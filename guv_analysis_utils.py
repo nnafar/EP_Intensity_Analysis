@@ -1,9 +1,5 @@
 # -*- coding: utf-8 -*-
 """
-Created on Wed Oct 29 11:35:06 2025
-
-@author: nnafar
-
 ======================================================
 --- GUV ANALYSIS UTILITIES ---
 ======================================================
@@ -16,6 +12,7 @@ All user-configurable settings are in 'config.py'.
 import numpy as np
 import cv2
 import pandas as pd
+import os
 
 # --- Packages for Time Extraction ---
 import re
@@ -28,6 +25,11 @@ from typing import List, Dict, Any, Optional
 # -------------------------------------------------------------------
 # --- 1. TIME EXTRACTION FUNCTIONS ---
 # -------------------------------------------------------------------
+# (All time extraction functions: _extract_from_imagej_metadata,
+# _extract_from_exif_data, _extract_from_tiff_tags,
+# _extract_from_filename_timestamps, extract_timestamps_from_metadata,
+# create_manual_timestamps... are UNCHANGED)
+# ... [Omitted for brevity, they are the same as the previous version] ...
 
 _FILENAME_PATTERNS = {
     "YYYY-MM-DD_HH-MM-SS": r'(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})',
@@ -37,7 +39,6 @@ _FILENAME_PATTERNS = {
 }
 
 def _extract_from_imagej_metadata(tif_files: List[str]) -> Optional[List[float]]:
-    # (This function is unchanged)
     print("Trying ImageJ metadata extraction...")
     timestamps = []
     frame_interval = None
@@ -64,7 +65,6 @@ def _extract_from_imagej_metadata(tif_files: List[str]) -> Optional[List[float]]
     return None
 
 def _extract_from_exif_data(tif_files: List[str]) -> Optional[List[float]]:
-    # (This function is unchanged)
     print("Trying EXIF timestamp extraction...")
     timestamps = []
     first_timestamp = None
@@ -98,7 +98,6 @@ def _extract_from_exif_data(tif_files: List[str]) -> Optional[List[float]]:
     return None
 
 def _extract_from_tiff_tags(tif_files: List[str]) -> Optional[List[float]]:
-    # (This function is unchanged)
     print("Trying TIFF tag extraction...")
     timestamps = []
     frame_interval = None
@@ -127,7 +126,6 @@ def _extract_from_tiff_tags(tif_files: List[str]) -> Optional[List[float]]:
     return None
 
 def _extract_from_filename_timestamps(tif_files: List[str]) -> Optional[List[float]]:
-    # (This function is unchanged)
     print("Trying filename timestamp patterns...")
     for name, pattern in _FILENAME_PATTERNS.items():
         try:
@@ -154,7 +152,6 @@ def _extract_from_filename_timestamps(tif_files: List[str]) -> Optional[List[flo
     return None
 
 def extract_timestamps_from_metadata(tif_files: List[str]) -> Optional[List[float]]:
-    # (This function is unchanged)
     global metadata_method_used
     metadata_method_used = "None"
     methods_to_try = [
@@ -175,7 +172,6 @@ def extract_timestamps_from_metadata(tif_files: List[str]) -> Optional[List[floa
     return None
 
 def create_manual_timestamps(num_files: int, frame_interval: float = 0.2) -> List[float]:
-    # (This function is unchanged)
     print(f"Using manual frame interval: {frame_interval} seconds")
     global metadata_method_used
     metadata_method_used = f"Manual calculation ({frame_interval}s interval)"
@@ -186,8 +182,10 @@ def create_manual_timestamps(num_files: int, frame_interval: float = 0.2) -> Lis
 # --- 2. ANALYSIS HELPER FUNCTIONS ---
 # -------------------------------------------------------------------
 
-def load_vesicle_coords_from_csv(csv_path: str) -> (int, int, int):
-    # (This function is unchanged)
+def load_vesicles_dataframe(csv_path: str) -> pd.DataFrame:
+    """
+    Loads DisGUVery CSV and returns the entire DataFrame of vesicles.
+    """
     print(f"Loading GUV coordinates from: {csv_path}")
     try:
         detected_vesicles = pd.read_csv(csv_path)
@@ -195,12 +193,9 @@ def load_vesicle_coords_from_csv(csv_path: str) -> (int, int, int):
             raise ValueError("No vesicles found in CSV.")
     except Exception as e:
         raise FileNotFoundError(f"Error loading DisGUVery CSV: {e}")
-    vesicle_to_track = detected_vesicles.iloc[0]
-    xc = int(vesicle_to_track.iloc[0])
-    yc = int(vesicle_to_track.iloc[1])
-    radius = int(vesicle_to_track.iloc[2])
-    print(f"Tracking GUV at ({xc}, {yc}) with radius {radius}")
-    return xc, yc, radius
+    
+    print(f"Found {len(detected_vesicles)} GUV(s) in CSV file.")
+    return detected_vesicles
 
 def create_ideal_mask(shape: tuple, xc: int, yc: int, radius: int) -> np.ndarray:
     # (This function is unchanged)
@@ -218,8 +213,9 @@ def dyn_model(t: np.ndarray, A: float, b: float) -> np.ndarray:
     return A * (1 - np.exp(-t / b))
 
 # -------------------------------------------------------------------
-# --- 3. FIGURE & EXPORT FUNCTIONS (NEW) ---
+# --- 3. FIGURE & EXPORT FUNCTIONS ---
 # -------------------------------------------------------------------
+# (find_closest_frame and style_image are unchanged)
 
 def find_closest_frame(time_data: list, target_time: float) -> (int, float):
     """
