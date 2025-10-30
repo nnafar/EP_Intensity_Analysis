@@ -36,14 +36,27 @@ TIF_SUFFIX = '_t*.tif'
 MODEL_TO_USE = '4-PARAM'  # Options: '4-PARAM' or '5-PARAM'
 JUMP_SENSITIVITY = 3
 FIT_DATA_PERCENTAGE = 0.99
-FIT_INITIAL_GUESS = [1.0, 0.5, 10.0, 0.5, 100.0] # [Af, A1, tau1, A2, tau2]
-FIT_INITIAL_GUESS_4PARAM = [1000.0, 1000.0, 10.0, 0.05] # [I_offset, A, tau, D]
+MEMBRANE_THICKNESS_PIXELS = 15 
+
+# Parameters for the Background Ring Mask
+BG_BUFFER_PIXELS = 5     # Space between GUV outer edge and start of background ring
+BG_RING_WIDTH_PIXELS = 20 # Radial width of the background ring
+
+# Parameters for exporting a mask visualization image
+EXPORT_MASK_VISUALIZATION = True # Set to True to save a debug image of the masks
+MASK_VIZ_OVERLAY_ALPHA = 0.6     # Opacity of the base C1 image (0.0 to 1.0)
+
+
+FIT_INITIAL_GUESS = [1.5, 0.5, 10.0, 0.5, 100.0] # [Af, A1, tau1, A2, tau2] 
+# UPDATED FOR NORMALIZED DATA: [I_offset, A, tau, D]
+FIT_INITIAL_GUESS_4PARAM = [0.0, 1.0, 10.0, 0.001] 
 
 # --- 4. IMAGE EXPORT PARAMETERS ---
 # List of time points (in seconds) to export as image frames
 EXPORT_TIME_POINTS_S = [0, 50, 100, 200, 300]
-MICRONS_PER_PIXEL = 0.65  # e.g., 0.65 µm/pixel
-SCALE_BAR_LENGTH_MICRONS = 20
+# CORRECTED: Updated to the correct scaling factor
+MICRONS_PER_PIXEL = 0.065  # e.g., 0.065 µm/pixel
+SCALE_BAR_LENGTH_MICRONS = 10 # Adjusted for higher resolution
 OUTPUT_IMAGE_FOLDER = 'C:\\Data\\Emma\\output_images'
 
 # --- 5. FALLBACK PARAMETERS ---
