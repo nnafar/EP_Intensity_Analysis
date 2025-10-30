@@ -36,11 +36,11 @@ TIF_SUFFIX = '_t*.tif'
 MODEL_TO_USE = '4-PARAM'  # Options: '4-PARAM' or '5-PARAM'
 JUMP_SENSITIVITY = 3
 FIT_DATA_PERCENTAGE = 0.99
-MEMBRANE_THICKNESS_PIXELS = 15 
+MEMBRANE_THICKNESS_PIXELS = 2 
 
 # Parameters for the Background Ring Mask
-BG_BUFFER_PIXELS = 5     # Space between GUV outer edge and start of background ring
-BG_RING_WIDTH_PIXELS = 20 # Radial width of the background ring
+BG_BUFFER_PIXELS = 5      # Space between GUV outer edge and start of background ring
+BG_RING_WIDTH_PIXELS = 8 # Radial width of the background ring
 
 # Parameters for exporting a mask visualization image
 EXPORT_MASK_VISUALIZATION = True # Set to True to save a debug image of the masks

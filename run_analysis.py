@@ -110,11 +110,9 @@ def main():
         
         print(f"\n--- Processing GUV {guv_id} at ({xc}, {yc}) ---")
         
-        # --- HOTFIX: Apply 10x correction to radius ---
-        guv_radius_estimate = int(np.round(guv_radius_from_csv_raw / 10.0))
-        if i == 0:
-             print(f"  - Applying 10x correction to radius from CSV: {guv_radius_from_csv_raw}px -> {guv_radius_estimate}px")
-        # --- End Hotfix ---
+        # FIX: Use the CSV radius directly without any scaling correction
+        guv_radius_estimate = int(np.round(guv_radius_from_csv_raw))
+        print(f"  - Using radius from CSV: {guv_radius_estimate}px")
 
         
         # 5a. ENHANCED: Define Masks using Membrane Detection
