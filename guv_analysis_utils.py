@@ -3,8 +3,8 @@
 ======================================================
 --- GUV ANALYSIS UTILITIES ---
 ======================================================
-This enhanced version includes membrane detection from radial intensity profiles,
-adapted from the skeleton.py approach.
+This enhanced version includes membrane detection from radial intensity profiles.
+It incorporates gradient-based and hybrid methods for more robust detection.
 """
 
 # --- Core Packages ---
@@ -24,6 +24,7 @@ from typing import List, Dict, Any, Optional, Tuple
 # --- Packages for Membrane Detection ---
 from scipy.signal import find_peaks, peak_widths
 from scipy import ndimage as nd
+from scipy.ndimage import gaussian_filter1d, map_coordinates
 
 # -------------------------------------------------------------------
 # --- 1. TIME EXTRACTION FUNCTIONS (unchanged) ---
@@ -98,7 +99,7 @@ def dyn_model(t: np.ndarray, Af: float, A1: float, tau1: float, A2: float, tau2:
     return Af - A1 * np.exp(-t / tau1) - A2 * np.exp(-t / tau2)
 
 # -------------------------------------------------------------------
-# --- 3. IMAGE PROCESSING & MASKING FUNCTIONS ---
+# --- 3. IMAGE PROCESSING & MASKING FUNCTIONS (Core Utilities) ---
 # -------------------------------------------------------------------
 
 def tifflist_to_numpy(file_paths: list) -> np.ndarray:
@@ -148,256 +149,307 @@ def create_annular_mask(img_shape: tuple[int, int], center: tuple[int, int], inn
     annular_mask = np.logical_and(mask_outer, mask_inner)
     return annular_mask
 
+def refine_guv_center(image: np.ndarray, center_guess: Tuple[int, int], radius_estimate: int, 
+                      search_box_factor: float = 1.0) -> Tuple[int, int]:
+    """
+    Refines the GUV center coordinates by finding the "center of mass" (centroid)
+    of the bright areas in a blurred ROI.
+    """
+    xc, yc = center_guess
+    
+    # Define a search box around the guess
+    box_half_width = int(max(15, radius_estimate * search_box_factor))
+    x_start = max(0, xc - box_half_width)
+    x_end = min(image.shape[1], xc + box_half_width)
+    y_start = max(0, yc - box_half_width)
+    y_end = min(image.shape[0], yc + box_half_width)
+    
+    if x_start >= x_end or y_start >= y_end:
+        return center_guess
+        
+    roi = image[y_start:y_end, x_start:x_end]
+    
+    if roi.dtype == np.uint16:
+        roi_blurred = cv2.GaussianBlur(roi, (5, 5), 0)
+        roi_8bit = cv2.normalize(roi_blurred, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
+    else:
+        roi_blurred = cv2.GaussianBlur(roi.astype(np.float32), (5, 5), 0)
+        roi_8bit = cv2.normalize(roi_blurred, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
+
+    try:
+        thresh_val, thresh_mask = cv2.threshold(
+            roi_8bit, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )
+        M = cv2.moments(thresh_mask)
+        if M["m00"] == 0:
+            (min_val, max_val, min_loc, max_loc) = cv2.minMaxLoc(roi_blurred)
+            cX, cY = max_loc
+        else:
+            cX = int(M["m10"] / M["m00"])
+            cY = int(M["m01"] / M["m00"])
+    except Exception:
+        (min_val, max_val, min_loc, max_loc) = cv2.minMaxLoc(roi_blurred)
+        cX, cY = max_loc
+    
+    xc_new = x_start + cX
+    yc_new = y_start + cY
+    
+    shift = np.sqrt((xc_new - xc)**2 + (yc_new - yc)**2)
+    
+    if shift > radius_estimate * 0.7:
+        print(f"  - Warning: Center refinement shifted by {shift:.1f}px. Reverting to original center.")
+        return center_guess
+        
+    return (xc_new, yc_new)
+
 # -------------------------------------------------------------------
-# --- 4. NEW: RADIAL PROFILE & MEMBRANE DETECTION ---
+# --- 4. NEW: RADIAL PROFILE & MEMBRANE DETECTION (skeleton.py method) ---
 # -------------------------------------------------------------------
 
-def calculate_linear_profiles(image: np.ndarray, center: Tuple[int, int], 
-                              num_angles: int = 360, length_excess: float = 1.5, 
-                              dr: int = 1, radius_estimate: int = 50) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def linear_profiles(image: np.ndarray, 
+                    center: Tuple[int, int], 
+                    num_angles: int, 
+                    length_excess: float, 
+                    radius: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Calculate linear intensity profiles radiating from the center.
-    Adapted from skeleton.py linear_profiles function.
+    Calculate linear intensity profiles radiating from the center using
+    scipy.ndimage.map_coordinates for sub-pixel interpolation.
     
-    Parameters:
-        image: 2D image array
-        center: (xc, yc) center coordinates
-        num_angles: number of angular profiles to calculate
-        length_excess: how far beyond radius to sample (multiplier)
-        dr: step size in pixels along radius
-        radius_estimate: estimated radius for determining profile length
-        
-    Returns:
-        intensity_profiles: Array of shape (num_radial_points, num_angles)
-        along_radius: Array of radial distances from center
-        theta: Array of angles
+    (Adapted from skeleton.py)
     """
     xc, yc = center
+    length = int(radius * length_excess)
+    theta = np.linspace(0, 2 * np.pi, num_angles, endpoint=False)
     
-    # Calculate the length of the linear profiles
-    length = int(np.round(radius_estimate * length_excess))
+    # 1D array of radii
+    along_radius = np.arange(0, length, 1)
     
-    # Generate angles
-    theta = np.linspace(0, 2*np.pi, num_angles, endpoint=False)
-    
-    # Generate radial distances
-    along_radius = np.arange(0, length, dr)
-    num_radial_points = len(along_radius)
-    
-    # Initialize intensity profiles array
-    intensity_profiles = np.zeros((num_radial_points, num_angles))
-    
-    # For each angle
-    for i, angle in enumerate(theta):
-        # Calculate coordinates along this radial line
-        x_coords = xc + along_radius * np.cos(angle)
-        y_coords = yc + along_radius * np.sin(angle)
-        
-        # Ensure coordinates are within image bounds
-        valid_mask = (x_coords >= 0) & (x_coords < image.shape[1]) & \
-                     (y_coords >= 0) & (y_coords < image.shape[0])
-        
-        # Sample intensities using interpolation
-        for j in range(num_radial_points):
-            if valid_mask[j]:
-                x_int, y_int = int(x_coords[j]), int(y_coords[j])
-                intensity_profiles[j, i] = image[y_int, x_int]
-            else:
-                intensity_profiles[j, i] = 0  # Outside image bounds
-                
-    return intensity_profiles, along_radius, theta
+    # 2D arrays of x and y coordinates
+    # (num_angles, length)
+    x_coords = xc + along_radius[np.newaxis, :] * np.cos(theta[:, np.newaxis])
+    y_coords = yc + along_radius[np.newaxis, :] * np.sin(theta[:, np.newaxis])
 
-def calculate_radial_profile(intensity_profiles: np.ndarray) -> np.ndarray:
-    """
-    Calculate the average radial profile by averaging over all angles.
-    
-    Parameters:
-        intensity_profiles: Array of shape (num_radial_points, num_angles)
-        
-    Returns:
-        radial_profile: 1D array of averaged intensities
-    """
-    return np.mean(intensity_profiles, axis=1)
+    # map_coordinates requires coordinates as a (2, N) array
+    # We want a (num_angles, length) output, so we flatten and stack
+    coords = np.stack([y_coords.ravel(), x_coords.ravel()], axis=0)
 
-def detect_membrane_from_profile(radial_profile: np.ndarray, radius_estimate: int) -> Tuple[int, int, List[str], bool]:
-    """
-    Detect membrane inner and outer borders from radial intensity profile using peak detection.
-    Adapted from skeleton.py membrane_detection function.
+    # Perform interpolation
+    # 'order=1' is linear interpolation
+    profiles_flat = map_coordinates(image, coords, order=1, mode='constant', cval=0.0)
     
-    Parameters:
-        radial_profile: 1D array of radial intensity profile
-        radius_estimate: estimated radius from CSV (for guidance)
-        
+    # Reshape back to (num_angles, length) and transpose
+    # to (length, num_angles) to match old function's output shape
+    profiles = profiles_flat.reshape(num_angles, length).T
+    
+    return profiles, along_radius, theta
+
+def average_radial_profile(profiles: np.ndarray) -> np.ndarray:
+    """
+    Calculate the average radial profile using the median over all angles.
+    (Adapted from skeleton.py)
+    """
+    # Use median to be robust against outliers (e.g., lipid clusters)
+    return np.median(profiles, axis=1)
+
+def membrane_search(profile: np.ndarray, 
+                    radii: np.ndarray, 
+                    expected_radius: int, 
+                    search_factor: float) -> Tuple[int, int, int, List[str], bool]:
+    """
+    Detects membrane location by finding the highest peak in a search window
+    defined by expected_radius +/- (expected_radius * search_factor).
+    
+    (Adapted from skeleton.py + previous fixes)
+    
     Returns:
-        index_border_in: Index of inner membrane border
-        index_border_out: Index of outer membrane border  
-        comments: List of quality/warning comments
-        failed: True if detection failed completely
+        peak_pos: Radius (in pixels) of the detected peak.
+        inner_b: Radius (in pixels) of the inner membrane border.
+        outer_b: Radius (in pixels) of the outer membrane border.
+        comments: List of quality/warning comments.
+        failed: True if detection failed.
     """
     comments = []
     failed = False
     
-    # Find peaks with adjusted parameters for better detection
-    peaks, properties = find_peaks(
-        radial_profile, 
-        height=np.max(radial_profile) * 0.1,  # At least 10% of max
-        distance=5, 
-        prominence=np.max(radial_profile) * 0.05  # At least 5% prominence
-    )
+    # --- 1. Define search window around hint ---
+    data_to_search = profile
     
-    if not np.any(peaks):
-        index_border_in = 0
-        index_border_out = 0 
-        comments = ["no_membrane_peak_detected"]
-        failed = True
-        return index_border_in, index_border_out, comments, failed
+    # Find array indices corresponding to the radius window
+    min_radius = max(0, expected_radius * (1.0 - search_factor))
+    max_radius = expected_radius * (1.0 + search_factor)
     
-    # If only one peak, use it
-    if len(peaks) == 1:
-        chosen_peak = 0
+    min_idx = np.searchsorted(radii, min_radius, side='left')
+    max_idx = np.searchsorted(radii, max_radius, side='right')
+    
+    if min_idx < max_idx: # Ensure window is valid
+        # Create a *mask* to nullify data outside this window
+        search_mask = np.zeros_like(profile)
+        search_mask[min_idx:max_idx] = 1.0
+        data_to_search = profile * search_mask
     else:
-        # Multiple peaks - choose the best one based on several criteria
-        peak_scores = []
-        
-        for i, peak_pos in enumerate(peaks):
-            score = 0
-            
-            # Criterion 1: Prefer peaks closer to the expected radius (higher weight)
-            distance_to_expected = abs(peak_pos - radius_estimate)
-            distance_score = 1.0 / (1.0 + distance_to_expected / max(1, radius_estimate))
-            score += distance_score * 3.0  # High weight for position
-            
-            # Criterion 2: Prefer higher peaks
-            height_score = radial_profile[peak_pos] / np.max(radial_profile)
-            score += height_score * 2.0  # Medium weight for height
-            
-            # Criterion 3: Prefer peaks with good prominence
-            prominence_score = properties['prominences'][i] / np.max(properties['prominences'])
-            score += prominence_score * 1.0  # Lower weight for prominence
-            
-            # Criterion 4: Penalize peaks that are too early (likely noise)
-            if peak_pos < radius_estimate * 0.3:
-                score *= 0.5
-            
-            # Criterion 5: Penalize peaks that are too late (likely artifacts)
-            if peak_pos > radius_estimate * 2.0:
-                score *= 0.3
-                
-            peak_scores.append(score)
-        
-        # Choose the peak with the highest score
-        chosen_peak = np.argmax(peak_scores)
-        
-        # Add comment if we had to choose among many peaks
-        if len(peaks) > 2:
-            comments.append("multiple_peaks")
+        comments.append("invalid_search_window")
+        data_to_search = profile # Fallback to searching everything
     
-    # Calculate width at half maximum for the chosen peak
+    # --- 2. Find peaks in the masked data ---
     try:
-        width_half_max = peak_widths(radial_profile, [peaks[chosen_peak]], rel_height=0.5)
-        index_border_in = int(np.round(width_half_max[2][0]))
-        index_border_out = int(np.round(width_half_max[3][0]))
-    except:
-        # Fallback if width calculation fails
-        index_border_in = max(0, peaks[chosen_peak] - 5)
-        index_border_out = min(len(radial_profile) - 1, peaks[chosen_peak] + 5)
-        comments.append("width_calc_failed")
-    
-    # Quality checks
-    if index_border_out - index_border_in > radius_estimate/4:
-        comments.append("wide_peak")
-    
-    if np.mean(radial_profile[:index_border_in]) >= 0.3 * radial_profile[peaks[chosen_peak]]:
-        comments.append("signal_inside_vesicle")
-    
-    if len(radial_profile) > index_border_out and np.mean(radial_profile[index_border_out:]) >= 0.4 * radial_profile[peaks[chosen_peak]]:
-        comments.append("signal_outside_vesicle")
-    
-    return index_border_in, index_border_out, comments, failed
+        peaks, props = find_peaks(
+            data_to_search,
+            height=np.max(profile) * 0.1,  # Height relative to *original* max
+            distance=5,
+            prominence=np.max(profile) * 0.05 # Prominence relative to *original* max
+        )
+    except Exception as e:
+        comments.append(f"find_peaks_failed: {e}")
+        peaks = np.array([]) # Ensure peaks is an empty array
 
-def create_guv_masks_with_detection(roi_guide_frame: np.ndarray, center: tuple[int, int], 
-                                   radius_estimate: int, bg_buffer: int, bg_width: int,
-                                   num_angles: int = 360, length_excess: float = 1.5) -> \
+    if not np.any(peaks):
+        comments.append("no_peak_in_window")
+        failed = True
+        # Fallback to using the estimate
+        peak_idx = np.searchsorted(radii, expected_radius) # Find index closest to hint
+        peak_idx = min(peak_idx, len(radii) - 1) # Clamp to bounds
+    else:
+        # Find the *highest* peak within the allowed window
+        heights = props['peak_heights']
+        chosen_peak_idx_in_peaks_array = np.argmax(heights)
+        peak_idx = peaks[chosen_peak_idx_in_peaks_array]
+
+    # --- 3. Calculate width ---
+    # Use peak_widths on the *original* profile to get accurate widths
+    try:
+        width_results = peak_widths(profile, [peak_idx], rel_height=0.5)
+        # width_results contains (widths, width_heights, left_ips, right_ips)
+        inner_idx = int(np.round(width_results[2][0]))
+        outer_idx = int(np.round(width_results[3][0]))
+        
+        # Sanity check
+        if inner_idx >= outer_idx:
+            raise ValueError("Inner border >= outer border")
+            
+    except Exception as e:
+        comments.append(f"width_calc_failed: {e}")
+        # Fallback: use a fixed width (e.g., 5 pixels) around the peak
+        inner_idx = max(0, peak_idx - 5)
+        outer_idx = min(len(profile) - 1, peak_idx + 5)
+        
+    # --- 4. Convert indices back to pixel radii ---
+    # Ensure indices are within the bounds of the radii array
+    peak_idx = min(peak_idx, len(radii) - 1)
+    inner_idx = min(inner_idx, len(radii) - 1)
+    outer_idx = min(outer_idx, len(radii) - 1)
+    
+    peak_pos = int(radii[peak_idx])
+    inner_b = int(radii[inner_idx])
+    outer_b = int(radii[outer_idx])
+    
+    # Final sanity check
+    if inner_b == 0 and outer_b == 0:
+        comments.append("zero_radius_detected")
+        failed = True
+        inner_b = max(1, int(expected_radius * 0.8))
+        outer_b = expected_radius
+        peak_pos = expected_radius
+
+    return peak_pos, inner_b, outer_b, comments, failed
+
+
+# --- UPDATED FUNCTION SIGNATURE ---
+def create_guv_masks_with_detection(roi_guide_frame: np.ndarray, 
+                                   center: Tuple[int, int],
+                                   radius_estimate: int, 
+                                   bg_buffer: int, 
+                                   bg_width: int,
+                                   search_factor: float, # <-- ADDED
+                                   num_angles: int = 360, 
+                                   length_excess: float = 1.5,
+                                   viz_thickness: Optional[int] = None) -> \
                                    Tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
     """
-    Creates GUV masks using membrane detection from radial intensity profiles.
-    This is the ENHANCED version that actually detects where the membrane is.
+    Creates GUV masks using the detection logic from skeleton.py, constrained
+    by a search window based on the radius_estimate.
     
-    Parameters:
-        roi_guide_frame: The membrane channel image
-        center: (xc, yc) center coordinates
-        radius_estimate: Initial radius estimate from CSV
-        bg_buffer: Buffer space outside GUV before background ring starts
-        bg_width: Width of background ring
-        num_angles: Number of radial profiles for detection
-        length_excess: How far to extend profiles beyond estimate
-        
-    Returns:
-        inner_guv_mask: Mask for inner GUV area (excludes membrane)
-        membrane_mask: Mask for membrane region (visualization only)
-        background_ring_mask: Mask for background measurement
-        detection_info: Dictionary with detection results and quality metrics
+    (This function now wraps the new skeleton.py-based methods)
     """
     img_shape = roi_guide_frame.shape
     
+    # --- 1. Call skeleton.py-based functions ---
+    
     # Step 1: Calculate linear intensity profiles
-    intensity_profiles, along_radius, theta = calculate_linear_profiles(
-        roi_guide_frame, center, num_angles, length_excess, dr=1, 
-        radius_estimate=radius_estimate
+    profiles, along_radius, theta = linear_profiles(
+        roi_guide_frame, 
+        center, 
+        num_angles=num_angles, 
+        length_excess=length_excess,
+        radius=radius_estimate 
     )
     
     # Step 2: Calculate average radial profile
-    radial_profile = calculate_radial_profile(intensity_profiles)
+    radial_profile = average_radial_profile(profiles)
     
-    # Step 3: Detect membrane from radial profile
-    idx_inner, idx_outer, comments, failed = detect_membrane_from_profile(
-        radial_profile, radius_estimate
+    # Step 3: Detect membrane
+    # --- UPDATED CALL ---
+    peak_pos, inner_b, outer_b, comments, failed = membrane_search(
+        radial_profile, 
+        along_radius,
+        expected_radius=radius_estimate,
+        search_factor=search_factor # <-- Use passed-in value
     )
-    
-    # Store detection info
-    detection_info = {
-        'detected_inner_radius': along_radius[idx_inner] if not failed else 0,
-        'detected_outer_radius': along_radius[idx_outer] if not failed else radius_estimate,
-        'peak_position': along_radius[idx_outer] if not failed else radius_estimate,
-        'detection_failed': failed,
-        'comments': comments,
-        'radial_profile': radial_profile,
-        'along_radius': along_radius
-    }
-    
-    # Step 4: Create masks based on detected membrane
-    if failed:
-        # Fallback to estimate-based masks
-        print(f"  WARNING: Membrane detection failed. Using radius estimate: {radius_estimate}px")
-        inner_radius = max(1, int(radius_estimate * 0.8))  # Conservative inner radius
-        outer_radius = radius_estimate
-    else:
-        # Use detected radii
-        inner_radius = max(1, int(detection_info['detected_inner_radius']))
-        outer_radius = int(detection_info['detected_outer_radius'])
-        
-        print(f"  Detected membrane: inner={inner_radius}px, outer={outer_radius}px (estimate was {radius_estimate}px)")
+    # --- END UPDATED CALL ---
+
+    # --- 2. Create Masks ---
     
     # 1. Inner GUV Mask (for dye uptake measurement)
-    inner_guv_mask = create_circular_mask(img_shape, center, radius=inner_radius)
+    inner_guv_mask = create_circular_mask(img_shape, center, radius=inner_b)
     
     # 2. Membrane Mask (for visualization)
-    membrane_mask = create_annular_mask(img_shape, center, 
-                                       inner_radius=inner_radius + 1, 
-                                       outer_radius=outer_radius)
+    if viz_thickness is not None and viz_thickness > 0:
+        # Use a fixed thickness for visualization, anchored to the *inner* radius
+        viz_mem_inner_r = inner_b + 1
+        viz_mem_outer_r = inner_b + viz_thickness
+        membrane_mask = create_annular_mask(img_shape, center, 
+                                           inner_radius=viz_mem_inner_r, 
+                                           outer_radius=viz_mem_outer_r)
+    else:
+        # Original behavior: fill the whole detected membrane area
+        membrane_mask = create_annular_mask(img_shape, center, 
+                                           inner_radius=inner_b + 1, 
+                                           outer_radius=outer_b)
     
     # 3. Background Ring Mask
-    bg_inner_r = outer_radius + bg_buffer
-    bg_outer_r = outer_radius + bg_buffer + bg_width
+    bg_inner_r = outer_b + bg_buffer
+    bg_outer_r = outer_b + bg_buffer + bg_width
     background_ring_mask = create_annular_mask(img_shape, center, 
                                               inner_radius=bg_inner_r, 
                                               outer_radius=bg_outer_r)
+
+    # --- 3. Populate detection_info dictionary for run_analysis.py ---
+    # --- UPDATED DICTIONARY ---
+    detection_info = {
+        'detected_inner_radius': inner_b,
+        'detected_outer_radius': outer_b,
+        'bg_inner_radius': bg_inner_r, # <-- ADDED
+        'bg_outer_radius': bg_outer_r, # <-- ADDED
+        'peak_position': peak_pos,
+        'detection_failed': failed,
+        'comments': comments,
+        'radial_profile': radial_profile,
+        'along_radius': along_radius,
+        'method': 'skeleton_search',
+        'search_factor_used': search_factor
+    }
+    # --- END UPDATED DICTIONARY ---
+
+    if not failed:
+         print(f"  Detected membrane: inner={inner_b}px, outer={outer_b}px (estimate was {radius_estimate}px)")
+    else:
+         print(f"  WARNING: Membrane detection failed. Review comments: {comments}")
+
     
     return inner_guv_mask, membrane_mask, background_ring_mask, detection_info
 
 
 # -------------------------------------------------------------------
-# --- 5. LEGACY FUNCTION (for backward compatibility) ---
+# --- 5. LEGACY & TRACE FUNCTIONS (unchanged) ---
 # -------------------------------------------------------------------
     
 def create_guv_masks(roi_guide_frame: np.ndarray, center: tuple[int, int], guv_radius: int, 
@@ -405,28 +457,19 @@ def create_guv_masks(roi_guide_frame: np.ndarray, center: tuple[int, int], guv_r
                     tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     LEGACY FUNCTION: Creates masks using fixed geometry (no detection).
-    Kept for backward compatibility. Use create_guv_masks_with_detection instead.
     """
     img_shape = roi_guide_frame.shape
-    
     R = int(np.round(guv_radius))
-    
-    # 1. Inner GUV Mask
     inner_guv_radius = max(1, R - membrane_thickness) 
     inner_guv_mask = create_circular_mask(img_shape, center, radius=inner_guv_radius)
-    
-    # 2. Membrane Mask
     membrane_mask = create_annular_mask(img_shape, center, 
                                        inner_radius=inner_guv_radius + 1, 
                                        outer_radius=R)
-
-    # 3. Background Ring Mask
     bg_inner_r = R + bg_buffer
     bg_outer_r = R + bg_buffer + bg_width
     background_ring_mask = create_annular_mask(img_shape, center, 
                                               inner_radius=bg_inner_r, 
                                               outer_radius=bg_outer_r)
-    
     return inner_guv_mask, membrane_mask, background_ring_mask
 
 def get_intensity_trace(im_stack: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -434,11 +477,12 @@ def get_intensity_trace(im_stack: np.ndarray, mask: np.ndarray) -> np.ndarray:
     trace = np.zeros(im_stack.shape[0])
     num_pixels = np.sum(mask)
     
+    if num_pixels == 0:
+        return trace
+        
     for i in range(im_stack.shape[0]):
-        # Apply the mask to the frame
         masked_frame = im_stack[i][mask]
-        # Calculate the average intensity
-        trace[i] = np.sum(masked_frame) / num_pixels if num_pixels > 0 else 0
+        trace[i] = np.sum(masked_frame) / num_pixels
         
     return trace
 
@@ -448,24 +492,19 @@ def get_intensity_trace(im_stack: np.ndarray, mask: np.ndarray) -> np.ndarray:
 
 def detect_intensity_jump(trace: np.ndarray, sensitivity: float = 3.0) -> int:
     """
-    Detects a sudden jump in intensity (e.g., electroporation event) using the
-    standard deviation of the difference trace.
-    Returns the frame index of the jump, or -1 if none is found.
+    Detects a sudden jump in intensity (e.g., electroporation event).
     """
     if len(trace) < 10:
         return -1
         
-    # Calculate the difference between consecutive frames
     diff_trace = np.diff(trace)
-    
-    # Calculate the standard deviation and mean of the difference trace
     std_diff = np.std(diff_trace[5:]) 
     mean_diff = np.mean(diff_trace[5:])
     
-    # Threshold for jump detection
+    if std_diff == 0:
+        return -1
+        
     threshold = mean_diff + sensitivity * std_diff
-    
-    # Find the first point where the difference exceeds the threshold
     jump_indices = np.where(diff_trace > threshold)[0]
     
     if jump_indices.size > 0:
@@ -482,62 +521,45 @@ def create_mask_visualization(base_image: np.ndarray, inner_mask: np.ndarray,
                              membrane_mask: np.ndarray, background_mask: np.ndarray, 
                              alpha: float = 0.6) -> np.ndarray:
     """
-    Overlays the inner, membrane, and background masks in color on top of the
-    base C1 image for visualization.
+    Overlays the inner, membrane, and background masks in color.
     """
-    # 1. Normalize base image to 8-bit and convert to BGR
     img_8bit = cv2.normalize(base_image, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
     viz_image = cv2.cvtColor(img_8bit, cv2.COLOR_GRAY2BGR)
-    
-    # 2. Create colored overlay
     overlay = np.zeros_like(viz_image)
     overlay[inner_mask] = (128, 0, 128)      # Purple (BGR)
     overlay[membrane_mask] = (0, 0, 255)     # Red (BGR)
     overlay[background_mask] = (255, 0, 0)   # Blue (BGR)
-    
-    # 3. Blend images
     beta = 1.0 - alpha
     final_viz = cv2.addWeighted(viz_image, alpha, overlay, beta, 0)
-    
     return final_viz
 
 def style_image(frame: np.ndarray, time_label: str, microns_per_pixel: float, scale_bar_microns: int) -> np.ndarray:
     """
     Applies the red colormap and adds annotations.
     """
-    # 1. Normalize to 8-bit (0-255) for display
     img_8bit = cv2.normalize(frame, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
-    
-    # 2. Apply red colormap
     img_color = cv2.cvtColor(img_8bit, cv2.COLOR_GRAY2BGR)
-    img_color[:, :, 0] = 0  # Zero out Blue channel
-    img_color[:, :, 1] = 0  # Zero out Green channel
-    img_color[:, :, 2] = img_8bit # Set Red channel to intensity
+    img_color[:, :, 0] = 0
+    img_color[:, :, 1] = 0
+    img_color[:, :, 2] = img_8bit
     
-    # 3. Add time stamp
     cv2.putText(
         img_color,
         time_label,
-        (20, 40),  # Position (from top-left)
+        (20, 40),
         cv2.FONT_HERSHEY_SIMPLEX,
-        1.2,  # Font scale
-        (255, 255, 255),  # Color (white)
-        2,  # Thickness
+        1.2,
+        (255, 255, 255),
+        2,
         cv2.LINE_AA
     )
     
-    # 4. Add scale bar (if configured)
     if scale_bar_microns > 0 and microns_per_pixel > 0:
         bar_length_pixels = int(scale_bar_microns / microns_per_pixel)
         h, w, _ = img_color.shape
-        
-        # Position the scale bar: 30 pixels from bottom/right edge
         p1 = (w - 30 - bar_length_pixels, h - 30)
         p2 = (w - 30, h - 30)
-        
-        cv2.line(img_color, p1, p2, (255, 255, 255), 5) # Draw white line
-        
-        # Add label
+        cv2.line(img_color, p1, p2, (255, 255, 255), 5)
         cv2.putText(
             img_color,
             f"{scale_bar_microns} µm",

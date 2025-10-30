@@ -80,6 +80,9 @@ def main():
     
     print("Loading ROI (C1) guide image...")
     roi_guide_frame = cv2.imread(roi_guide_file, cv2.IMREAD_ANYDEPTH)
+    if roi_guide_frame is None:
+        print(f"Error: Could not load ROI guide frame: {roi_guide_file}")
+        return
     
     print(f"Loading GUV coordinates from: {path_to_csv}")
     try:
@@ -108,24 +111,49 @@ def main():
         guv_id = df_vesicles.loc[i, 'id']
         guv_radius_from_csv_raw = guv_sizes[i]
         
-        print(f"\n--- Processing GUV {guv_id} at ({xc}, {yc}) ---")
+        # Store original coordinates
+        xc_orig, yc_orig = xc, yc
         
-        # FIX: Use the CSV radius directly without any scaling correction
-        guv_radius_estimate = int(np.round(guv_radius_from_csv_raw))
-        print(f"  - Using radius from CSV: {guv_radius_estimate}px")
+        print(f"\n--- Processing GUV {guv_id} at ({xc_orig}, {yc_orig}) ---")
+        
+        # --- MODIFIED: Assume CSV 'size' is DIAMETER, divide by 2 for radius ---
+        guv_radius_estimate = int(np.round(guv_radius_from_csv_raw / 2.0))
+        print(f"  - Using radius estimate (CSV 'size'/2): {guv_radius_estimate}px")
 
+
+        # --- *** FIX: DISABLE CENTER REFINEMENT *** ---
+        # Bright clusters skew the center of mass calculation.
+        # We will use the original CSV coordinates directly.
+        # print(f"  - Refining center coordinates...")
+        # (xc_refined, yc_refined) = utils.refine_guv_center(
+        #     roi_guide_frame, 
+        #     (xc_orig, yc_orig), 
+        #     guv_radius_estimate,
+        #     search_box_factor=0.8 # Search in a box 1.6x the radius
+        # )
+        xc_refined, yc_refined = xc_orig, yc_orig # Use original center
+        print(f"  - Using original CSV center: ({xc_refined}, {yc_refined})")
+        # --- *** END FIX *** ---
         
         # 5a. ENHANCED: Define Masks using Membrane Detection
         print(f"  - Detecting membrane from radial intensity profile...")
+        
+        # Get the visualization thickness from config, default to None if not present
+        viz_thickness = getattr(cfg, 'VIZ_MEMBRANE_THICKNESS_PIXELS', None)
+        
+        # --- UPDATED FUNCTION CALL ---
         inner_mask, membrane_mask, background_mask, detection_info = utils.create_guv_masks_with_detection(
             roi_guide_frame, 
-            (xc, yc), 
+            (xc_refined, yc_refined),  # Use the original (now "refined") center
             radius_estimate=guv_radius_estimate,
             bg_buffer=cfg.BG_BUFFER_PIXELS,
             bg_width=cfg.BG_RING_WIDTH_PIXELS,
+            search_factor=cfg.MEMBRANE_SEARCH_FACTOR, # <-- Read from config
             num_angles=360,  # Use lots of angles for accurate detection
-            length_excess=1.5
+            length_excess=1.5,
+            viz_thickness=viz_thickness  # Pass the new parameter
         )
+        # --- END UPDATED CALL ---
         
         # Log detection quality
         quality_entry = {
@@ -139,12 +167,12 @@ def main():
         detection_quality_log.append(quality_entry)
         
         # Print quality warnings if any
-        if detection_info['comments']:
+        if detection_info['comments'] and 'OK' not in quality_entry['comments']:
             print(f"  - Quality flags: {', '.join(detection_info['comments'])}")
 
         # Export mask visualization for the first GUV (i==0) OR if detection had issues
         should_export_viz = (cfg.EXPORT_MASK_VISUALIZATION and i == 0) or \
-                           (detection_info['detection_failed'] or detection_info['comments'])
+                           (detection_info['detection_failed'] or 'OK' not in quality_entry['comments'])
         
         if should_export_viz:
             print(f"  - Generating mask visualization for GUV {guv_id}...")
@@ -169,31 +197,50 @@ def main():
             except Exception as e:
                 print(f"    Warning: Could not save mask visualization: {e}")
                 
-            # ALSO save the radial profile plot for problematic detections
-            if detection_info['detection_failed'] or detection_info['comments']:
-                fig, ax = plt.subplots(figsize=(10, 5))
-                ax.plot(detection_info['along_radius'], detection_info['radial_profile'], 'b-', linewidth=2)
-                ax.axvline(x=detection_info['detected_inner_radius'], color='green', linestyle='--', 
-                          label=f"Inner border ({detection_info['detected_inner_radius']:.1f}px)")
-                ax.axvline(x=detection_info['detected_outer_radius'], color='red', linestyle='--', 
-                          label=f"Outer border ({detection_info['detected_outer_radius']:.1f}px)")
-                ax.axvline(x=guv_radius_estimate, color='orange', linestyle=':', 
-                          label=f"CSV estimate ({guv_radius_estimate}px)")
-                ax.set_xlabel('Radius (pixels)')
-                ax.set_ylabel('Intensity (a.u.)')
-                ax.set_title(f'Radial Intensity Profile - GUV {guv_id}')
-                ax.legend()
-                ax.grid(True, alpha=0.3)
-                
-                profile_name = f"{cfg.EXPERIMENT_BASE_NAME}_radial_profile_GUV_{guv_id}.png"
-                profile_path = os.path.join(cfg.OUTPUT_IMAGE_FOLDER, profile_name)
-                fig.savefig(profile_path, dpi=150, bbox_inches='tight')
-                plt.close(fig)
-                print(f"    Saved radial profile to: {profile_path}")
+            # --- *** FIX: ALWAYS SAVE RADIAL PLOT *** ---
+            # Removed the 'if' condition to ensure the plot is always
+            # saved for debugging, even if detection *thinks* it succeeded.
+            fig, ax = plt.subplots(figsize=(10, 5))
+            ax.plot(detection_info['along_radius'], detection_info['radial_profile'], 'b-', linewidth=2)
+            
+            # Add shaded region for UPTAKE (INNER)
+            ax.axvspan(0, detection_info['detected_inner_radius'], color='purple', alpha=0.2, label='Uptake (Inner) Region')
+            
+            # Add shaded region for MEMBRANE
+            ax.axvspan(detection_info['detected_inner_radius'], detection_info['detected_outer_radius'], color='red', alpha=0.2, label='Membrane Region')
+
+            # Add shaded region for BACKGROUND
+            bg_r_start = detection_info['bg_inner_radius']
+            bg_r_end = detection_info['bg_outer_radius']
+            ax.axvspan(bg_r_start, bg_r_end, color='blue', alpha=0.2, label=f'Background Region')
+
+            # Add lines for reference
+            ax.axvline(x=guv_radius_estimate, color='orange', linestyle=':', 
+                      label=f"CSV estimate ({guv_radius_estimate}px)")
+            ax.axvline(x=detection_info['peak_position'], color='black', linestyle=':', 
+                      label=f"Detected Peak ({detection_info['peak_position']:.1f}px)")
+            
+            ax.set_xlabel('Radius (pixels)')
+            ax.set_ylabel('Intensity (a.u.)')
+            ax.set_title(f'Radial Intensity Profile & Regions - GUV {guv_id} (Center: {xc_refined}, {yc_refined})')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            
+            profile_name = f"{cfg.EXPERIMENT_BASE_NAME}_radial_profile_GUV_{guv_id}.png"
+            profile_path = os.path.join(cfg.OUTPUT_IMAGE_FOLDER, profile_name)
+            fig.savefig(profile_path, dpi=150, bbox_inches='tight')
+            plt.close(fig)
+            print(f"    Saved radial profile to: {profile_path}")
+            # --- *** END FIX *** ---
         
         # 5b. Get Intensity Traces
         intensity_trace = utils.get_intensity_trace(im_stack, inner_mask)
         background_trace = utils.get_intensity_trace(im_stack, background_mask)
+        
+        if np.all(intensity_trace == 0):
+            print(f"  - Warning: GUV {guv_id} inner mask is empty or invalid. Skipping this GUV.")
+            all_jump_frames.append(0) # Add a placeholder
+            continue # Skip to the next GUV
         
         # 5c. Detect Jump 
         try:
@@ -234,14 +281,23 @@ def main():
     print(f"  - Detections with warnings: {num_with_warnings}")
     print(f"  - Clean detections: {len(df_quality) - num_with_warnings}")
     
+    if not all_intensity_curves:
+        print("Error: No valid intensity curves were processed. Cannot continue to fitting.")
+        return
+        
     # --- Three-Term Normalization ---
     normalized_curves = []
     print("\nNormalizing intensity curves using $I_{uptake} = (I_{dye,t} - I_{dye,0}) / (I_{background,t} - I_{dye,0})$...")
     
-    for dye_trace, bg_trace, jump_f in zip(all_intensity_curves, all_background_curves, all_jump_frames):
+    valid_curve_indices = []
+    
+    for idx, (dye_trace, bg_trace, jump_f) in enumerate(zip(all_intensity_curves, all_background_curves, all_jump_frames)):
         # Determine baseline frames for I_dye,0
         baseline_frames_end = max(5, jump_f)
-        
+        if baseline_frames_end >= len(dye_trace):
+             print(f"  - Warning: Skipping GUV {idx+1} due to insufficient baseline frames.")
+             continue
+             
         # Calculate I_dye,0 (initial intensity before pulse)
         I_dye_0 = np.mean(dye_trace[:baseline_frames_end])
         
@@ -258,24 +314,30 @@ def main():
             normalized_trace = np.nan_to_num(normalized_trace, nan=0.0, posinf=0.0, neginf=0.0)
             
         normalized_curves.append(normalized_trace)
+        valid_curve_indices.append(idx) # Keep track of which GUVs were kept
+
+    if not normalized_curves:
+        print("Error: Normalization failed for all curves. Cannot continue.")
+        return
 
     all_intensity_curves = normalized_curves # Replace original list with normalized
     # --- END Normalization ---
 
 
     # --- 6. Calculate Average Curve (and perform alignment) ---
-    if not all_intensity_curves:
-        print("Error: No valid intensity curves were processed. Cannot continue to fitting.")
-        return
-        
     curve_array_original = np.array(all_intensity_curves)
     
     # --- Aligning the data to the median jump frame ---
-    valid_jump_frames = np.array(all_jump_frames)
+    # Filter jump frames to only include those from valid curves
+    valid_jump_frames = np.array(all_jump_frames)[valid_curve_indices]
     
     # Calculate the median jump frame index to use as the common alignment point
     median_jump_frame = int(np.median(valid_jump_frames))
     print(f"Aligning all data using the median jump frame index: {median_jump_frame}")
+    
+    if median_jump_frame >= total_frames_original:
+        print(f"Error: Median jump frame {median_jump_frame} is out of bounds. Capping at 0.")
+        median_jump_frame = 0
     
     # Slice the time array from the median jump frame and re-zero it
     t_aligned = time_array_original[median_jump_frame:]
@@ -335,7 +397,7 @@ def main():
         fig_title = f"Fit Parameters: $A_f = {Af:.2f}$, $A_1 = {A1:.2f}$, $\\tau_1 = {tau1:.2f}$ s, $A_2 = {A2:.2f}$, $\\tau_2 = {tau2:.2f}$ s"
         fit_curve = utils.dyn_model(t, Af, A1, tau1, A2, tau2)
         
-    elif cfg.MODEL_TO_USE == '4-PARAM':
+    elif cfg.MODEL_TO_USE == '4-PARAM': 
         I_offset = params[0]
         A = params[1]
         tau = params[2]
@@ -354,6 +416,10 @@ def main():
     # Use the aligned time array (t) and image stack (im_stack_aligned)
     for i, time_point in enumerate(cfg.EXPORT_TIME_POINTS_S):
         frame_idx, actual_time = utils.find_closest_frame(t, time_point)
+        if frame_idx >= len(im_stack_aligned):
+            print(f"  - Warning: Time point {time_point}s (frame {frame_idx}) is out of range. Skipping.")
+            continue
+            
         frame_data = im_stack_aligned[frame_idx]
         
         label = f"{int(np.round(time_point))} S" 
@@ -380,13 +446,14 @@ def main():
         ax.plot(t[:len(curve)], curve, color='gray', alpha=0.2)
         
     # Plot the average curve
-    ax.plot(t, average_curve, 'r.', markersize=3, label=f'Average (n={len(guv_coords)})')
+    ax.plot(t, average_curve, 'r.', markersize=3, label=f'Average (n={len(all_intensity_curves)})')
 
     # Plot the fitted curve
     ax.plot(t, fit_curve, 'k-', linewidth=2, label='Fitted Curve')
     
     # Highlight the fitted slice for clarity
-    ax.plot(t[fit_slice_index-1], average_curve[fit_slice_index-1], 'b*', markersize=10, label='End of Fit Data')
+    if fit_slice_index > 0 and fit_slice_index <= len(t):
+        ax.plot(t[fit_slice_index-1], average_curve[fit_slice_index-1], 'b*', markersize=10, label='End of Fit Data')
 
 
     # Add fit parameters to the title
@@ -398,7 +465,12 @@ def main():
     ax.legend(loc='lower right')
     plt.grid(True)
     
-    plt.show()
+    # Save the plot
+    plot_name = f"{cfg.EXPERIMENT_BASE_NAME}_kinetic_fit.png"
+    plot_path = os.path.join(cfg.OUTPUT_IMAGE_FOLDER, plot_name)
+    fig.savefig(plot_path, dpi=300, bbox_inches='tight')
+    print(f"Saved summary plot to: {plot_path}")
+    plt.close(fig) # Close the plot to free memory
 
 if __name__ == "__main__":
     main()
