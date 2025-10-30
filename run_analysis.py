@@ -58,19 +58,18 @@ def main():
 
     # --- 3. Extract Timestamps ---
     print("Trying ImageJ metadata extraction...")
-    time_array, frame_interval = utils.extract_timestamps_from_metadata(dye_files)
+    time_array_original, frame_interval = utils.extract_timestamps_from_metadata(dye_files)
     
-    if time_array is None or frame_interval is None:
+    if time_array_original is None or frame_interval is None:
         print("Falling back to manual timestamps...")
         fallback_fps = getattr(cfg, "FALLBACK_FPS", 1.0)
-        time_array, frame_interval = utils.create_manual_timestamps(len(dye_files), fallback_fps)
+        time_array_original, frame_interval = utils.create_manual_timestamps(len(dye_files), fallback_fps)
         
-    
-    total_frames = len(dye_files)
+    total_frames_original = len(dye_files)
 
-    if time_array is not None and frame_interval is not None:
+    if time_array_original is not None and frame_interval is not None:
         print(f"      Found frame interval: {frame_interval} seconds")
-        print(f"Successfully extracted {len(time_array)} timestamps using ImageJ metadata")
+        print(f"Successfully extracted {len(time_array_original)} timestamps")
     else:
         print("Error: Could not extract or generate timestamps.")
         return
@@ -101,6 +100,7 @@ def main():
 
     # --- 5. Process Each GUV ---
     all_intensity_curves = []
+    all_jump_frames = [] # Store jump frames for alignment (Fix 1)
     
     for i, (xc, yc) in enumerate(guv_coords):
         guv_id = df_vesicles.loc[i, 'id']
@@ -115,38 +115,63 @@ def main():
         # 5b. Get Intensity Trace
         intensity_trace = utils.get_intensity_trace(im_stack, mask)
         
-        # 5c. Detect Jump (optional, but useful for aligning the curves if needed)
+        # 5c. Detect Jump (Fix 1: Capture jump frame for alignment)
         try:
             jump_frame = utils.detect_intensity_jump(intensity_trace, sensitivity=cfg.JUMP_SENSITIVITY)
-            if jump_frame != -1:
+            if jump_frame == -1:
+                jump_frame = 0 # Assume no jump or start at 0 if none is clear
+                print(f"No clear jump detected for GUV {guv_id}, assuming start at frame 0.")
+            else:
                 print(f"Fluorescence jump detected at frame {jump_frame}")
+                
         except Exception as e:
             print(f"Warning: Jump detection failed for GUV {guv_id}: {e}")
-            jump_frame = 0 # Assume no jump or start at 0
+            jump_frame = 0 # Default to 0 on error
             
-        # 5d. Store Trace
+        # 5d. Store Trace and Jump Index
         all_intensity_curves.append(intensity_trace)
+        all_jump_frames.append(jump_frame)
 
     print(f"\n--- Analysis Complete: {len(all_intensity_curves)} / {len(guv_coords)} GUVs processed ---")
 
-    # --- 6. Calculate Average Curve ---
+    # --- 6. Calculate Average Curve (and perform alignment) ---
     if not all_intensity_curves:
         print("Error: No valid intensity curves were processed. Cannot continue to fitting.")
         return
         
-    curve_array = np.array(all_intensity_curves)
-    average_curve = np.mean(curve_array, axis=0)
-
+    curve_array_original = np.array(all_intensity_curves)
+    
+    # --- Fix 1: Aligning the data to the median jump frame ---
+    valid_jump_frames = np.array(all_jump_frames)
+    
+    # Calculate the median jump frame index to use as the common alignment point
+    median_jump_frame = int(np.median(valid_jump_frames))
+    print(f"Aligning all data using the median jump frame index: {median_jump_frame}")
+    
+    # Slice the time array from the median jump frame and re-zero it
+    t_aligned = time_array_original[median_jump_frame:]
+    t = t_aligned - t_aligned[0]
+    
+    # Slice the curve data and image stack
+    average_curve = np.mean(curve_array_original[:, median_jump_frame:], axis=0)
+    curve_array = curve_array_original[:, median_jump_frame:]
+    im_stack_aligned = im_stack[median_jump_frame:] # For image export
+    
+    # Update variables for subsequent steps
+    total_frames = len(t)
+    
     # --- 7. Fit Average Curve to Selected Model ---
     print(f"Fitting average curve to model: {cfg.MODEL_TO_USE}...")
-    t = time_array[:total_frames]
     
     # Calculate the number of frames to use for fitting based on the configuration
-    total_frames_after_pulse = int(np.round(total_frames * cfg.FIT_DATA_PERCENTAGE))
-    time_stamp = total_frames_after_pulse 
+    # (Fix 2: Simplified redundant calculation)
+    fit_slice_index = int(np.round(total_frames * cfg.FIT_DATA_PERCENTAGE))
     
-    if time_stamp > total_frames_after_pulse: time_stamp = total_frames_after_pulse
-    print(f"Fitting first {cfg.FIT_DATA_PERCENTAGE*100:.0f}% of data ({time_stamp} frames).")
+    # Ensure the count does not exceed the total available frames after alignment
+    if fit_slice_index > total_frames:
+        fit_slice_index = total_frames
+        
+    print(f"Fitting first {cfg.FIT_DATA_PERCENTAGE*100:.0f}% of aligned data ({fit_slice_index} frames).")
 
     if cfg.MODEL_TO_USE == '5-PARAM':
         p0_guess = cfg.FIT_INITIAL_GUESS
@@ -160,8 +185,8 @@ def main():
     # Perform the curve fit
     params, covariance = sc.curve_fit(
         fit_function, 
-        t[:time_stamp], 
-        average_curve[:time_stamp], 
+        t[:fit_slice_index], 
+        average_curve[:fit_slice_index], 
         p0=p0_guess,
         maxfev=5000 
     )
@@ -196,10 +221,13 @@ def main():
     # Ensure the output directory exists
     os.makedirs(cfg.OUTPUT_IMAGE_FOLDER, exist_ok=True)
     
+    # Use the aligned time array (t) and image stack (im_stack_aligned)
     for i, time_point in enumerate(cfg.EXPORT_TIME_POINTS_S):
         frame_idx, actual_time = utils.find_closest_frame(t, time_point)
-        frame_data = im_stack[frame_idx] # Get frame from the C3 (Dye) stack
-        label = f"{int(np.round(time_point))} S"
+        frame_data = im_stack_aligned[frame_idx] # Get frame from the aligned C3 (Dye) stack
+        
+        # The label should reflect the time relative to the pulse (i.e., relative to the aligned t=0)
+        label = f"{int(np.round(time_point))} S" 
         
         styled_frame = utils.style_image(
             frame_data, 
@@ -210,7 +238,7 @@ def main():
         out_name = f"frame_{i+1}_at_{int(np.round(time_point))}s.png"
         out_path = os.path.join(cfg.OUTPUT_IMAGE_FOLDER, out_name)
         cv2.imwrite(out_path, styled_frame)
-        print(f"  - Saved {out_name} (actual time: {actual_time:.3f}s)")
+        print(f"  - Saved {out_name} (actual time: {actual_time:.3f}s relative to pulse)")
         
     print("Frame export complete.")
 
@@ -220,19 +248,19 @@ def main():
     
     # Plot all individual GUV traces
     for curve in curve_array:
-        ax.plot(t, curve, color='gray', alpha=0.2)
+        ax.plot(t[:len(curve)], curve, color='gray', alpha=0.2)
         
     # Plot the average curve
-    ax.plot(t, average_curve, 'r.', markersize=3, label=f'Average (n={len(all_intensity_curves)})')
+    ax.plot(t, average_curve, 'r.', markersize=3, label=f'Average (n={len(guv_coords)})')
 
     # Plot the fitted curve
-    ax.plot(t[:time_stamp], fit_curve[:time_stamp], 'k-', linewidth=2, label='Fitted Curve')
+    ax.plot(t[:fit_slice_index], fit_curve[:fit_slice_index], 'k-', linewidth=2, label='Fitted Curve')
 
     # Add fit parameters to the title
     ax.set_title(fig_title)
     
     # Final plot styling
-    ax.set_xlabel("Time (s)")
+    ax.set_xlabel("Time (s) relative to Electroporation Pulse")
     ax.set_ylabel("Normalized Intensity ($I_{uptake}$)")
     ax.legend(loc='lower right')
     plt.grid(True)
