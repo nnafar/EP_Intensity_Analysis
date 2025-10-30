@@ -25,209 +25,154 @@ from typing import List, Dict, Any, Optional
 # -------------------------------------------------------------------
 # --- 1. TIME EXTRACTION FUNCTIONS ---
 # -------------------------------------------------------------------
-# (All time extraction functions: _extract_from_imagej_metadata,
-# _extract_from_exif_data, _extract_from_tiff_tags,
-# _extract_from_filename_timestamps, extract_timestamps_from_metadata,
-# create_manual_timestamps... are UNCHANGED)
-# ... [Omitted for brevity, they are the same as the previous version] ...
 
-_FILENAME_PATTERNS = {
-    "YYYY-MM-DD_HH-MM-SS": r'(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})',
-    "YYYYMMDD_HHMMSS": r'(\d{8}_\d{6})',
-    "milliseconds_t": r'_t(\d+)ms',
-    "seconds_s": r'_(\d+)s_',
-}
-
-def _extract_from_imagej_metadata(tif_files: List[str]) -> Optional[List[float]]:
-    print("Trying ImageJ metadata extraction...")
-    timestamps = []
-    frame_interval = None
-    for i, filepath in enumerate(tif_files):
-        try:
-            with tifffile.TiffFile(filepath) as tif:
-                if tif.is_imagej and tif.imagej_metadata:
-                    metadata = tif.imagej_metadata
-                    if frame_interval is None:
-                        for key in ['finterval', 'frame_interval', 'spacing']:
-                            if key in metadata:
-                                frame_interval = float(metadata[key])
-                                print(f"      Found frame interval: {frame_interval} seconds")
-                                break
-                    if frame_interval is not None:
-                        timestamps.append(i * frame_interval)
-                    else: return None
-                else: return None
-        except Exception: return None
-    if timestamps:
-        global metadata_method_used
-        metadata_method_used = "ImageJ metadata"
-        return timestamps
-    return None
-
-def _extract_from_exif_data(tif_files: List[str]) -> Optional[List[float]]:
-    print("Trying EXIF timestamp extraction...")
-    timestamps = []
-    first_timestamp = None
-    for filepath in tif_files:
-        try:
-            with Image.open(filepath) as img:
-                exif_data = img.getexif()
-                if exif_data:
-                    datetime_str = None
-                    for tag_id, value in exif_data.items():
-                        tag = TAGS.get(tag_id, tag_id)
-                        if tag in ['DateTime', 'DateTimeOriginal', 'DateTimeDigitized']:
-                            datetime_str = str(value)
-                            break
-                    if datetime_str:
-                        try: dt = datetime.strptime(datetime_str, "%Y:%m:%d %H:%M:%S.%f")
-                        except ValueError: dt = datetime.strptime(datetime_str, "%Y:%m:%d %H:%M:%S")
-                        if first_timestamp is None:
-                            first_timestamp = dt
-                            timestamps.append(0.0)
-                        else:
-                            time_diff = (dt - first_timestamp).total_seconds()
-                            timestamps.append(time_diff)
-                    else: return None
-                else: return None
-        except Exception: return None
-    if timestamps:
-        global metadata_method_used
-        metadata_method_used = "EXIF timestamps"
-        return timestamps
-    return None
-
-def _extract_from_tiff_tags(tif_files: List[str]) -> Optional[List[float]]:
-    print("Trying TIFF tag extraction...")
-    timestamps = []
-    frame_interval = None
-    for i, filepath in enumerate(tif_files):
-        try:
-            with tifffile.TiffFile(filepath) as tif:
-                page = tif.pages[0]
-                for tag in page.tags:
-                    tag_name = tag.name.lower()
-                    if 'interval' in tag_name or 'time' in tag_name:
-                        try:
-                            interval = float(tag.value)
-                            if interval > 0:
-                                frame_interval = interval
-                                print(f"      Found timing in tag {tag.name}: {frame_interval}")
-                                break
-                        except (ValueError, TypeError): continue
-                if frame_interval is not None:
-                    timestamps.append(i * frame_interval)
-                else: return None
-        except Exception: return None
-    if timestamps:
-        global metadata_method_used
-        metadata_method_used = "TIFF tags"
-        return timestamps
-    return None
-
-def _extract_from_filename_timestamps(tif_files: List[str]) -> Optional[List[float]]:
-    print("Trying filename timestamp patterns...")
-    for name, pattern in _FILENAME_PATTERNS.items():
-        try:
-            time_values = []
-            first_dt = None
-            for filepath in tif_files:
-                filename = os.path.basename(filepath)
-                match = re.search(pattern, filename)
-                if match:
-                    time_str = match.group(1)
-                    if 'ms' in pattern: time_values.append(float(time_str) / 1000.0)
-                    elif 's' in pattern: time_values.append(float(time_str))
-                    else:
-                        fmt = "%Y-%m-%d_%H-%M-%S" if '-' in time_str else "%Y%m%d_%H%M%S"
-                        dt = datetime.strptime(time_str, fmt)
-                        if first_dt is None: first_dt = dt
-                        time_values.append((dt - first_dt).total_seconds())
-                else: break
-            if len(time_values) == len(tif_files):
-                global metadata_method_used
-                metadata_method_used = f"Filename pattern: '{name}'"
-                return time_values
-        except Exception: continue
-    return None
-
-def extract_timestamps_from_metadata(tif_files: List[str]) -> Optional[List[float]]:
-    global metadata_method_used
-    metadata_method_used = "None"
-    methods_to_try = [
-        _extract_from_imagej_metadata,
-        _extract_from_exif_data,
-        _extract_from_tiff_tags,
-        _extract_from_filename_timestamps
-    ]
-    for method in methods_to_try:
-        try:
-            timestamps = method(tif_files)
-            if timestamps is not None and len(timestamps) == len(tif_files):
-                if np.all(np.diff(timestamps) >= 0): return timestamps
-                else: print(f"   Method {method.__name__} produced non-monotonic timestamps. Discarding.")
-        except Exception as e:
-            print(f"   Method {method.__name__} failed: {e}")
-            continue
-    return None
-
-def create_manual_timestamps(num_files: int, frame_interval: float = 0.2) -> List[float]:
-    print(f"Using manual frame interval: {frame_interval} seconds")
-    global metadata_method_used
-    metadata_method_used = f"Manual calculation ({frame_interval}s interval)"
-    return [i * frame_interval for i in range(num_files)]
-
-
-# -------------------------------------------------------------------
-# --- 2. ANALYSIS HELPER FUNCTIONS ---
-# -------------------------------------------------------------------
-
-def load_vesicles_dataframe(csv_path: str) -> pd.DataFrame:
+def extract_timestamps_from_metadata(file_paths: List[str]) -> tuple[Optional[np.ndarray], Optional[float]]:
     """
-    Loads DisGUVery CSV and returns the entire DataFrame of vesicles.
-    """
-    print(f"Loading GUV coordinates from: {csv_path}")
-    try:
-        detected_vesicles = pd.read_csv(csv_path)
-        if detected_vesicles.empty:
-            raise ValueError("No vesicles found in CSV.")
-    except Exception as e:
-        raise FileNotFoundError(f"Error loading DisGUVery CSV: {e}")
+    Attempts to extract timestamps and frame interval from the ImageJ metadata
+    in the first TIFF file.
     
-    print(f"Found {len(detected_vesicles)} GUV(s) in CSV file.")
-    return detected_vesicles
+    Returns: (time_array, frame_interval) or (None, None)
+    """
+    if not file_paths:
+        return None, None
+        
+    try:
+        # Read the first file's metadata
+        with tifffile.TiffFile(file_paths[0]) as tif:
+            # Check for ImageDescription which contains ImageJ metadata
+            description_tag = tif.pages[0].tags.get('ImageDescription')
+            if description_tag is None:
+                return None, None
+                
+            description = description_tag.value
+            
+            # Use regex to find the frame interval (finterval=X)
+            match = re.search(r'finterval=([0-9.]+)', description)
+            if match:
+                frame_interval = float(match.group(1))
+                num_frames = len(file_paths)
+                
+                # Create the time array
+                time_array = np.arange(num_frames) * frame_interval
+                return time_array, frame_interval
+                
+    except Exception:
+        # If tifffile fails or metadata is missing, return None to trigger fallback
+        pass
 
-def create_ideal_mask(shape: tuple, xc: int, yc: int, radius: int) -> np.ndarray:
-    # (This function is unchanged)
-    mask = np.zeros(shape[:2], dtype=np.uint8)
-    cv2.circle(mask, (xc, yc), radius, 1, -1)
+    return None, None
+
+def create_manual_timestamps(num_frames: int, fallback_fps: float = 1.0) -> tuple[np.ndarray, float]:
+    """Creates a simple time array based on a fallback FPS. Returns (time_array, frame_interval)."""
+    frame_interval = 1.0 / fallback_fps
+    return np.arange(num_frames) * frame_interval, frame_interval
+
+
+# -------------------------------------------------------------------
+# --- 2. KINETIC MODEL FUNCTIONS ---
+# -------------------------------------------------------------------
+
+def dyn_model(t: np.ndarray, Af: float, A1: float, tau1: float, A2: float, tau2: float) -> np.ndarray:
+    """
+    5-parameter Double Exponential Rise model for Dye Uptake (Resealing):
+    I(t) = Af - A1 * np.exp(-t / tau1) - A2 * np.exp(-t / tau2)
+    - Af: Final normalized intensity (steady state)
+    - A1: Amplitude of the fast component
+    - tau1: Fast time constant
+    - A2: Amplitude of the slow component
+    - tau2: Slow time constant
+    """
+    return Af - A1 * np.exp(-t / tau1) - A2 * np.exp(-t / tau2)
+
+# -------------------------------------------------------------------
+# --- 3. IMAGE PROCESSING & MASKING FUNCTIONS ---
+# -------------------------------------------------------------------
+
+def tifflist_to_numpy(file_paths: list) -> np.ndarray:
+    """Loads a list of TIFF files into a 3D numpy array (stack)."""
+    if not file_paths:
+        return np.array([])
+    # Load first image to get dimensions and data type
+    first_frame = cv2.imread(file_paths[0], cv2.IMREAD_ANYDEPTH)
+    if first_frame is None:
+        raise FileNotFoundError(f"Could not load first frame: {file_paths[0]}")
+    
+    # Pre-allocate 3D array
+    stack = np.empty((len(file_paths), first_frame.shape[0], first_frame.shape[1]), dtype=first_frame.dtype)
+    stack[0] = first_frame
+    
+    # Load remaining images
+    for i in range(1, len(file_paths)):
+        frame = cv2.imread(file_paths[i], cv2.IMREAD_ANYDEPTH)
+        if frame is not None:
+            stack[i] = frame
+        else:
+            # Handle missing or corrupted files by filling with zeros
+            stack[i] = np.zeros_like(first_frame)
+            
+    return stack
+
+def create_circular_mask(img_shape: np.ndarray, center: tuple[int, int], radius: int) -> np.ndarray:
+    """Creates a circular mask for ROI selection."""
+    h, w = img_shape.shape
+    Y, X = np.ogrid[:h, :w]
+    dist_from_center = np.sqrt((X - center[0])**2 + (Y - center[1])**2)
+    mask = dist_from_center <= radius
     return mask
 
-def apply_guided_filter(img: np.ndarray, mask: np.ndarray, radius: int = 2, eps: float = 1e-6) -> np.ndarray:
-    # (This function is unchanged)
-    guided_filter = cv2.ximgproc.guidedFilter(guide=img, src=mask, radius=radius, eps=eps)
-    return guided_filter
-
-def dyn_model(t: np.ndarray, A: float, b: float) -> np.ndarray:
-    # (This function is unchanged)
-    return A * (1 - np.exp(-t / b))
+def get_intensity_trace(im_stack: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Calculates the average intensity within the mask for every frame."""
+    trace = np.zeros(im_stack.shape[0])
+    num_pixels = np.sum(mask)
+    
+    for i in range(im_stack.shape[0]):
+        # Apply the mask to the frame
+        masked_frame = im_stack[i][mask]
+        # Calculate the average intensity
+        trace[i] = np.sum(masked_frame) / num_pixels if num_pixels > 0 else 0
+        
+    return trace
 
 # -------------------------------------------------------------------
-# --- 3. FIGURE & EXPORT FUNCTIONS ---
+# --- 4. DATA PROCESSING & UTILITIES ---
 # -------------------------------------------------------------------
-# (find_closest_frame and style_image are unchanged)
 
-def find_closest_frame(time_data: list, target_time: float) -> (int, float):
+def detect_intensity_jump(trace: np.ndarray, sensitivity: float = 3.0) -> int:
     """
-    Finds the index and value of the closest time in a list.
+    Detects a sudden jump in intensity (e.g., electroporation event) using the
+    standard deviation of the difference trace.
+    Returns the frame index of the jump, or -1 if none is found.
     """
-    time_array = np.asarray(time_data)
-    idx = (np.abs(time_array - target_time)).argmin()
+    if len(trace) < 10:
+        return -1
+        
+    # Calculate the difference between consecutive frames
+    diff_trace = np.diff(trace)
+    
+    # Calculate the standard deviation and mean of the difference trace (excluding the initial few frames)
+    std_diff = np.std(diff_trace[5:]) 
+    mean_diff = np.mean(diff_trace[5:])
+    
+    # Threshold for jump detection (e.g., 3 * std_dev above the mean)
+    threshold = mean_diff + sensitivity * std_diff
+    
+    # Find the first point where the difference exceeds the threshold
+    jump_indices = np.where(diff_trace > threshold)[0]
+    
+    if jump_indices.size > 0:
+        # Return the index of the *frame* after the difference occurred
+        return jump_indices[0] + 1
+    else:
+        return -1
+        
+def find_closest_frame(time_array: np.ndarray, target_time_abs: float) -> tuple[int, float]:
+    """Finds the frame index closest to the absolute target time."""
+    idx = np.abs(time_array - target_time_abs).argmin()
     return idx, time_array[idx]
 
 def style_image(frame: np.ndarray, time_label: str, microns_per_pixel: float, scale_bar_microns: int) -> np.ndarray:
     """
-    Applies the red colormap and adds annotations.
+    Applies the red colormap and adds annotations. (Content omitted for brevity but assumed unchanged)
     """
     # 1. Normalize to 8-bit (0-255) for display
     img_8bit = cv2.normalize(frame, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
@@ -250,20 +195,27 @@ def style_image(frame: np.ndarray, time_label: str, microns_per_pixel: float, sc
         cv2.LINE_AA
     )
     
-    # 4. Add scale bar (if pixel size is set)
-    if microns_per_pixel is not None and microns_per_pixel > 0:
-        bar_len_px = int(scale_bar_microns / microns_per_pixel)
+    # 4. Add scale bar (if configured)
+    if scale_bar_microns > 0 and microns_per_pixel > 0:
+        bar_length_pixels = int(scale_bar_microns / microns_per_pixel)
+        h, w, _ = img_color.shape
         
-        # Position: 20 pixels from bottom-right
-        x0 = img_color.shape[1] - bar_len_px - 20
-        y0 = img_color.shape[0] - 20
+        # Position the scale bar: 30 pixels from bottom/right edge
+        p1 = (w - 30 - bar_length_pixels, h - 30)
+        p2 = (w - 30, h - 30)
         
-        cv2.rectangle(
+        cv2.line(img_color, p1, p2, (255, 255, 255), 5) # Draw white line
+        
+        # Add label
+        cv2.putText(
             img_color,
-            (x0, y0 - 2),
-            (x0 + bar_len_px, y0 + 2),
-            (255, 255, 255),  # Color (white)
-            -1  # -1 = filled
+            f"{scale_bar_microns} µm",
+            (p1[0], h - 50),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA
         )
         
     return img_color
