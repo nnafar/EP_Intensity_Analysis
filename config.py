@@ -57,13 +57,21 @@ CSV_SUFFIX = "_detected_vesicles.csv"
 # Make this WIDER (e.g., 0.5) if the CSV estimate is poor.
 MEMBRANE_SEARCH_FACTOR = 0.3
 
+# --- NEW: Membrane Width ---
+# Defines the membrane region as: Detected Peak +/- this value.
+# The FWHM detection (peak_widths) was too broad for narrow peaks.
+# A value of 4 creates an 8-pixel wide membrane region.
+MEMBRANE_FIXED_HALF_WIDTH = 2
+
+
 # --- Background Mask Geometry ---
 # Buffer space (in pixels) between the GUV's outer edge and the
 # *start* of the background ring.
-BG_BUFFER_PIXELS = 15
+# (Reduced from 15 to 5 to create a narrower gap)
+BG_BUFFER_PIXELS = 3
 
 # Width (in pixels) of the annular ring used for background subtraction.
-BG_RING_WIDTH_PIXELS = 30
+BG_RING_WIDTH_PIXELS = 10
 
 # --- Jump Detection ---
 # Sensitivity for detecting the fluorescence jump.
@@ -128,7 +136,7 @@ EXPORT_TIME_POINTS_S = [0, 50, 100, 200, 300]
 
 # --- Scale Bar ---
 # Microns per pixel. Set to 0 to disable the scale bar.
-MICRONS_PER_PIXEL = 0.0 # 0.1625 
+MICRONS_PER_PIXEL = 0.108 # 0.1625 
 
 # Length of the scale bar to draw (in microns).
 SCALE_BAR_LENGTH_MICRONS = 10

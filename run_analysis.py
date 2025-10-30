@@ -121,19 +121,19 @@ def main():
         print(f"  - Using radius estimate (CSV 'size'/2): {guv_radius_estimate}px")
 
 
-        # --- *** FIX: DISABLE CENTER REFINEMENT *** ---
-        # Bright clusters skew the center of mass calculation.
-        # We will use the original CSV coordinates directly.
-        # print(f"  - Refining center coordinates...")
-        # (xc_refined, yc_refined) = utils.refine_guv_center(
-        #     roi_guide_frame, 
-        #     (xc_orig, yc_orig), 
-        #     guv_radius_estimate,
-        #     search_box_factor=0.8 # Search in a box 1.6x the radius
-        # )
-        xc_refined, yc_refined = xc_orig, yc_orig # Use original center
-        print(f"  - Using original CSV center: ({xc_refined}, {yc_refined})")
-        # --- *** END FIX *** ---
+        # --- *** MODIFIED: RE-ENABLING CENTER REFINEMENT *** ---
+        # Bright clusters *can* skew the center of mass calculation, but
+        # the CSV coordinate may also be slightly off.
+        print(f"  - Refining center coordinates...")
+        (xc_refined, yc_refined) = utils.refine_guv_center(
+            roi_guide_frame, 
+            (xc_orig, yc_orig), 
+            guv_radius_estimate,
+            search_box_factor=0.8 # Search in a box 1.6x the radius
+        )
+        # xc_refined, yc_refined = xc_orig, yc_orig # Uncomment this line to disable refinement
+        print(f"  - Original center: ({xc_orig}, {yc_orig}), Refined center: ({xc_refined}, {yc_refined})")
+        # --- *** END MODIFICATION *** ---
         
         # 5a. ENHANCED: Define Masks using Membrane Detection
         print(f"  - Detecting membrane from radial intensity profile...")
@@ -144,11 +144,12 @@ def main():
         # --- UPDATED FUNCTION CALL ---
         inner_mask, membrane_mask, background_mask, detection_info = utils.create_guv_masks_with_detection(
             roi_guide_frame, 
-            (xc_refined, yc_refined),  # Use the original (now "refined") center
+            (xc_refined, yc_refined),  # Use the refined center
             radius_estimate=guv_radius_estimate,
             bg_buffer=cfg.BG_BUFFER_PIXELS,
             bg_width=cfg.BG_RING_WIDTH_PIXELS,
             search_factor=cfg.MEMBRANE_SEARCH_FACTOR, # <-- Read from config
+            membrane_half_width=cfg.MEMBRANE_FIXED_HALF_WIDTH, # <-- ADD THIS LINE
             num_angles=360,  # Use lots of angles for accurate detection
             length_excess=1.5,
             viz_thickness=viz_thickness  # Pass the new parameter
@@ -427,7 +428,7 @@ def main():
         styled_frame = utils.style_image(
             frame_data, 
             label, 
-            cfg.MICRONS_PER_PIXEL, 
+            cfg.MICRONS_PER_PIXEL, # <--- CORRECTED TYPO
             cfg.SCALE_BAR_LENGTH_MICRONS
             )
         out_name = f"frame_{i+1}_at_{int(np.round(time_point))}s.png"

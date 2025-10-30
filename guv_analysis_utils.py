@@ -254,7 +254,8 @@ def average_radial_profile(profiles: np.ndarray) -> np.ndarray:
 def membrane_search(profile: np.ndarray, 
                     radii: np.ndarray, 
                     expected_radius: int, 
-                    search_factor: float) -> Tuple[int, int, int, List[str], bool]:
+                    search_factor: float,
+                    membrane_half_width: int) -> Tuple[int, int, int, List[str], bool]:
     """
     Detects membrane location by finding the highest peak in a search window
     defined by expected_radius +/- (expected_radius * search_factor).
@@ -315,22 +316,22 @@ def membrane_search(profile: np.ndarray,
         peak_idx = peaks[chosen_peak_idx_in_peaks_array]
 
     # --- 3. Calculate width ---
-    # Use peak_widths on the *original* profile to get accurate widths
+    # --- *** MODIFIED BLOCK *** ---
+    # Use the fixed half-width from config instead of scipy.peak_widths,
+    # as peak_widths was proving too broad for narrow peaks.
     try:
-        width_results = peak_widths(profile, [peak_idx], rel_height=0.5)
-        # width_results contains (widths, width_heights, left_ips, right_ips)
-        inner_idx = int(np.round(width_results[2][0]))
-        outer_idx = int(np.round(width_results[3][0]))
+        inner_idx = max(0, peak_idx - membrane_half_width)
+        outer_idx = min(len(profile) - 1, peak_idx + membrane_half_width)
         
-        # Sanity check
         if inner_idx >= outer_idx:
-            raise ValueError("Inner border >= outer border")
+            raise ValueError("Inner border >= outer border (width is zero or negative)")
             
     except Exception as e:
         comments.append(f"width_calc_failed: {e}")
-        # Fallback: use a fixed width (e.g., 5 pixels) around the peak
+        # Fallback: use a default width (e.g., 5 pixels) around the peak
         inner_idx = max(0, peak_idx - 5)
         outer_idx = min(len(profile) - 1, peak_idx + 5)
+    # --- *** END MODIFIED BLOCK *** ---
         
     # --- 4. Convert indices back to pixel radii ---
     # Ensure indices are within the bounds of the radii array
@@ -359,7 +360,8 @@ def create_guv_masks_with_detection(roi_guide_frame: np.ndarray,
                                    radius_estimate: int, 
                                    bg_buffer: int, 
                                    bg_width: int,
-                                   search_factor: float, # <-- ADDED
+                                   search_factor: float, # <-- From config
+                                   membrane_half_width: int, # <-- ADDED
                                    num_angles: int = 360, 
                                    length_excess: float = 1.5,
                                    viz_thickness: Optional[int] = None) -> \
@@ -392,7 +394,8 @@ def create_guv_masks_with_detection(roi_guide_frame: np.ndarray,
         radial_profile, 
         along_radius,
         expected_radius=radius_estimate,
-        search_factor=search_factor # <-- Use passed-in value
+        search_factor=search_factor, # <-- Use passed-in value
+        membrane_half_width=membrane_half_width # <-- PASS NEW VALUE
     )
     # --- END UPDATED CALL ---
 
