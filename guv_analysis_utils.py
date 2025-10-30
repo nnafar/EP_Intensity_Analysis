@@ -72,6 +72,16 @@ def create_manual_timestamps(num_frames: int, fallback_fps: float = 1.0) -> tupl
 # --- 2. KINETIC MODEL FUNCTIONS ---
 # -------------------------------------------------------------------
 
+def dyn_model_4param(t: np.ndarray, I_offset: float, A: float, tau: float, D: float) -> np.ndarray:
+    """
+    4-parameter Exponential Rise with Linear Drift: I(t) = I_offset + A * (1 - np.exp(-t/tau)) + D * t
+    - I_offset: Baseline intensity
+    - A: Amplitude of the rise
+    - tau: Time constant
+    - D: Linear drift term
+    """
+    return I_offset + A * (1 - np.exp(-t / tau)) + D * t
+
 def dyn_model(t: np.ndarray, Af: float, A1: float, tau1: float, A2: float, tau2: float) -> np.ndarray:
     """
     5-parameter Double Exponential Rise model for Dye Uptake (Resealing):

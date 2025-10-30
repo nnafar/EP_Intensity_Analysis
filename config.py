@@ -33,10 +33,11 @@ TIF_SUFFIX = '_t*.tif'
 
 
 # --- 3. ANALYSIS PARAMETERS ---
+MODEL_TO_USE = '5-PARAM'  # Options: '4-PARAM' or '5-PARAM'
 JUMP_SENSITIVITY = 3
 FIT_DATA_PERCENTAGE = 0.5
-# Initial guess for [Af, A1, tau1, A2, tau2]
-FIT_INITIAL_GUESS = [1.0, 0.5, 10.0, 0.5, 100.0] 
+FIT_INITIAL_GUESS = [1.0, 0.5, 10.0, 0.5, 100.0] # [Af, A1, tau1, A2, tau2]
+FIT_INITIAL_GUESS_4PARAM = [1000.0, 1000.0, 10.0, 0.05] # [I_offset, A, tau, D]
 
 # --- 4. IMAGE EXPORT PARAMETERS ---
 # List of time points (in seconds) to export as image frames

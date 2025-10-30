@@ -58,12 +58,10 @@ def main():
 
     # --- 3. Extract Timestamps ---
     print("Trying ImageJ metadata extraction...")
-    # Function call is now expecting two values (time_array, frame_interval)
     time_array, frame_interval = utils.extract_timestamps_from_metadata(dye_files)
     
     if time_array is None or frame_interval is None:
         print("Falling back to manual timestamps...")
-        # Assuming FALLBACK_FPS is set in config.py or use a default of 1.0
         fallback_fps = getattr(cfg, "FALLBACK_FPS", 1.0)
         time_array, frame_interval = utils.create_manual_timestamps(len(dye_files), fallback_fps)
         
@@ -89,8 +87,8 @@ def main():
     print(f"Loading GUV coordinates from: {path_to_csv}")
     try:
         df_vesicles = pd.read_csv(path_to_csv, comment='#', header=None)
-        # Assuming columns: id_vesicle, xc (pix), yc (pix), size (pix), matching score
-        df_vesicles.columns = ['id', 'xc', 'yc', 'size', 'score']
+        # CSV FIX: Assumes 6 columns (5 data + 1 extra trailing comma)
+        df_vesicles.columns = ['id', 'xc', 'yc', 'size', 'score', 'extra']
         
     except Exception as e:
         print(f"Error reading CSV file: {e}")
@@ -139,8 +137,8 @@ def main():
     curve_array = np.array(all_intensity_curves)
     average_curve = np.mean(curve_array, axis=0)
 
-    # --- 7. Fit Average Curve to Model (Double Exponential) ---
-    print("Fitting average curve to model...")
+    # --- 7. Fit Average Curve to Selected Model ---
+    print(f"Fitting average curve to model: {cfg.MODEL_TO_USE}...")
     t = time_array[:total_frames]
     
     # Calculate the number of frames to use for fitting based on the configuration
@@ -149,26 +147,50 @@ def main():
     
     if time_stamp > total_frames_after_pulse: time_stamp = total_frames_after_pulse
     print(f"Fitting first {cfg.FIT_DATA_PERCENTAGE*100:.0f}% of data ({time_stamp} frames).")
-    
+
+    if cfg.MODEL_TO_USE == '5-PARAM':
+        p0_guess = cfg.FIT_INITIAL_GUESS
+        fit_function = utils.dyn_model
+    elif cfg.MODEL_TO_USE == '4-PARAM':
+        p0_guess = cfg.FIT_INITIAL_GUESS_4PARAM
+        fit_function = utils.dyn_model_4param
+    else:
+        raise ValueError("Invalid MODEL_TO_USE specified in config.py. Must be '4-PARAM' or '5-PARAM'.")
+
     # Perform the curve fit
     params, covariance = sc.curve_fit(
-        utils.dyn_model, 
+        fit_function, 
         t[:time_stamp], 
         average_curve[:time_stamp], 
-        p0=cfg.FIT_INITIAL_GUESS,
-        maxfev=5000 # Increased maxfev for double exponential stability
+        p0=p0_guess,
+        maxfev=5000 
     )
     
-    # Extract the 5 fitted parameters: Af, A1, tau1, A2, tau2
-    Af = params[0] # Final normalized intensity (Af)
-    A1 = params[1] # Amplitude of the fast component (A1)
-    tau1 = params[2] # Fast time constant (tau1)
-    A2 = params[3] # Amplitude of the slow component (A2)
-    tau2 = params[4] # Slow time constant (tau2)
+    # --- 8. Extract Parameters and Generate Outputs ---
+    if cfg.MODEL_TO_USE == '5-PARAM':
+        # Extract the 5 fitted parameters: Af, A1, tau1, A2, tau2
+        Af = params[0] # Final normalized intensity (Af)
+        A1 = params[1] # Amplitude of the fast component (A1)
+        tau1 = params[2] # Fast time constant (tau1)
+        A2 = params[3] # Amplitude of the slow component (A2)
+        tau2 = params[4] # Slow time constant (tau2)
 
-    print(f"Fit Complete. Af={Af:.2f}, A1={A1:.2f}, tau1={tau1:.2f} s, A2={A2:.2f}, tau2={tau2:.2f} s")
+        print(f"Fit Complete. Af={Af:.2f}, A1={A1:.2f}, tau1={tau1:.2f} s, A2={A2:.2f}, tau2={tau2:.2f} s")
+        fig_title = f"Fit Parameters: $A_f = {Af:.2f}$, $A_1 = {A1:.2f}$, $\\tau_1 = {tau1:.2f}$ s, $A_2 = {A2:.2f}$, $\\tau_2 = {tau2:.2f}$ s"
+        fit_curve = utils.dyn_model(t, Af, A1, tau1, A2, tau2)
+        
+    elif cfg.MODEL_TO_USE == '4-PARAM':
+        # Extract the 4 fitted parameters: I_offset, A, tau, D
+        I_offset = params[0] # Initial baseline intensity (I_offset)
+        A = params[1] # Amplitude of rise (A)
+        tau = params[2] # Time constant (tau)
+        D = params[3] # Linear drift term (D)
 
-    # --- 8. Export Representative Frames ---
+        print(f"Fit Complete. I_offset={I_offset:.2f}, A={A:.2f}, tau={tau:.2f} s, D={D:.4f}")
+        fig_title = f"Fit Parameters: $I_{{offset}} = {I_offset:.2f}$, $A = {A:.2f}$, $\\tau = {tau:.2f}$ s, $D = {D:.4f}$"
+        fit_curve = utils.dyn_model_4param(t, I_offset, A, tau, D)
+
+    # --- 9. Export Representative Frames ---
     print("\nExporting representative frames...")
     
     # Ensure the output directory exists
@@ -192,7 +214,7 @@ def main():
         
     print("Frame export complete.")
 
-    # --- 9. PLOT KINETIC RESULTS (Summary Plot) ---
+    # --- 10. PLOT KINETIC RESULTS (Summary Plot) ---
     print("\nGenerating summary plot...")
     fig,ax = plt.subplots(nrows=1,ncols=1, figsize=(10, 6))
     
@@ -204,11 +226,9 @@ def main():
     ax.plot(t, average_curve, 'r.', markersize=3, label=f'Average (n={len(all_intensity_curves)})')
 
     # Plot the fitted curve
-    fit_curve = utils.dyn_model(t, Af, A1, tau1, A2, tau2)
     ax.plot(t[:time_stamp], fit_curve[:time_stamp], 'k-', linewidth=2, label='Fitted Curve')
 
-    # Add fit parameters to the title - UPDATED FOR 5-PARAMETER MODEL
-    fig_title = f"Fit Parameters: $A_f = {Af:.2f}$, $A_1 = {A1:.2f}$, $\\tau_1 = {tau1:.2f}$ s, $A_2 = {A2:.2f}$, $\\tau_2 = {tau2:.2f}$ s"
+    # Add fit parameters to the title
     ax.set_title(fig_title)
     
     # Final plot styling
