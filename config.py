@@ -67,7 +67,7 @@ MEMBRANE_FIXED_HALF_WIDTH = 3
 # --- Background Mask Geometry ---
 # Buffer space (in pixels) between the GUV's outer edge and the
 # *start* of the background ring.
-BG_BUFFER_PIXELS = 5
+BG_BUFFER_PIXELS = 10
 
 # Width (in pixels) of the annular ring used for background subtraction.
 BG_RING_WIDTH_PIXELS = 10
@@ -151,7 +151,7 @@ MASK_VIZ_OVERLAY_ALPHA = 0.6
 # Set a fixed thickness (in pixels) for the RED membrane visualization ring.
 # If set to None, the ring will fill the entire detected membrane region.
 # A fixed value (e.g., 5) can look cleaner.
-VIZ_MEMBRANE_THICKNESS_PIXELS = 11
+VIZ_MEMBRANE_THICKNESS_PIXELS = None
 
 
 # -------------------------------------------------------------------
