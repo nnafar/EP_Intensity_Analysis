@@ -1,18 +1,16 @@
 # -*- coding: utf-8 -*-
 """
 ======================================================
---- GUV INTENSITY ANALYSIS (v3 - Fractional I_uptake) ---
+--- GUV INTENSITY ANALYSIS (v2 - Multi-GUV) ---
 ======================================================
-This script analyzes all GUVs found in the CSV file, applying background
-correction and scaling the kinetic traces to a 0-to-1 fractional uptake.
+This script analyzes all GUVs found in the CSV file.
 
 It will:
 1.  Loop over all GUVs to get their individual uptake curves.
-2.  Apply background correction using an annulus mask.
-3.  Calculate an average uptake curve.
-4.  Fit the average curve to the kinetic model.
-5.  Export time-lapse frames.
-6.  Plot all individual GUV curves (gray) and the
+2.  Calculate an average uptake curve.
+3.  Fit the average curve to the kinetic model.
+4.  Export time-lapse frames.
+5.  Plot all individual GUV curves (gray) and the
     average curve with its fit (red/black).
 """
 
@@ -40,7 +38,6 @@ def main():
     path_to_csv = os.path.join(cfg.DATA_FOLDER, cfg.ROI_CHANNEL_PREFIX + cfg.EXPERIMENT_BASE_NAME + cfg.CSV_SUFFIX)
     
     # --- 2. Load File Names ---
-    # ... (unchanged)
     dye_files = natsorted(glob.glob(path_to_dye_tifs))
     roi_guide_files = natsorted(glob.glob(path_to_roi_tifs))
     
@@ -60,7 +57,6 @@ def main():
     print(f"Found {len(dye_files)} dye image files.")
 
     # --- 3. Extract Timestamps ---
-    # ... (unchanged)
     print("Trying ImageJ metadata extraction...")
     time_array_original, frame_interval = utils.extract_timestamps_from_metadata(dye_files)
     
@@ -90,16 +86,9 @@ def main():
     print(f"Loading GUV coordinates from: {path_to_csv}")
     try:
         df_vesicles = pd.read_csv(path_to_csv, comment='#', header=None)
+        # CSV FIX: Assumes 6 columns (5 data + 1 extra trailing comma)
+        df_vesicles.columns = ['id', 'xc', 'yc', 'size', 'score', 'extra']
         
-        # --- FIX 2: Flexible CSV Column Handling ---
-        num_cols = df_vesicles.shape[1]
-        if num_cols >= 5:
-             # Use the first 5 columns explicitly
-            df_vesicles = df_vesicles.iloc[:, :5] 
-            df_vesicles.columns = ['id', 'xc', 'yc', 'size', 'score']
-        else:
-            raise ValueError(f"CSV file must contain at least 5 columns (id, xc, yc, yc, size, score), found {num_cols}.")
-            
     except Exception as e:
         print(f"Error reading CSV file: {e}")
         return
@@ -110,8 +99,8 @@ def main():
     print(f"Found {len(guv_coords)} GUV(s) in CSV file.")
 
     # --- 5. Process Each GUV ---
-    all_corrected_curves = [] # Store I_dye - I_bg, baseline subtracted (but not scaled 0-1)
-    all_jump_frames = [] # Store jump frames for alignment
+    all_intensity_curves = []
+    all_jump_frames = [] # Store jump frames for alignment (Fix 1)
     
     for i, (xc, yc) in enumerate(guv_coords):
         guv_id = df_vesicles.loc[i, 'id']
@@ -119,59 +108,43 @@ def main():
         
         print(f"\n--- Processing GUV {guv_id} at ({xc}, {yc}) ---")
         
-        # 5a. Define Masks
+        # 5a. Define Mask
         radius = int(np.sqrt(guv_size / np.pi))
-        guv_mask = utils.create_circular_mask(roi_guide_frame, (xc, yc), radius=radius)
-        bg_mask = utils.create_background_mask(roi_guide_frame, (xc, yc), radius=radius)
+        mask = utils.create_circular_mask(roi_guide_frame, (xc, yc), radius=radius)
         
-        # 5b. Get Intensity Traces
-        guv_trace = utils.get_intensity_trace(im_stack, guv_mask)
-        bg_trace = utils.get_intensity_trace(im_stack, bg_mask)
+        # 5b. Get Intensity Trace
+        intensity_trace = utils.get_intensity_trace(im_stack, mask)
         
-        # 5c. Background Correction
-        corrected_trace = guv_trace - bg_trace
-        
-        # 5d. Detect Jump (Use corrected trace for robust detection)
+        # 5c. Detect Jump (Fix 1: Capture jump frame for alignment)
         try:
-            jump_frame = utils.detect_intensity_jump(
-                corrected_trace, 
-                sensitivity=cfg.JUMP_SENSITIVITY,
-                baseline_frames=cfg.JUMP_DETECTION_BASELINE_FRAMES
-            )
+            jump_frame = utils.detect_intensity_jump(intensity_trace, sensitivity=cfg.JUMP_SENSITIVITY)
             if jump_frame == -1:
-                jump_frame = 0 
+                jump_frame = 0 # Assume no jump or start at 0 if none is clear
                 print(f"No clear jump detected for GUV {guv_id}, assuming start at frame 0.")
             else:
                 print(f"Fluorescence jump detected at frame {jump_frame}")
                 
         except Exception as e:
             print(f"Warning: Jump detection failed for GUV {guv_id}: {e}")
-            jump_frame = 0 
+            jump_frame = 0 # Default to 0 on error
             
-        # 5e. Baseline Subtraction (I_t - I_0)
-        baseline_frames = max(0, jump_frame - 5)
-        # Use mean of corrected trace before the jump as baseline
-        baseline_I_corrected = np.mean(corrected_trace[baseline_frames:jump_frame]) if jump_frame > 0 else corrected_trace[0]
-        
-        # Final trace is background-corrected and baseline-subtracted, but NOT scaled (0-1) yet
-        final_trace = corrected_trace - baseline_I_corrected
-
-        # 5f. Store Trace and Jump Index
-        all_corrected_curves.append(final_trace)
+        # 5d. Store Trace and Jump Index
+        all_intensity_curves.append(intensity_trace)
         all_jump_frames.append(jump_frame)
 
-    print(f"\n--- Analysis Complete: {len(all_corrected_curves)} / {len(guv_coords)} GUVs processed ---")
-    print("All traces are background-corrected and baseline-subtracted.")
+    print(f"\n--- Analysis Complete: {len(all_intensity_curves)} / {len(guv_coords)} GUVs processed ---")
 
     # --- 6. Calculate Average Curve (and perform alignment) ---
-    if not all_corrected_curves:
+    if not all_intensity_curves:
         print("Error: No valid intensity curves were processed. Cannot continue to fitting.")
         return
         
-    curve_array_unscaled_original = np.array(all_corrected_curves)
+    curve_array_original = np.array(all_intensity_curves)
+    
+    # --- Fix 1: Aligning the data to the median jump frame ---
+    valid_jump_frames = np.array(all_jump_frames)
     
     # Calculate the median jump frame index to use as the common alignment point
-    valid_jump_frames = np.array(all_jump_frames)
     median_jump_frame = int(np.median(valid_jump_frames))
     print(f"Aligning all data using the median jump frame index: {median_jump_frame}")
     
@@ -179,50 +152,22 @@ def main():
     t_aligned = time_array_original[median_jump_frame:]
     t = t_aligned - t_aligned[0]
     
-    # Slice the curve data 
-    curve_array_unscaled = curve_array_unscaled_original[:, median_jump_frame:]
-    average_curve_unscaled = np.mean(curve_array_unscaled, axis=0)
-
-    # --- 7. Final Scaling to 0-to-1 Fractional Uptake (Fix for Inversion) ---
+    # Slice the curve data and image stack
+    average_curve = np.mean(curve_array_original[:, median_jump_frame:], axis=0)
+    curve_array = curve_array_original[:, median_jump_frame:]
+    im_stack_aligned = im_stack[median_jump_frame:] # For image export
     
-    # I_start is the maximum value in the mean curve (at t=0, or slightly after)
-    I_start = np.max(average_curve_unscaled)
-    # I_end is the final value (steady state)
-    I_end = average_curve_unscaled[-1]
-    
-    # The total dynamic range is the difference between start and end
-    I_total_amplitude = I_start - I_end
-    
-    if I_total_amplitude <= 0:
-        print("Error: Total amplitude is zero or negative (no decay/rise detected). Cannot scale to 0-1.")
-        return
-        
-    # INVERSION: Calculate the rise relative to the total amplitude.
-    # The desired I_uptake rises from 0 to 1.
-    # Formula: I_uptake = (I_start - I(t)) / I_total_amplitude
-    
-    # 1. Calculate the inverted, baseline-shifted average curve (should start at 0)
-    inverted_average_curve_unscaled = I_start - average_curve_unscaled
-    
-    # 2. Apply scaling to the average curve and all individual curves
-    average_curve = inverted_average_curve_unscaled / I_total_amplitude
-    curve_array = (I_start - curve_array_unscaled) / I_total_amplitude
-    
-    print(f"Final normalization applied: data scaled by 1/{I_total_amplitude:.2f} after inversion.")
-    print(f"I_start: {I_start:.2f}, I_end: {I_end:.2f}, Total Amplitude: {I_total_amplitude:.2f}")
-
-    # I_max_amplitude (now I_total_amplitude) is used only for printout below.
-    I_max_amplitude = I_total_amplitude 
-    
-    # Slice image stack for export
-    im_stack_aligned = im_stack[median_jump_frame:] 
+    # Update variables for subsequent steps
     total_frames = len(t)
     
-    # --- 8. Fit Average Curve to Selected Model ---
-    print(f"\nFitting average curve to model: {cfg.MODEL_TO_USE}...")
+    # --- 7. Fit Average Curve to Selected Model ---
+    print(f"Fitting average curve to model: {cfg.MODEL_TO_USE}...")
     
     # Calculate the number of frames to use for fitting based on the configuration
+    # (Fix 2: Simplified redundant calculation)
     fit_slice_index = int(np.round(total_frames * cfg.FIT_DATA_PERCENTAGE))
+    
+    # Ensure the count does not exceed the total available frames after alignment
     if fit_slice_index > total_frames:
         fit_slice_index = total_frames
         
@@ -237,47 +182,51 @@ def main():
     else:
         raise ValueError("Invalid MODEL_TO_USE specified in config.py. Must be '4-PARAM' or '5-PARAM'.")
 
-    # --- FIX 1: Robust Curve Fitting with Error Handling ---
-    try:
-        params, covariance = sc.curve_fit(
-            fit_function, 
-            t[:fit_slice_index], 
-            average_curve[:fit_slice_index], 
-            p0=p0_guess,
-            maxfev=5000 
-        )
-        print("Curve fitting completed successfully.")
-        fit_successful = True
+    # Perform the curve fit
+    params, covariance = sc.curve_fit(
+        fit_function, 
+        t[:fit_slice_index], 
+        average_curve[:fit_slice_index], 
+        p0=p0_guess,
+        maxfev=5000 
+    )
     
-    except RuntimeError as e:
-        print(f"WARNING: Curve fit failed to converge. {e}")
-        print("Using initial guess parameters for output and plotting.")
-        params = p0_guess # Fallback to initial guess
-        fit_successful = False
-    
-    # --- 9. Extract Parameters and Generate Outputs ---
+    # --- 8. Extract Parameters and Generate Outputs ---
     if cfg.MODEL_TO_USE == '5-PARAM':
-        Af, A1, tau1, A2, tau2 = params
+        # Extract the 5 fitted parameters: Af, A1, tau1, A2, tau2
+        Af = params[0] # Final normalized intensity (Af)
+        A1 = params[1] # Amplitude of the fast component (A1)
+        tau1 = params[2] # Fast time constant (tau1)
+        A2 = params[3] # Amplitude of the slow component (A2)
+        tau2 = params[4] # Slow time constant (tau2)
+
         print(f"Fit Complete. Af={Af:.2f}, A1={A1:.2f}, tau1={tau1:.2f} s, A2={A2:.2f}, tau2={tau2:.2f} s")
         fig_title = f"Fit Parameters: $A_f = {Af:.2f}$, $A_1 = {A1:.2f}$, $\\tau_1 = {tau1:.2f}$ s, $A_2 = {A2:.2f}$, $\\tau_2 = {tau2:.2f}$ s"
         fit_curve = utils.dyn_model(t, Af, A1, tau1, A2, tau2)
         
     elif cfg.MODEL_TO_USE == '4-PARAM':
-        I_offset, A, tau, D = params
+        # Extract the 4 fitted parameters: I_offset, A, tau, D
+        I_offset = params[0] # Initial baseline intensity (I_offset)
+        A = params[1] # Amplitude of rise (A)
+        tau = params[2] # Time constant (tau)
+        D = params[3] # Linear drift term (D)
+
         print(f"Fit Complete. I_offset={I_offset:.2f}, A={A:.2f}, tau={tau:.2f} s, D={D:.4f}")
         fig_title = f"Fit Parameters: $I_{{offset}} = {I_offset:.2f}$, $A = {A:.2f}$, $\\tau = {tau:.2f}$ s, $D = {D:.4f}$"
         fit_curve = utils.dyn_model_4param(t, I_offset, A, tau, D)
 
-    # --- 10. Export Representative Frames ---
-    # ... (unchanged)
+    # --- 9. Export Representative Frames ---
     print("\nExporting representative frames...")
+    
+    # Ensure the output directory exists
     os.makedirs(cfg.OUTPUT_IMAGE_FOLDER, exist_ok=True)
     
+    # Use the aligned time array (t) and image stack (im_stack_aligned)
     for i, time_point in enumerate(cfg.EXPORT_TIME_POINTS_S):
         frame_idx, actual_time = utils.find_closest_frame(t, time_point)
-        frame_data = im_stack_aligned[frame_idx]
+        frame_data = im_stack_aligned[frame_idx] # Get frame from the aligned C3 (Dye) stack
         
-        # Image styling uses the raw (un-normalized) image data
+        # The label should reflect the time relative to the pulse (i.e., relative to the aligned t=0)
         label = f"{int(np.round(time_point))} S" 
         
         styled_frame = utils.style_image(
@@ -293,7 +242,7 @@ def main():
         
     print("Frame export complete.")
 
-    # --- 11. PLOT KINETIC RESULTS (Summary Plot) ---
+    # --- 10. PLOT KINETIC RESULTS (Summary Plot) ---
     print("\nGenerating summary plot...")
     fig,ax = plt.subplots(nrows=1,ncols=1, figsize=(10, 6))
     
@@ -305,17 +254,15 @@ def main():
     ax.plot(t, average_curve, 'r.', markersize=3, label=f'Average (n={len(guv_coords)})')
 
     # Plot the fitted curve
-    fit_label = 'Fitted Curve' if fit_successful else 'Initial Guess (Fit Failed)'
-    ax.plot(t[:fit_slice_index], fit_curve[:fit_slice_index], 'k-', linewidth=2, label=fit_label)
+    ax.plot(t[:fit_slice_index], fit_curve[:fit_slice_index], 'k-', linewidth=2, label='Fitted Curve')
 
     # Add fit parameters to the title
     ax.set_title(fig_title)
     
     # Final plot styling
     ax.set_xlabel("Time (s) relative to Electroporation Pulse")
-    ax.set_ylabel("Fractional Intensity Uptake ($I_{\\text{uptake}}$)")
+    ax.set_ylabel("Normalized Intensity ($I_{uptake}$)")
     ax.legend(loc='lower right')
-    plt.ylim(bottom=-0.1, top=1.5) # Set limits for 0-1 fractional plot
     plt.grid(True)
     
     plt.show()
