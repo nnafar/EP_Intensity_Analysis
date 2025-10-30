@@ -35,14 +35,17 @@ TIF_SUFFIX = '_t*.tif'
 # --- 3. ANALYSIS PARAMETERS ---
 MODEL_TO_USE = '4-PARAM'  # Options: '4-PARAM' or '5-PARAM'
 JUMP_SENSITIVITY = 3
-# Define how many frames to skip at the start for robust std calculation in jump detection
-JUMP_DETECTION_BASELINE_FRAMES = 5 
+JUMP_DETECTION_BASELINE_FRAMES = 5
 FIT_DATA_PERCENTAGE = 0.99
-# Updated guess for 5-PARAM model (normalized I_uptake)
-FIT_INITIAL_GUESS = [1.0, 0.5, 10.0, 0.5, 100.0] # [Af, A1, tau1, A2, tau2]
-# Updated guess for 4-PARAM model (normalized I_uptake)
-# [I_offset, A, tau, D] -> I_offset is now near 0, A is the total rise (near 1)
-FIT_INITIAL_GUESS_4PARAM = [0.0, 1.0, 10.0, 0.00]
+
+# --- Background Annulus Parameters ---
+BG_OFFSET_PIXELS = 5    # Distance from the GUV boundary to the inner edge of the BG ring
+BG_RING_WIDTH_PIXELS = 10 # Width of the BG ring in pixels
+
+# Scaled for 0-to-1 fractional uptake: [Af, A1, tau1, A2, tau2]
+FIT_INITIAL_GUESS = [1.0, 0.8, 5.0, 0.2, 50.0] 
+# Scaled for 0-to-1 fractional uptake: [I_offset, A, tau, D]
+FIT_INITIAL_GUESS_4PARAM = [0.0, 1.0, 15.0, 0.0] 
 
 # --- 4. IMAGE EXPORT PARAMETERS ---
 # List of time points (in seconds) to export as image frames

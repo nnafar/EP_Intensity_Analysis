@@ -13,6 +13,7 @@ import numpy as np
 import cv2
 import pandas as pd
 import os
+import config as cfg
 
 # --- Packages for Time Extraction ---
 import re
@@ -25,6 +26,7 @@ from typing import List, Dict, Any, Optional
 # -------------------------------------------------------------------
 # --- 1. TIME EXTRACTION FUNCTIONS ---
 # -------------------------------------------------------------------
+# ... (extract_timestamps_from_metadata and create_manual_timestamps are unchanged)
 
 def extract_timestamps_from_metadata(file_paths: List[str]) -> tuple[Optional[np.ndarray], Optional[float]]:
     """
@@ -71,6 +73,7 @@ def create_manual_timestamps(num_frames: int, fallback_fps: float = 1.0) -> tupl
 # -------------------------------------------------------------------
 # --- 2. KINETIC MODEL FUNCTIONS ---
 # -------------------------------------------------------------------
+# ... (dyn_model_4param and dyn_model are unchanged)
 
 def dyn_model_4param(t: np.ndarray, I_offset: float, A: float, tau: float, D: float) -> np.ndarray:
     """
@@ -93,6 +96,7 @@ def dyn_model(t: np.ndarray, Af: float, A1: float, tau1: float, A2: float, tau2:
     - tau2: Slow time constant
     """
     return Af - A1 * np.exp(-t / tau1) - A2 * np.exp(-t / tau2)
+
 
 # -------------------------------------------------------------------
 # --- 3. IMAGE PROCESSING & MASKING FUNCTIONS ---
@@ -130,6 +134,25 @@ def create_circular_mask(img_shape: np.ndarray, center: tuple[int, int], radius:
     mask = dist_from_center <= radius
     return mask
 
+def create_background_mask(img_shape: np.ndarray, center: tuple[int, int], radius: int) -> np.ndarray:
+    """
+    Creates a circular ring mask for background subtraction around a GUV.
+    Uses BG_OFFSET_PIXELS and BG_RING_WIDTH_PIXELS from config.
+    """
+    h, w = img_shape.shape
+    Y, X = np.ogrid[:h, :w]
+    
+    # Calculate distance from the GUV center
+    dist_from_center = np.sqrt((X - center[0])**2 + (Y - center[1])**2)
+    
+    # Define inner and outer radii of the background annulus
+    inner_radius = radius + cfg.BG_OFFSET_PIXELS
+    outer_radius = inner_radius + cfg.BG_RING_WIDTH_PIXELS
+    
+    # Create the annulus mask (ring)
+    bg_mask = (dist_from_center >= inner_radius) & (dist_from_center <= outer_radius)
+    return bg_mask
+
 def get_intensity_trace(im_stack: np.ndarray, mask: np.ndarray) -> np.ndarray:
     """Calculates the average intensity within the mask for every frame."""
     trace = np.zeros(im_stack.shape[0])
@@ -165,7 +188,6 @@ def detect_intensity_jump(trace: np.ndarray, sensitivity: float = 3.0, baseline_
     diff_trace = np.diff(trace)
     
     # Calculate the standard deviation and mean of the difference trace (excluding the initial frames)
-    # Use the configurable 'baseline_frames'
     std_diff = np.std(diff_trace[baseline_frames:]) 
     mean_diff = np.mean(diff_trace[baseline_frames:])
     
