@@ -94,7 +94,7 @@ def dyn_model(t: np.ndarray, Af: float, A1: float, tau1: float, A2: float, tau2:
     - A1: Amplitude of the fast component
     - tau1: Fast time constant
     - A2: Amplitude of the slow component
-    - tau2: Slow time constant
+    - tau2: Fast time constant
     """
     return Af - A1 * np.exp(-t / tau1) - A2 * np.exp(-t / tau2)
 
@@ -107,7 +107,8 @@ def tifflist_to_numpy(file_paths: list) -> np.ndarray:
     if not file_paths:
         return np.array([])
     # Load first image to get dimensions and data type
-    first_frame = cv2.imread(file_paths[0], cv2.IMREAD_ANYDEPTH)
+    # --- MODIFIED: Ensure grayscale loading ---
+    first_frame = cv2.imread(file_paths[0], cv2.IMREAD_ANYDEPTH | cv2.IMREAD_GRAYSCALE)
     if first_frame is None:
         raise FileNotFoundError(f"Could not load first frame: {file_paths[0]}")
     
@@ -117,7 +118,8 @@ def tifflist_to_numpy(file_paths: list) -> np.ndarray:
     
     # Load remaining images
     for i in range(1, len(file_paths)):
-        frame = cv2.imread(file_paths[i], cv2.IMREAD_ANYDEPTH)
+        # --- MODIFIED: Ensure grayscale loading ---
+        frame = cv2.imread(file_paths[i], cv2.IMREAD_ANYDEPTH | cv2.IMREAD_GRAYSCALE)
         if frame is not None:
             stack[i] = frame
         else:
@@ -153,7 +155,7 @@ def refine_guv_center(image: np.ndarray, center_guess: Tuple[int, int], radius_e
                       search_box_factor: float = 1.0) -> Tuple[int, int]:
     """
     Refines the GUV center coordinates by finding the "center of mass" (centroid)
-    of the bright areas in a blurred ROI.
+    of the *membrane ring* using edge detection.
     """
     xc, yc = center_guess
     
@@ -169,26 +171,64 @@ def refine_guv_center(image: np.ndarray, center_guess: Tuple[int, int], radius_e
         
     roi = image[y_start:y_end, x_start:x_end]
     
+    # --- *** NEW FIX *** ---
+    # Handle cases where cv2.imread loads a grayscale TIFF as 3-channel
+    if roi.ndim == 3:
+        # Assume all channels are identical and take the first one
+        roi = roi[:, :, 0]
+    # --- *** END NEW FIX *** ---
+    
+    # --- MODIFICATION: Use Laplacian edge detection to find the ring ---
+    # This is more robust than simple thresholding, which gets pulled
+    # by the bright interior.
+
+    # 1. Blur to reduce noise before edge detection
     if roi.dtype == np.uint16:
-        roi_blurred = cv2.GaussianBlur(roi, (5, 5), 0)
-        roi_8bit = cv2.normalize(roi_blurred, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
+        # Need to work with a float type for Laplacian, then scale
+        roi_float = roi.astype(np.float32)
+        roi_blurred = cv2.GaussianBlur(roi_float, (3, 3), 0)
+        # Using 16-bit signed output to capture positive/negative slopes
+        
+        # --- *** CORRECTED LINE *** ---
+        laplacian = cv2.Laplacian(roi_blurred, cv2.CV_32F, ksize=3)
+        # --- *** END CORRECTION *** ---
     else:
-        roi_blurred = cv2.GaussianBlur(roi.astype(np.float32), (5, 5), 0)
-        roi_8bit = cv2.normalize(roi_blurred, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
+        # Assume 8-bit or similar
+        roi_blurred = cv2.GaussianBlur(roi.astype(np.float32), (3, 3), 0)
+        
+        # --- *** CORRECTED LINE *** ---
+        laplacian = cv2.Laplacian(roi_blurred, cv2.CV_32F, ksize=3)
+        # --- *** END CORRECTION *** ---
+
+    # 2. Convert back to absolute 8-bit scale
+    # This image now highlights *only* the edges (the ring)
+    edge_image_8u = cv2.convertScaleAbs(laplacian)
+
+    # 3. Normalize for thresholding (Otsu works best on 8-bit)
+    if np.max(edge_image_8u) > 0:
+         roi_8bit = cv2.normalize(edge_image_8u, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
+    else:
+         roi_8bit = edge_image_8u # all zeros
+    # --- END MODIFICATION ---
 
     try:
+        # 4. Threshold the *edge image* to get a mask of the ring
         thresh_val, thresh_mask = cv2.threshold(
             roi_8bit, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
         )
+        
+        # 5. Find the center of mass of the *ring mask*
         M = cv2.moments(thresh_mask)
         if M["m00"] == 0:
-            (min_val, max_val, min_loc, max_loc) = cv2.minMaxLoc(roi_blurred)
+            # Fallback: if no moments, find max brightness pixel in the *edge image*
+            (min_val, max_val, min_loc, max_loc) = cv2.minMaxLoc(roi_8bit)
             cX, cY = max_loc
         else:
             cX = int(M["m10"] / M["m00"])
             cY = int(M["m01"] / M["m00"])
     except Exception:
-        (min_val, max_val, min_loc, max_loc) = cv2.minMaxLoc(roi_blurred)
+        # Fallback: find max brightness pixel in the *edge image*
+        (min_val, max_val, min_loc, max_loc) = cv2.minMaxLoc(roi_8bit)
         cX, cY = max_loc
     
     xc_new = x_start + cX
@@ -196,6 +236,7 @@ def refine_guv_center(image: np.ndarray, center_guess: Tuple[int, int], radius_e
     
     shift = np.sqrt((xc_new - xc)**2 + (yc_new - yc)**2)
     
+    # Keep the shift check, it's still good practice
     if shift > radius_estimate * 0.7:
         print(f"  - Warning: Center refinement shifted by {shift:.1f}px. Reverting to original center.")
         return center_guess
@@ -218,6 +259,11 @@ def linear_profiles(image: np.ndarray,
     (Adapted from skeleton.py)
     """
     xc, yc = center
+    
+    # --- FIX for 3-channel image ---
+    if image.ndim == 3:
+        image = image[:,:,0]
+    
     length = int(radius * length_excess)
     theta = np.linspace(0, 2 * np.pi, num_angles, endpoint=False)
     
@@ -272,8 +318,13 @@ def membrane_search(profile: np.ndarray,
     comments = []
     failed = False
     
+    # --- *** NEW FIX: Smooth the profile to be robust to noise/clusters *** ---
+    # sigma=1 applies a light smoothing to average out high-frequency noise
+    profile_smooth = gaussian_filter1d(profile, sigma=1)
+    # --- *** END NEW FIX *** ---
+    
     # --- 1. Define search window around hint ---
-    data_to_search = profile
+    data_to_search = profile_smooth # Use the smoothed profile for detection
     
     # Find array indices corresponding to the radius window
     min_radius = max(0, expected_radius * (1.0 - search_factor))
@@ -284,17 +335,17 @@ def membrane_search(profile: np.ndarray,
     
     if min_idx < max_idx: # Ensure window is valid
         # Create a *mask* to nullify data outside this window
-        search_mask = np.zeros_like(profile)
+        search_mask = np.zeros_like(profile_smooth)
         search_mask[min_idx:max_idx] = 1.0
-        data_to_search = profile * search_mask
+        data_to_search = profile_smooth * search_mask
     else:
         comments.append("invalid_search_window")
-        data_to_search = profile # Fallback to searching everything
+        # data_to_search is already profile_smooth
     
-    # --- 2. Find peaks in the masked data ---
+    # --- 2. Find peaks in the masked, smoothed data ---
     try:
         peaks, props = find_peaks(
-            data_to_search,
+            data_to_search, # This now uses the smoothed data
             height=np.max(profile) * 0.1,  # Height relative to *original* max
             distance=5,
             prominence=np.max(profile) * 0.05 # Prominence relative to *original* max
@@ -435,7 +486,7 @@ def create_guv_masks_with_detection(roi_guide_frame: np.ndarray,
         'peak_position': peak_pos,
         'detection_failed': failed,
         'comments': comments,
-        'radial_profile': radial_profile,
+        'radial_profile': radial_profile, # Save the *original* noisy profile for plotting
         'along_radius': along_radius,
         'method': 'skeleton_search',
         'search_factor_used': search_factor
@@ -526,7 +577,14 @@ def create_mask_visualization(base_image: np.ndarray, inner_mask: np.ndarray,
     """
     Overlays the inner, membrane, and background masks in color.
     """
-    img_8bit = cv2.normalize(base_image, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
+    # --- MODIFIED: Ensure 8-bit conversion is from 2D ---
+    if base_image.ndim == 3:
+        base_image_gray = base_image[:,:,0]
+    else:
+        base_image_gray = base_image
+    img_8bit = cv2.normalize(base_image_gray, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
+    # --- END MODIFICATION ---
+    
     viz_image = cv2.cvtColor(img_8bit, cv2.COLOR_GRAY2BGR)
     overlay = np.zeros_like(viz_image)
     overlay[inner_mask] = (128, 0, 128)      # Purple (BGR)
@@ -540,7 +598,14 @@ def style_image(frame: np.ndarray, time_label: str, microns_per_pixel: float, sc
     """
     Applies the red colormap and adds annotations.
     """
-    img_8bit = cv2.normalize(frame, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
+    # --- MODIFIED: Ensure 8-bit conversion is from 2D ---
+    if frame.ndim == 3:
+        frame_gray = frame[:,:,0]
+    else:
+        frame_gray = frame
+    img_8bit = cv2.normalize(frame_gray, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
+    # --- END MODIFICATION ---
+
     img_color = cv2.cvtColor(img_8bit, cv2.COLOR_GRAY2BGR)
     img_color[:, :, 0] = 0
     img_color[:, :, 1] = 0

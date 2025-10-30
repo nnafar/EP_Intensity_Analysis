@@ -79,7 +79,11 @@ def main():
     print("Dye stack loaded.")
     
     print("Loading ROI (C1) guide image...")
-    roi_guide_frame = cv2.imread(roi_guide_file, cv2.IMREAD_ANYDEPTH)
+    # --- *** MODIFIED LINE *** ---
+    # Force loading as grayscale (single-channel) while preserving 16-bit depth
+    roi_guide_frame = cv2.imread(roi_guide_file, cv2.IMREAD_ANYDEPTH | cv2.IMREAD_GRAYSCALE)
+    # --- *** END MODIFICATION *** ---
+    
     if roi_guide_frame is None:
         print(f"Error: Could not load ROI guide frame: {roi_guide_file}")
         return
@@ -368,7 +372,9 @@ def main():
         p0_guess = cfg.FIT_INITIAL_GUESS
         fit_function = utils.dyn_model
     elif cfg.MODEL_TO_USE == '4-PARAM':
+        # --- *** MODIFIED LINE (TYPO FIX) *** ---
         p0_guess = cfg.FIT_INITIAL_GUESS_4PARAM
+        # --- *** END MODIFICATION *** ---
         fit_function = utils.dyn_model_4param
     else:
         raise ValueError("Invalid MODEL_TO_USE specified in config.py. Must be '4-PARAM' or '5-PARAM'.")
@@ -470,7 +476,6 @@ def main():
     plot_name = f"{cfg.EXPERIMENT_BASE_NAME}_kinetic_fit.png"
     plot_path = os.path.join(cfg.OUTPUT_IMAGE_FOLDER, plot_name)
     fig.savefig(plot_path, dpi=300, bbox_inches='tight')
-    print(f"Saved summary plot to: {plot_path}")
     plt.close(fig) # Close the plot to free memory
 
 if __name__ == "__main__":

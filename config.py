@@ -61,14 +61,13 @@ MEMBRANE_SEARCH_FACTOR = 0.3
 # Defines the membrane region as: Detected Peak +/- this value.
 # The FWHM detection (peak_widths) was too broad for narrow peaks.
 # A value of 4 creates an 8-pixel wide membrane region.
-MEMBRANE_FIXED_HALF_WIDTH = 2
+MEMBRANE_FIXED_HALF_WIDTH = 3
 
 
 # --- Background Mask Geometry ---
 # Buffer space (in pixels) between the GUV's outer edge and the
 # *start* of the background ring.
-# (Reduced from 15 to 5 to create a narrower gap)
-BG_BUFFER_PIXELS = 3
+BG_BUFFER_PIXELS = 5
 
 # Width (in pixels) of the annular ring used for background subtraction.
 BG_RING_WIDTH_PIXELS = 10
@@ -152,7 +151,7 @@ MASK_VIZ_OVERLAY_ALPHA = 0.6
 # Set a fixed thickness (in pixels) for the RED membrane visualization ring.
 # If set to None, the ring will fill the entire detected membrane region.
 # A fixed value (e.g., 5) can look cleaner.
-VIZ_MEMBRANE_THICKNESS_PIXELS = 5
+VIZ_MEMBRANE_THICKNESS_PIXELS = 11
 
 
 # -------------------------------------------------------------------
