@@ -147,10 +147,15 @@ def get_intensity_trace(im_stack: np.ndarray, mask: np.ndarray) -> np.ndarray:
 # --- 4. DATA PROCESSING & UTILITIES ---
 # -------------------------------------------------------------------
 
-def detect_intensity_jump(trace: np.ndarray, sensitivity: float = 3.0) -> int:
+def detect_intensity_jump(trace: np.ndarray, sensitivity: float = 3.0, baseline_frames: int = 5) -> int:
     """
     Detects a sudden jump in intensity (e.g., electroporation event) using the
     standard deviation of the difference trace.
+    
+    NOTE: The standard deviation is calculated using the difference trace *after*
+    the first 'baseline_frames' to ensure a stable baseline noise estimate.
+    Jump detection is most reliable for events occurring after this skipped region.
+
     Returns the frame index of the jump, or -1 if none is found.
     """
     if len(trace) < 10:
@@ -159,9 +164,10 @@ def detect_intensity_jump(trace: np.ndarray, sensitivity: float = 3.0) -> int:
     # Calculate the difference between consecutive frames
     diff_trace = np.diff(trace)
     
-    # Calculate the standard deviation and mean of the difference trace (excluding the initial few frames)
-    std_diff = np.std(diff_trace[5:]) 
-    mean_diff = np.mean(diff_trace[5:])
+    # Calculate the standard deviation and mean of the difference trace (excluding the initial frames)
+    # Use the configurable 'baseline_frames'
+    std_diff = np.std(diff_trace[baseline_frames:]) 
+    mean_diff = np.mean(diff_trace[baseline_frames:])
     
     # Threshold for jump detection (e.g., 3 * std_dev above the mean)
     threshold = mean_diff + sensitivity * std_diff

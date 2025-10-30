@@ -86,9 +86,17 @@ def main():
     print(f"Loading GUV coordinates from: {path_to_csv}")
     try:
         df_vesicles = pd.read_csv(path_to_csv, comment='#', header=None)
-        # CSV FIX: Assumes 6 columns (5 data + 1 extra trailing comma)
-        df_vesicles.columns = ['id', 'xc', 'yc', 'size', 'score', 'extra']
         
+        # Assume the first 5 columns are 'id', 'xc', 'yc', 'size', 'score',
+        # regardless of trailing empty columns.
+        num_cols = df_vesicles.shape[1]
+        if num_cols >= 5:
+             # Use the first 5 columns explicitly
+            df_vesicles = df_vesicles.iloc[:, :5] 
+            df_vesicles.columns = ['id', 'xc', 'yc', 'size', 'score']
+        else:
+            raise ValueError(f"CSV file must contain at least 5 columns, found {num_cols}.")
+            
     except Exception as e:
         print(f"Error reading CSV file: {e}")
         return
@@ -100,7 +108,7 @@ def main():
 
     # --- 5. Process Each GUV ---
     all_intensity_curves = []
-    all_jump_frames = [] # Store jump frames for alignment (Fix 1)
+    all_jump_frames = []
     
     for i, (xc, yc) in enumerate(guv_coords):
         guv_id = df_vesicles.loc[i, 'id']
@@ -117,31 +125,50 @@ def main():
         
         # 5c. Detect Jump (Fix 1: Capture jump frame for alignment)
         try:
-            jump_frame = utils.detect_intensity_jump(intensity_trace, sensitivity=cfg.JUMP_SENSITIVITY)
+            jump_frame = utils.detect_intensity_jump(
+                intensity_trace, 
+                sensitivity=cfg.JUMP_SENSITIVITY,
+                baseline_frames=cfg.JUMP_DETECTION_BASELINE_FRAMES
+                )
             if jump_frame == -1:
-                jump_frame = 0 # Assume no jump or start at 0 if none is clear
+                jump_frame = 0 
                 print(f"No clear jump detected for GUV {guv_id}, assuming start at frame 0.")
             else:
                 print(f"Fluorescence jump detected at frame {jump_frame}")
                 
         except Exception as e:
             print(f"Warning: Jump detection failed for GUV {guv_id}: {e}")
-            jump_frame = 0 # Default to 0 on error
+            jump_frame = 0
             
         # 5d. Store Trace and Jump Index
         all_intensity_curves.append(intensity_trace)
         all_jump_frames.append(jump_frame)
+        
+        # 6. Normalize Curves (Must be done before alignment for accurate baseline)
+        normalized_curves = []
+        
+        for trace, jump_frame in zip(all_intensity_curves, all_jump_frames):
+            # Calculate the baseline intensity before the jump
+            # Use a small window (e.g., 5 frames) before the jump frame for robust baseline
+            baseline_frames = max(0, jump_frame - 5)
+            baseline_I = np.mean(trace[baseline_frames:jump_frame]) if jump_frame > 0 else trace[0]
+    
+            # Apply the normalization: I_normalized = (I_t - I_baseline) / (I_final - I_baseline) 
+            # Here, we only do I_t - I_baseline to start the trace at I=0 at the pulse time.
+            # The subsequent fit handles the final amplitude (A or Af).
+            normalized_trace = (trace - baseline_I)
+            normalized_curves.append(normalized_trace)
 
-    print(f"\n--- Analysis Complete: {len(all_intensity_curves)} / {len(guv_coords)} GUVs processed ---")
+    print("\nAll traces normalized to pre-pulse baseline intensity.")
 
-    # --- 6. Calculate Average Curve (and perform alignment) ---
-    if not all_intensity_curves:
+    # 7. Calculate Average Curve (and perform alignment)
+    if not normalized_curves:
         print("Error: No valid intensity curves were processed. Cannot continue to fitting.")
         return
         
-    curve_array_original = np.array(all_intensity_curves)
+    curve_array_original = np.array(normalized_curves) # Use normalized data
     
-    # --- Fix 1: Aligning the data to the median jump frame ---
+    # Aligning the data to the median jump frame
     valid_jump_frames = np.array(all_jump_frames)
     
     # Calculate the median jump frame index to use as the common alignment point
@@ -160,11 +187,10 @@ def main():
     # Update variables for subsequent steps
     total_frames = len(t)
     
-    # --- 7. Fit Average Curve to Selected Model ---
+    # 8. Fit Average Curve to Selected Model (Step number adjusted)
     print(f"Fitting average curve to model: {cfg.MODEL_TO_USE}...")
     
     # Calculate the number of frames to use for fitting based on the configuration
-    # (Fix 2: Simplified redundant calculation)
     fit_slice_index = int(np.round(total_frames * cfg.FIT_DATA_PERCENTAGE))
     
     # Ensure the count does not exceed the total available frames after alignment
@@ -182,16 +208,24 @@ def main():
     else:
         raise ValueError("Invalid MODEL_TO_USE specified in config.py. Must be '4-PARAM' or '5-PARAM'.")
 
-    # Perform the curve fit
-    params, covariance = sc.curve_fit(
-        fit_function, 
-        t[:fit_slice_index], 
-        average_curve[:fit_slice_index], 
-        p0=p0_guess,
-        maxfev=5000 
-    )
+    try:
+        params, covariance = sc.curve_fit(
+            fit_function, 
+            t[:fit_slice_index], 
+            average_curve[:fit_slice_index], 
+            p0=p0_guess,
+            maxfev=5000 
+        )
+        print("Curve fitting completed successfully.")
+        fit_successful = True
     
-    # --- 8. Extract Parameters and Generate Outputs ---
+    except RuntimeError as e:
+        print(f"WARNING: Curve fit failed to converge. {e}")
+        print("Using initial guess parameters for output and plotting.")
+        params = p0_guess # Fallback to initial guess
+        fit_successful = False
+    
+    # --- 9. Extract Parameters and Generate Outputs ---
     if cfg.MODEL_TO_USE == '5-PARAM':
         # Extract the 5 fitted parameters: Af, A1, tau1, A2, tau2
         Af = params[0] # Final normalized intensity (Af)
@@ -215,7 +249,7 @@ def main():
         fig_title = f"Fit Parameters: $I_{{offset}} = {I_offset:.2f}$, $A = {A:.2f}$, $\\tau = {tau:.2f}$ s, $D = {D:.4f}$"
         fit_curve = utils.dyn_model_4param(t, I_offset, A, tau, D)
 
-    # --- 9. Export Representative Frames ---
+    # --- 10. Export Representative Frames ---
     print("\nExporting representative frames...")
     
     # Ensure the output directory exists
@@ -242,7 +276,7 @@ def main():
         
     print("Frame export complete.")
 
-    # --- 10. PLOT KINETIC RESULTS (Summary Plot) ---
+    # --- 11. PLOT KINETIC RESULTS (Summary Plot) ---
     print("\nGenerating summary plot...")
     fig,ax = plt.subplots(nrows=1,ncols=1, figsize=(10, 6))
     
@@ -254,14 +288,15 @@ def main():
     ax.plot(t, average_curve, 'r.', markersize=3, label=f'Average (n={len(guv_coords)})')
 
     # Plot the fitted curve
-    ax.plot(t[:fit_slice_index], fit_curve[:fit_slice_index], 'k-', linewidth=2, label='Fitted Curve')
+    fit_label = 'Fitted Curve' if fit_successful else 'Initial Guess (Fit Failed)'
+    ax.plot(t[:fit_slice_index], fit_curve[:fit_slice_index], 'k-', linewidth=2, label=fit_label)
 
     # Add fit parameters to the title
     ax.set_title(fig_title)
     
     # Final plot styling
     ax.set_xlabel("Time (s) relative to Electroporation Pulse")
-    ax.set_ylabel("Normalized Intensity ($I_{uptake}$)")
+    ax.set_ylabel("Intensity (Normalized to Pre-Pulse Baseline)")
     ax.legend(loc='lower right')
     plt.grid(True)
     
