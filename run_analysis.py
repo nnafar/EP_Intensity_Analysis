@@ -366,7 +366,7 @@ def main():
 
     if cfg.MODEL_TO_USE == '5-PARAM':
         p0_guess = cfg.FIT_INITIAL_GUESS_5PARAM
-        fit_function = utils.dyn_model
+        fit_function = utils.dyn_model_5param
     elif cfg.MODEL_TO_USE == '4-PARAM':
         p0_guess = cfg.FIT_INITIAL_GUESS_4PARAM
         fit_function = utils.dyn_model_4param
@@ -399,9 +399,9 @@ def main():
 
         print(f"Fit Complete. Af={Af:.2f}, A1={A1:.2f}, tau1={tau1:.2f} s, A2={A2:.2f}, tau2={tau2:.2f} s")
         fig_title = f"Fit Parameters: $A_f = {Af:.2f}$, $A_1 = {A1:.2f}$, $\\tau_1 = {tau1:.2f}$ s, $A_2 = {A2:.2f}$, $\\tau_2 = {tau2:.2f}$ s"
-        fit_curve = utils.dyn_model(t, Af, A1, tau1, A2, tau2)
+        fit_curve = utils.dyn_model_5param(t, Af, A1, tau1, A2, tau2)
         
-    elif cfg.MODEL_TO_USE == '4-PARAM': # <--- *** CORRECTED TYPO ***
+    elif cfg.MODEL_TO_USE == '4-PARAM':
         I_offset = params[0]
         A = params[1]
         tau = params[2]
