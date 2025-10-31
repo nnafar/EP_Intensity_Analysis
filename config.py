@@ -57,17 +57,23 @@ CSV_SUFFIX = "_detected_vesicles.csv"
 # Make this WIDER (e.g., 0.5) if the CSV estimate is poor.
 MEMBRANE_SEARCH_FACTOR = 0.3
 
-# --- NEW: Membrane Width ---
+# --- Membrane Width ---
 # Defines the membrane region as: Detected Peak +/- this value.
 # The FWHM detection (peak_widths) was too broad for narrow peaks.
-# A value of 4 creates an 8-pixel wide membrane region.
+# A value of 3 creates an 6-pixel wide membrane region.
 MEMBRANE_FIXED_HALF_WIDTH = 3
+
+# --- Peak Finding Parameters (for scipy.signal.find_peaks) ---
+# Minimum pixel distance between peaks for detection
+PEAK_FIND_MIN_DISTANCE = 5
+# Required peak prominence (as a fraction of max profile intensity)
+PEAK_FIND_MIN_PROMINENCE = 0.05 
 
 
 # --- Background Mask Geometry ---
 # Buffer space (in pixels) between the GUV's outer edge and the
 # *start* of the background ring.
-BG_BUFFER_PIXELS = 5
+BG_BUFFER_PIXELS = 2
 
 # Width (in pixels) of the annular ring used for background subtraction.
 BG_RING_WIDTH_PIXELS = 10
@@ -77,6 +83,11 @@ BG_RING_WIDTH_PIXELS = 10
 # Higher values = less sensitive (needs a bigger jump).
 # Lower values = more sensitive (may pick up noise).
 JUMP_SENSITIVITY = 3.0 # Standard deviations from the mean difference
+
+# --- Baseline Calculation ---
+# Minimum number of frames to use for baseline calculation
+# (used as max(MIN_BASELINE_FRAMES, jump_frame))
+MIN_BASELINE_FRAMES = 5
 
 
 # -------------------------------------------------------------------
@@ -101,7 +112,7 @@ FIT_DATA_PERCENTAGE = 0.99
 # tau1: Time constant of fast component (seconds)
 # A2: Amplitude of slow component
 # tau2: Time constant of slow component (seconds)
-FIT_INITIAL_GUESS = (
+FIT_INITIAL_GUESS_5PARAM = (
     1.0,  # Af
     0.5,  # A1
     10.0, # tau1
@@ -135,7 +146,7 @@ EXPORT_TIME_POINTS_S = [0, 50, 100, 200, 300]
 
 # --- Scale Bar ---
 # Microns per pixel. Set to 0 to disable the scale bar.
-MICRONS_PER_PIXEL = 0.108 # 0.1625 
+MICRONS_PER_PIXEL = 0.108  
 
 # Length of the scale bar to draw (in microns).
 SCALE_BAR_LENGTH_MICRONS = 10
@@ -145,13 +156,13 @@ SCALE_BAR_LENGTH_MICRONS = 10
 # (Will also export for any GUV that has detection warnings)
 EXPORT_MASK_VISUALIZATION = True
 
-# Opacity of the colored mask overlay (0.0 = transparent, 1.0 = opaque)
-MASK_VIZ_OVERLAY_ALPHA = 0.6
+# Opacity of the colored mask overlay (1.0 = transparent, 0.0 = opaque)
+MASK_VIZ_OVERLAY_ALPHA = 0.8
 
 # Set a fixed thickness (in pixels) for the RED membrane visualization ring.
-# If set to None, the ring will fill the entire detected membrane region.
+# If set to None, the ring will represent the detected membrane thickness.
 # A fixed value (e.g., 5) can look cleaner.
-VIZ_MEMBRANE_THICKNESS_PIXELS = 11
+VIZ_MEMBRANE_THICKNESS_PIXELS = None
 
 
 # -------------------------------------------------------------------

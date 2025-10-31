@@ -12,16 +12,16 @@ import numpy as np
 import cv2
 import pandas as pd
 import os
-
-# --- Packages for Time Extraction ---
 import re
 from datetime import datetime
+from typing import List, Dict, Any, Optional, Tuple
+
+# --- Packages for Time Extraction ---
 import tifffile
 from PIL import Image
 from PIL.ExifTags import TAGS
-from typing import List, Dict, Any, Optional, Tuple
 
-# --- Packages for Membrane Detection ---
+# --- Packages for Analysis & Detection ---
 from scipy.signal import find_peaks, peak_widths
 from scipy import ndimage as nd
 from scipy.ndimage import gaussian_filter1d, map_coordinates
@@ -102,6 +102,20 @@ def dyn_model(t: np.ndarray, Af: float, A1: float, tau1: float, A2: float, tau2:
 # --- 3. IMAGE PROCESSING & MASKING FUNCTIONS (Core Utilities) ---
 # -------------------------------------------------------------------
 
+def _convert_to_8bit_gray(image: np.ndarray) -> np.ndarray:
+    """
+    Converts a 16-bit or 3-channel image to 8-bit grayscale for visualization.
+    """
+    if image.ndim == 3:
+        image_gray = image[:,:,0]
+    else:
+        image_gray = image
+    
+    if image_gray.dtype != np.uint8:
+         # Normalize from whatever bit-depth (e.g., 16-bit) to 8-bit
+        return cv2.normalize(image_gray, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
+    return image_gray
+
 def tifflist_to_numpy(file_paths: list) -> np.ndarray:
     """Loads a list of TIFF files into a 3D numpy array (stack)."""
     if not file_paths:
@@ -123,7 +137,8 @@ def tifflist_to_numpy(file_paths: list) -> np.ndarray:
         if frame is not None:
             stack[i] = frame
         else:
-            # Handle missing or corrupted files by filling with zeros
+            # --- ADDED: Warning for missing/corrupt files ---
+            print(f"  - Warning: Could not load file: {file_paths[i]}. Frame {i} will be zeros.")
             stack[i] = np.zeros_like(first_frame)
             
     return stack
@@ -211,25 +226,26 @@ def refine_guv_center(image: np.ndarray, center_guess: Tuple[int, int], radius_e
          roi_8bit = edge_image_8u # all zeros
     # --- END MODIFICATION ---
 
+    # --- REFINED EXCEPTION HANDLING ---
+    # 4. Threshold the *edge image* to get a mask of the ring
     try:
-        # 4. Threshold the *edge image* to get a mask of the ring
         thresh_val, thresh_mask = cv2.threshold(
             roi_8bit, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
         )
-        
-        # 5. Find the center of mass of the *ring mask*
-        M = cv2.moments(thresh_mask)
-        if M["m00"] == 0:
-            # Fallback: if no moments, find max brightness pixel in the *edge image*
-            (min_val, max_val, min_loc, max_loc) = cv2.minMaxLoc(roi_8bit)
-            cX, cY = max_loc
-        else:
-            cX = int(M["m10"] / M["m00"])
-            cY = int(M["m01"] / M["m00"])
-    except Exception:
-        # Fallback: find max brightness pixel in the *edge image*
+    except cv2.error:
+         # This can happen if roi_8bit is all one value (e.g., all black)
+         thresh_mask = np.zeros_like(roi_8bit) # Fallback to an empty mask
+    
+    # 5. Find the center of mass of the *ring mask*
+    M = cv2.moments(thresh_mask)
+    if M["m00"] == 0:
+        # Fallback: if no moments, find max brightness pixel in the *edge image*
         (min_val, max_val, min_loc, max_loc) = cv2.minMaxLoc(roi_8bit)
         cX, cY = max_loc
+    else:
+        cX = int(M["m10"] / M["m00"])
+        cY = int(M["m01"] / M["m00"])
+    # --- END REFINED HANDLING ---
     
     xc_new = x_start + cX
     yc_new = y_start + cY
@@ -301,7 +317,10 @@ def membrane_search(profile: np.ndarray,
                     radii: np.ndarray, 
                     expected_radius: int, 
                     search_factor: float,
-                    membrane_half_width: int) -> Tuple[int, int, int, List[str], bool]:
+                    membrane_half_width: int,
+                    peak_min_dist: int,      # <-- NEW
+                    peak_min_prom: float     # <-- NEW
+                    ) -> Tuple[int, int, int, List[str], bool]:
     """
     Detects membrane location by finding the highest peak in a search window
     defined by expected_radius +/- (expected_radius * search_factor).
@@ -344,12 +363,15 @@ def membrane_search(profile: np.ndarray,
     
     # --- 2. Find peaks in the masked, smoothed data ---
     try:
+        # --- MODIFIED: Use parameterized peak finding ---
+        max_prof_val = np.max(profile) # Base prominence on original max
         peaks, props = find_peaks(
             data_to_search, # This now uses the smoothed data
-            height=np.max(profile) * 0.1,  # Height relative to *original* max
-            distance=5,
-            prominence=np.max(profile) * 0.05 # Prominence relative to *original* max
+            height=max_prof_val * 0.1,  # Height relative to *original* max
+            distance=peak_min_dist,         # <-- USE PARAM
+            prominence=max_prof_val * peak_min_prom # <-- USE PARAM
         )
+        # --- END MODIFICATION ---
     except Exception as e:
         comments.append(f"find_peaks_failed: {e}")
         peaks = np.array([]) # Ensure peaks is an empty array
@@ -411,8 +433,10 @@ def create_guv_masks_with_detection(roi_guide_frame: np.ndarray,
                                    radius_estimate: int, 
                                    bg_buffer: int, 
                                    bg_width: int,
-                                   search_factor: float, # <-- From config
-                                   membrane_half_width: int, # <-- ADDED
+                                   search_factor: float,
+                                   membrane_half_width: int,
+                                   peak_min_dist: int,      # <-- NEW
+                                   peak_min_prom: float,     # <-- NEW
                                    num_angles: int = 360, 
                                    length_excess: float = 1.5,
                                    viz_thickness: Optional[int] = None) -> \
@@ -445,8 +469,10 @@ def create_guv_masks_with_detection(roi_guide_frame: np.ndarray,
         radial_profile, 
         along_radius,
         expected_radius=radius_estimate,
-        search_factor=search_factor, # <-- Use passed-in value
-        membrane_half_width=membrane_half_width # <-- PASS NEW VALUE
+        search_factor=search_factor,
+        membrane_half_width=membrane_half_width,
+        peak_min_dist=peak_min_dist,          # <-- PASS NEW
+        peak_min_prom=peak_min_prom           # <-- PASS NEW
     )
     # --- END UPDATED CALL ---
 
@@ -577,19 +603,15 @@ def create_mask_visualization(base_image: np.ndarray, inner_mask: np.ndarray,
     """
     Overlays the inner, membrane, and background masks in color.
     """
-    # --- MODIFIED: Ensure 8-bit conversion is from 2D ---
-    if base_image.ndim == 3:
-        base_image_gray = base_image[:,:,0]
-    else:
-        base_image_gray = base_image
-    img_8bit = cv2.normalize(base_image_gray, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
+    # --- MODIFIED: Use helper function ---
+    img_8bit = _convert_to_8bit_gray(base_image)
     # --- END MODIFICATION ---
     
     viz_image = cv2.cvtColor(img_8bit, cv2.COLOR_GRAY2BGR)
     overlay = np.zeros_like(viz_image)
-    overlay[inner_mask] = (128, 0, 128)      # Purple (BGR)
-    overlay[membrane_mask] = (0, 0, 255)     # Red (BGR)
-    overlay[background_mask] = (255, 0, 0)   # Blue (BGR)
+    overlay[inner_mask] = (201, 87, 188)      # Magenta (BGR)
+    overlay[membrane_mask] = (82, 0, 249)     # Bright Red (BGR)
+    overlay[background_mask] = (114, 48, 19)  # Purple (BGR)
     beta = 1.0 - alpha
     final_viz = cv2.addWeighted(viz_image, alpha, overlay, beta, 0)
     return final_viz
@@ -598,12 +620,8 @@ def style_image(frame: np.ndarray, time_label: str, microns_per_pixel: float, sc
     """
     Applies the red colormap and adds annotations.
     """
-    # --- MODIFIED: Ensure 8-bit conversion is from 2D ---
-    if frame.ndim == 3:
-        frame_gray = frame[:,:,0]
-    else:
-        frame_gray = frame
-    img_8bit = cv2.normalize(frame_gray, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
+    # --- MODIFIED: Use helper function ---
+    img_8bit = _convert_to_8bit_gray(frame)
     # --- END MODIFICATION ---
 
     img_color = cv2.cvtColor(img_8bit, cv2.COLOR_GRAY2BGR)

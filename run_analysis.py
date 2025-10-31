@@ -35,6 +35,9 @@ def main():
     path_to_roi_tifs = os.path.join(cfg.DATA_FOLDER, cfg.ROI_CHANNEL_PREFIX + cfg.EXPERIMENT_BASE_NAME + cfg.TIF_SUFFIX)
     path_to_csv = os.path.join(cfg.DATA_FOLDER, cfg.ROI_CHANNEL_PREFIX + cfg.EXPERIMENT_BASE_NAME + cfg.CSV_SUFFIX)
     
+    # --- Ensure output directory exists at the start ---
+    os.makedirs(cfg.OUTPUT_IMAGE_FOLDER, exist_ok=True)
+    
     # --- 2. Load File Names ---
     dye_files = natsorted(glob.glob(path_to_dye_tifs))
     roi_guide_files = natsorted(glob.glob(path_to_roi_tifs))
@@ -79,10 +82,9 @@ def main():
     print("Dye stack loaded.")
     
     print("Loading ROI (C1) guide image...")
-    # --- *** MODIFIED LINE *** ---
+    
     # Force loading as grayscale (single-channel) while preserving 16-bit depth
     roi_guide_frame = cv2.imread(roi_guide_file, cv2.IMREAD_ANYDEPTH | cv2.IMREAD_GRAYSCALE)
-    # --- *** END MODIFICATION *** ---
     
     if roi_guide_frame is None:
         print(f"Error: Could not load ROI guide frame: {roi_guide_file}")
@@ -120,12 +122,12 @@ def main():
         
         print(f"\n--- Processing GUV {guv_id} at ({xc_orig}, {yc_orig}) ---")
         
-        # --- MODIFIED: Assume CSV 'size' is DIAMETER, divide by 2 for radius ---
+        # --- Assume CSV 'size' is DIAMETER, divide by 2 for radius ---
         guv_radius_estimate = int(np.round(guv_radius_from_csv_raw / 2.0))
         print(f"  - Using radius estimate (CSV 'size'/2): {guv_radius_estimate}px")
 
 
-        # --- *** MODIFIED: RE-ENABLING CENTER REFINEMENT *** ---
+        # --- GUV CENTER COORDINATES REFINEMENT ---
         # Bright clusters *can* skew the center of mass calculation, but
         # the CSV coordinate may also be slightly off.
         print(f"  - Refining center coordinates...")
@@ -137,26 +139,27 @@ def main():
         )
         # xc_refined, yc_refined = xc_orig, yc_orig # Uncomment this line to disable refinement
         print(f"  - Original center: ({xc_orig}, {yc_orig}), Refined center: ({xc_refined}, {yc_refined})")
-        # --- *** END MODIFICATION *** ---
         
-        # 5a. ENHANCED: Define Masks using Membrane Detection
+        # 5a. Define Masks using Membrane Detection
         print(f"  - Detecting membrane from radial intensity profile...")
         
         # Get the visualization thickness from config, default to None if not present
         viz_thickness = getattr(cfg, 'VIZ_MEMBRANE_THICKNESS_PIXELS', None)
         
-        # --- UPDATED FUNCTION CALL ---
+        # --- UPDATED FUNCTION CALL (Passing new config params) ---
         inner_mask, membrane_mask, background_mask, detection_info = utils.create_guv_masks_with_detection(
             roi_guide_frame, 
             (xc_refined, yc_refined),  # Use the refined center
             radius_estimate=guv_radius_estimate,
             bg_buffer=cfg.BG_BUFFER_PIXELS,
             bg_width=cfg.BG_RING_WIDTH_PIXELS,
-            search_factor=cfg.MEMBRANE_SEARCH_FACTOR, # <-- Read from config
-            membrane_half_width=cfg.MEMBRANE_FIXED_HALF_WIDTH, # <-- ADD THIS LINE
-            num_angles=360,  # Use lots of angles for accurate detection
+            search_factor=cfg.MEMBRANE_SEARCH_FACTOR,
+            membrane_half_width=cfg.MEMBRANE_FIXED_HALF_WIDTH,
+            peak_min_dist=cfg.PEAK_FIND_MIN_DISTANCE,       # <-- NEW
+            peak_min_prom=cfg.PEAK_FIND_MIN_PROMINENCE,    # <-- NEW
+            num_angles=360,
             length_excess=1.5,
-            viz_thickness=viz_thickness  # Pass the new parameter
+            viz_thickness=viz_thickness
         )
         # --- END UPDATED CALL ---
         
@@ -189,9 +192,6 @@ def main():
                 alpha=cfg.MASK_VIZ_OVERLAY_ALPHA
             )
             
-            # Ensure output directory exists
-            os.makedirs(cfg.OUTPUT_IMAGE_FOLDER, exist_ok=True)
-            
             # Build a unique name
             viz_name = f"{cfg.EXPERIMENT_BASE_NAME}_mask_viz_GUV_{guv_id}.png"
             viz_path = os.path.join(cfg.OUTPUT_IMAGE_FOLDER, viz_name)
@@ -202,9 +202,7 @@ def main():
             except Exception as e:
                 print(f"    Warning: Could not save mask visualization: {e}")
                 
-            # --- *** FIX: ALWAYS SAVE RADIAL PLOT *** ---
-            # Removed the 'if' condition to ensure the plot is always
-            # saved for debugging, even if detection *thinks* it succeeded.
+            # --- SAVE RADIAL PLOT ---
             fig, ax = plt.subplots(figsize=(10, 5))
             ax.plot(detection_info['along_radius'], detection_info['radial_profile'], 'b-', linewidth=2)
             
@@ -236,7 +234,6 @@ def main():
             fig.savefig(profile_path, dpi=150, bbox_inches='tight')
             plt.close(fig)
             print(f"    Saved radial profile to: {profile_path}")
-            # --- *** END FIX *** ---
         
         # 5b. Get Intensity Traces
         intensity_trace = utils.get_intensity_trace(im_stack, inner_mask)
@@ -250,7 +247,7 @@ def main():
         # 5c. Detect Jump 
         try:
             jump_frame = utils.detect_intensity_jump(intensity_trace, sensitivity=cfg.JUMP_SENSITIVITY)
-            baseline_frames_end = max(5, jump_frame) 
+            baseline_frames_end = max(cfg.MIN_BASELINE_FRAMES, jump_frame) 
             
             if jump_frame == -1:
                 jump_frame = 0 
@@ -261,7 +258,7 @@ def main():
         except Exception as e:
             print(f"  - Warning: Jump detection failed for GUV {guv_id}: {e}")
             jump_frame = 0 
-            baseline_frames_end = 5
+            baseline_frames_end = cfg.MIN_BASELINE_FRAMES
             
         # 5d. Store Traces and Jump Index
         all_intensity_curves.append(intensity_trace)
@@ -273,7 +270,6 @@ def main():
     # Save detection quality log
     df_quality = pd.DataFrame(detection_quality_log)
     quality_log_path = os.path.join(cfg.OUTPUT_IMAGE_FOLDER, f"{cfg.EXPERIMENT_BASE_NAME}_detection_quality.csv")
-    os.makedirs(cfg.OUTPUT_IMAGE_FOLDER, exist_ok=True)
     df_quality.to_csv(quality_log_path, index=False)
     print(f"\nSaved detection quality log to: {quality_log_path}")
     
@@ -298,7 +294,7 @@ def main():
     
     for idx, (dye_trace, bg_trace, jump_f) in enumerate(zip(all_intensity_curves, all_background_curves, all_jump_frames)):
         # Determine baseline frames for I_dye,0
-        baseline_frames_end = max(5, jump_f)
+        baseline_frames_end = max(cfg.MIN_BASELINE_FRAMES, jump_f)
         if baseline_frames_end >= len(dye_trace):
              print(f"  - Warning: Skipping GUV {idx+1} due to insufficient baseline frames.")
              continue
@@ -369,17 +365,16 @@ def main():
     print(f"Fitting first {cfg.FIT_DATA_PERCENTAGE*100:.0f}% of aligned data ({fit_slice_index} frames).")
 
     if cfg.MODEL_TO_USE == '5-PARAM':
-        p0_guess = cfg.FIT_INITIAL_GUESS
+        p0_guess = cfg.FIT_INITIAL_GUESS_5PARAM
         fit_function = utils.dyn_model
     elif cfg.MODEL_TO_USE == '4-PARAM':
-        # --- *** MODIFIED LINE (TYPO FIX) *** ---
         p0_guess = cfg.FIT_INITIAL_GUESS_4PARAM
-        # --- *** END MODIFICATION *** ---
         fit_function = utils.dyn_model_4param
     else:
         raise ValueError("Invalid MODEL_TO_USE specified in config.py. Must be '4-PARAM' or '5-PARAM'.")
 
     # Perform the curve fit
+    # --- Add fit_failed flag ---
     try:
         params, covariance = sc.curve_fit(
             fit_function, 
@@ -388,9 +383,11 @@ def main():
             p0=p0_guess,
             maxfev=5000 
         )
+        fit_failed = False
     except RuntimeError as e:
         print(f"FATAL WARNING: Curve fitting failed: {e}. Using initial guess parameters for output.")
         params = np.array(p0_guess)
+        fit_failed = True
         
     # --- 8. Extract Parameters and Generate Outputs ---
     if cfg.MODEL_TO_USE == '5-PARAM':
@@ -404,7 +401,7 @@ def main():
         fig_title = f"Fit Parameters: $A_f = {Af:.2f}$, $A_1 = {A1:.2f}$, $\\tau_1 = {tau1:.2f}$ s, $A_2 = {A2:.2f}$, $\\tau_2 = {tau2:.2f}$ s"
         fit_curve = utils.dyn_model(t, Af, A1, tau1, A2, tau2)
         
-    elif cfg.MODEL_TO_USE == '4-PARAM': 
+    elif cfg.MODEL_TO_USE == '4-PARAM': # <--- *** CORRECTED TYPO ***
         I_offset = params[0]
         A = params[1]
         tau = params[2]
@@ -414,11 +411,14 @@ def main():
         fig_title = f"Fit Parameters: $I_{{offset}} = {I_offset:.2f}$, $A = {A:.2f}$, $\\tau = {tau:.2f}$ s, $D = {D:.4f}$"
         fit_curve = utils.dyn_model_4param(t, I_offset, A, tau, D)
 
+    # --- Modify title if fit failed ---
+    if fit_failed:
+        fig_title = "FIT FAILED: Using Initial Guess\n" + fig_title
+
     # --- 9. Export Representative Frames ---
     print("\nExporting representative frames...")
     
-    # Ensure the output directory exists
-    os.makedirs(cfg.OUTPUT_IMAGE_FOLDER, exist_ok=True)
+    # os.makedirs is already called at the top
     
     # Use the aligned time array (t) and image stack (im_stack_aligned)
     for i, time_point in enumerate(cfg.EXPORT_TIME_POINTS_S):
@@ -434,7 +434,7 @@ def main():
         styled_frame = utils.style_image(
             frame_data, 
             label, 
-            cfg.MICRONS_PER_PIXEL, # <--- CORRECTED TYPO
+            cfg.MICRONS_PER_PIXEL,
             cfg.SCALE_BAR_LENGTH_MICRONS
             )
         out_name = f"frame_{i+1}_at_{int(np.round(time_point))}s.png"
@@ -462,8 +462,7 @@ def main():
     if fit_slice_index > 0 and fit_slice_index <= len(t):
         ax.plot(t[fit_slice_index-1], average_curve[fit_slice_index-1], 'b*', markersize=10, label='End of Fit Data')
 
-
-    # Add fit parameters to the title
+    # --- Title is now set correctly regardless of fit status ---
     ax.set_title(fig_title)
     
     # Final plot styling
@@ -476,7 +475,39 @@ def main():
     plot_name = f"{cfg.EXPERIMENT_BASE_NAME}_kinetic_fit.png"
     plot_path = os.path.join(cfg.OUTPUT_IMAGE_FOLDER, plot_name)
     fig.savefig(plot_path, dpi=300, bbox_inches='tight')
+
+    # --- 11. EXPORT NORMALIZED CURVE DATA ---
+    print("\nExporting normalized curve data to CSV...")
+    
+    # Get the original GUV IDs for the curves that were successfully normalized
+    try:
+        all_guv_ids = df_vesicles['id'].values
+        valid_guv_ids = all_guv_ids[valid_curve_indices]
+        
+        # Create column headers
+        headers = ['Time (s)'] + [f'GUV_{gid}_I_uptake' for gid in valid_guv_ids] + ['Average_I_uptake']
+        
+        # Reshape 1D arrays to be 2D columns
+        t_col = t.reshape(-1, 1)
+        avg_col = average_curve.reshape(-1, 1)
+        
+        # Stack all data horizontally: Time, GUV1, GUV2, ..., Average
+        # We must transpose curve_array so each GUV is a column
+        data_to_save = np.hstack((t_col, curve_array.T, avg_col))
+        
+        # Create DataFrame for easy saving
+        df_curves = pd.DataFrame(data_to_save, columns=headers)
+        
+        # Define path and save
+        curves_csv_path = os.path.join(cfg.OUTPUT_IMAGE_FOLDER, f"{cfg.EXPERIMENT_BASE_NAME}_normalized_curves.csv")
+        df_curves.to_csv(curves_csv_path, index=False, float_format='%.6f')
+        print(f"  - Saved normalized data to: {curves_csv_path}")
+        
+    except Exception as e:
+        print(f"  - Warning: Could not export normalized curve CSV: {e}")
+
     plt.close(fig) # Close the plot to free memory
+
 
 if __name__ == "__main__":
     main()
