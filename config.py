@@ -87,7 +87,7 @@ JUMP_SENSITIVITY = 3.0 # Standard deviations from the mean difference
 # --- Baseline Calculation ---
 # Minimum number of frames to use for baseline calculation
 # (used as max(MIN_BASELINE_FRAMES, jump_frame))
-MIN_BASELINE_FRAMES = 5
+MIN_BASELINE_FRAMES = 3
 
 
 # -------------------------------------------------------------------
@@ -104,7 +104,7 @@ MODEL_TO_USE = '4-PARAM'
 # Percentage of the data (from 0.0 to 1.0) to use for fitting.
 # 1.0 = use all data
 # 0.5 = use first 50% of data
-FIT_DATA_PERCENTAGE = 0.99
+FIT_DATA_PERCENTAGE = 0.9
 
 # --- Initial Guesses for 5-PARAM Model ---
 # Af: Final intensity
