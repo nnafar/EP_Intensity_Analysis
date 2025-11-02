@@ -13,6 +13,7 @@ import cv2
 import pandas as pd
 import os
 import re
+import logging
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 
@@ -25,9 +26,45 @@ from PIL.ExifTags import TAGS
 from scipy.signal import find_peaks, peak_widths
 from scipy import ndimage as nd
 from scipy.ndimage import gaussian_filter1d, map_coordinates
+import matplotlib.pyplot as plt
+
+# --- Local Imports ---
+import config as cfg
+import guv_analysis_utils as utils # Imports itself for internal calls
+
 
 # -------------------------------------------------------------------
-# --- 1. TIME EXTRACTION FUNCTIONS (unchanged) ---
+# --- 0. LOGGING SETUP (NEW) ---
+# -------------------------------------------------------------------
+
+def setup_logging(output_folder: str, experiment_name: str, level: int = logging.INFO) -> logging.Logger:
+    """
+    Configures logging to file and console.
+    
+    Based on the recommendation from CODE_REVIEW.md.
+    """
+    log_filename = os.path.join(
+        output_folder, 
+        f"{experiment_name}_{datetime.now():%Y%m%d_%H%M%S}.log"
+    )
+    
+    # Ensure handlers are not added multiple times if reloaded
+    logger = logging.getLogger(__name__)
+    if logger.hasHandlers():
+        logger.handlers.clear()
+
+    logging.basicConfig(
+        level=level,
+        format='%(asctime)s - %(levelname)-8s - %(funcName)-20s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_filename),
+            logging.StreamHandler()
+        ]
+    )
+    return logger
+
+# -------------------------------------------------------------------
+# --- 1. TIME EXTRACTION FUNCTIONS ---
 # -------------------------------------------------------------------
 
 def extract_timestamps_from_metadata(file_paths: List[str]) -> tuple[Optional[np.ndarray], Optional[float]]:
@@ -41,27 +78,22 @@ def extract_timestamps_from_metadata(file_paths: List[str]) -> tuple[Optional[np
         return None, None
         
     try:
-        # Read the first file's metadata
         with tifffile.TiffFile(file_paths[0]) as tif:
-            # Check for ImageDescription which contains ImageJ metadata
             description_tag = tif.pages[0].tags.get('ImageDescription')
             if description_tag is None:
                 return None, None
                 
             description = description_tag.value
             
-            # Use regex to find the frame interval (finterval=X)
             match = re.search(r'finterval=([0-9.]+)', description)
             if match:
                 frame_interval = float(match.group(1))
                 num_frames = len(file_paths)
                 
-                # Create the time array
                 time_array = np.arange(num_frames) * frame_interval
                 return time_array, frame_interval
                 
     except Exception:
-        # If tifffile fails or metadata is missing, return None to trigger fallback
         pass
 
     return None, None
@@ -73,16 +105,12 @@ def create_manual_timestamps(num_frames: int, fallback_fps: float = 1.0) -> tupl
 
 
 # -------------------------------------------------------------------
-# --- 2. KINETIC MODEL FUNCTIONS (unchanged) ---
+# --- 2. KINETIC MODEL FUNCTIONS ---
 # -------------------------------------------------------------------
 
 def dyn_model_4param(t: np.ndarray, I_offset: float, A: float, tau: float, D: float) -> np.ndarray:
     """
     4-parameter Exponential Rise with Linear Drift: I(t) = I_offset + A * (1 - np.exp(-t/tau)) + D * t
-    - I_offset: Baseline intensity (should be ~0 for normalized I_uptake)
-    - A: Amplitude of the rise
-    - tau: Time constant
-    - D: Linear drift term
     """
     return I_offset + A * (1 - np.exp(-t / tau)) + D * t
 
@@ -90,11 +118,6 @@ def dyn_model_5param(t: np.ndarray, Af: float, A1: float, tau1: float, A2: float
     """
     5-parameter Double Exponential Rise model for Dye Uptake (Resealing):
     I(t) = Af - A1 * np.exp(-t / tau1) - A2 * np.exp(-t / tau2)
-    - Af: Final normalized intensity (steady state)
-    - A1: Amplitude of the fast component
-    - tau1: Fast time constant
-    - A2: Amplitude of the slow component
-    - tau2: Fast time constant
     """
     return Af - A1 * np.exp(-t / tau1) - A2 * np.exp(-t / tau2)
 
@@ -112,33 +135,26 @@ def _convert_to_8bit_gray(image: np.ndarray) -> np.ndarray:
         image_gray = image
     
     if image_gray.dtype != np.uint8:
-         # Normalize from whatever bit-depth (e.g., 16-bit) to 8-bit
         return cv2.normalize(image_gray, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
     return image_gray
 
-def tifflist_to_numpy(file_paths: list) -> np.ndarray:
+def tifflist_to_numpy(file_paths: List[str]) -> np.ndarray:
     """Loads a list of TIFF files into a 3D numpy array (stack)."""
     if not file_paths:
         return np.array([])
-    # Load first image to get dimensions and data type
-    # Ensure grayscale loading
+    
     first_frame = cv2.imread(file_paths[0], cv2.IMREAD_ANYDEPTH | cv2.IMREAD_GRAYSCALE)
     if first_frame is None:
         raise FileNotFoundError(f"Could not load first frame: {file_paths[0]}")
     
-    # Pre-allocate 3D array
     stack = np.empty((len(file_paths), first_frame.shape[0], first_frame.shape[1]), dtype=first_frame.dtype)
     stack[0] = first_frame
     
-    # Load remaining images
     for i in range(1, len(file_paths)):
-        # Ensure grayscale loading
         frame = cv2.imread(file_paths[i], cv2.IMREAD_ANYDEPTH | cv2.IMREAD_GRAYSCALE)
         if frame is not None:
             stack[i] = frame
         else:
-            # Warning for missing/corrupt files
-            print(f"  - Warning: Could not load file: {file_paths[i]}. Frame {i} will be zeros.")
             stack[i] = np.zeros_like(first_frame)
             
     return stack
@@ -147,7 +163,6 @@ def create_circular_mask(img_shape: tuple[int, int], center: tuple[int, int], ra
     """Creates a circular mask for ROI selection."""
     h, w = img_shape
     Y, X = np.ogrid[:h, :w]
-    # Center is (xc, yc) -> (X, Y)
     dist_from_center = np.sqrt((X - center[0])**2 + (Y - center[1])**2)
     mask = dist_from_center <= radius
     return mask
@@ -158,11 +173,9 @@ def create_annular_mask(img_shape: tuple[int, int], center: tuple[int, int], inn
     Y, X = np.ogrid[:h, :w]
     dist_from_center = np.sqrt((X - center[0])**2 + (Y - center[1])**2)
     
-    # Inner and outer checks
     mask_outer = dist_from_center <= outer_radius
     mask_inner = dist_from_center >= inner_radius
     
-    # Annular mask is the intersection of these two
     annular_mask = np.logical_and(mask_outer, mask_inner)
     return annular_mask
 
@@ -174,7 +187,6 @@ def refine_guv_center(image: np.ndarray, center_guess: Tuple[int, int], radius_e
     """
     xc, yc = center_guess
     
-    # Define a search box around the guess
     box_half_width = int(max(15, radius_estimate * search_box_factor))
     x_start = max(0, xc - box_half_width)
     x_end = min(image.shape[1], xc + box_half_width)
@@ -186,53 +198,33 @@ def refine_guv_center(image: np.ndarray, center_guess: Tuple[int, int], radius_e
         
     roi = image[y_start:y_end, x_start:x_end]
     
-    # Handle cases where cv2.imread loads a grayscale TIFF as 3-channel
     if roi.ndim == 3:
-        # Assume all channels are identical and take the first one
         roi = roi[:, :, 0]
     
-    # --- Use Laplacian edge detection to find the ring ---
-    # This is more robust than simple thresholding, which gets pulled
-    # by the bright interior.
-
-    # 1. Blur to reduce noise before edge detection
     if roi.dtype == np.uint16:
-        # Need to work with a float type for Laplacian, then scale
         roi_float = roi.astype(np.float32)
         roi_blurred = cv2.GaussianBlur(roi_float, (3, 3), 0)
-        # Using 16-bit signed output to capture positive/negative slopes
-        
         laplacian = cv2.Laplacian(roi_blurred, cv2.CV_32F, ksize=3)
-
     else:
-        # Assume 8-bit or similar
         roi_blurred = cv2.GaussianBlur(roi.astype(np.float32), (3, 3), 0)
-        
         laplacian = cv2.Laplacian(roi_blurred, cv2.CV_32F, ksize=3)
 
-    # 2. Convert back to absolute 8-bit scale
-    # This image now highlights *only* the edges (the ring)
     edge_image_8u = cv2.convertScaleAbs(laplacian)
 
-    # 3. Normalize for thresholding (Otsu works best on 8-bit)
     if np.max(edge_image_8u) > 0:
          roi_8bit = cv2.normalize(edge_image_8u, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
     else:
-         roi_8bit = edge_image_8u # all zeros
+         roi_8bit = edge_image_8u
 
-    # 4. Threshold the *edge image* to get a mask of the ring
     try:
         thresh_val, thresh_mask = cv2.threshold(
             roi_8bit, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
         )
     except cv2.error:
-         # This can happen if roi_8bit is all one value (e.g., all black)
-         thresh_mask = np.zeros_like(roi_8bit) # Fallback to an empty mask
+         thresh_mask = np.zeros_like(roi_8bit)
     
-    # 5. Find the center of mass of the *ring mask*
     M = cv2.moments(thresh_mask)
     if M["m00"] == 0:
-        # Fallback: if no moments, find max brightness pixel in the *edge image*
         (min_val, max_val, min_loc, max_loc) = cv2.minMaxLoc(roi_8bit)
         cX, cY = max_loc
     else:
@@ -244,9 +236,7 @@ def refine_guv_center(image: np.ndarray, center_guess: Tuple[int, int], radius_e
     
     shift = np.sqrt((xc_new - xc)**2 + (yc_new - yc)**2)
     
-    # Keep the shift check, it's still good practice
     if shift > radius_estimate * 0.7:
-        print(f"  - Warning: Center refinement shifted by {shift:.1f}px. Reverting to original center.")
         return center_guess
         
     return (xc_new, yc_new)
@@ -263,36 +253,24 @@ def linear_profiles(image: np.ndarray,
     """
     Calculate linear intensity profiles radiating from the center using
     scipy.ndimage.map_coordinates for sub-pixel interpolation.
-    
-    (Adapted from skeleton.py)
     """
     xc, yc = center
     
-    # --- For 3-channel image ---
     if image.ndim == 3:
         image = image[:,:,0]
     
     length = int(radius * length_excess)
     theta = np.linspace(0, 2 * np.pi, num_angles, endpoint=False)
     
-    # 1D array of radii
     along_radius = np.arange(0, length, 1)
     
-    # 2D arrays of x and y coordinates
-    # (num_angles, length)
     x_coords = xc + along_radius[np.newaxis, :] * np.cos(theta[:, np.newaxis])
     y_coords = yc + along_radius[np.newaxis, :] * np.sin(theta[:, np.newaxis])
 
-    # map_coordinates requires coordinates as a (2, N) array
-    # We want a (num_angles, length) output, so we flatten and stack
     coords = np.stack([y_coords.ravel(), x_coords.ravel()], axis=0)
 
-    # Perform interpolation
-    # 'order=1' is linear interpolation
     profiles_flat = map_coordinates(image, coords, order=1, mode='constant', cval=0.0)
     
-    # Reshape back to (num_angles, length) and transpose
-    # to (length, num_angles) to match old function's output shape
     profiles = profiles_flat.reshape(num_angles, length).T
     
     return profiles, along_radius, theta
@@ -300,87 +278,111 @@ def linear_profiles(image: np.ndarray,
 def average_radial_profile(profiles: np.ndarray) -> np.ndarray:
     """
     Calculate the average radial profile using the median over all angles.
-    (Adapted from skeleton.py)
     """
-    # Use median to be robust against outliers (e.g., lipid clusters)
     return np.median(profiles, axis=1)
 
-def membrane_search(profile: np.ndarray, 
-                    radii: np.ndarray, 
-                    expected_radius: int, 
-                    search_factor: float,
-                    membrane_half_width: int,
-                    peak_min_dist: int,      
-                    peak_min_prom: float     
-                    ) -> Tuple[int, int, int, List[str], bool]:
+def membrane_search(
+    profile: np.ndarray, 
+    radii: np.ndarray, 
+    expected_radius: int, 
+    search_factor: float,
+    membrane_half_width: int,
+    peak_min_dist: int,      
+    peak_min_prom: float     
+) -> Tuple[int, int, int, List[str], bool]:
     """
-    Detects membrane location by finding the highest peak in a search window
-    defined by expected_radius +/- (expected_radius * search_factor).
+    Detects membrane location by finding the highest peak in a search window.
+
+    The algorithm searches for the highest intensity peak within a window
+    centered on expected_radius. The membrane boundaries are defined as
+    peak_position ± membrane_half_width. This implementation is based on
+    the code review's recommendation.
     
-    (Adapted from skeleton.py + previous fixes)
+    Parameters
+    ----------
+    profile : np.ndarray
+        1D array of radial intensity values (averaged across angles).
+    radii : np.ndarray
+        1D array of pixel radii corresponding to profile values.
+    expected_radius : int
+        Expected membrane radius in pixels (from CSV).
+    search_factor : float
+        Fractional search window size (e.g., 0.3 = ±30% of expected_radius).
+    membrane_half_width : int
+        Half-width of membrane region in pixels (defines inner/outer boundaries).
+    peak_min_dist : int
+        Minimum distance between detected peaks (pixels).
+    peak_min_prom : float
+        Minimum peak prominence as fraction of max intensity (0-1).
     
-    Returns:
-        peak_pos: Radius (in pixels) of the detected peak.
-        inner_b: Radius (in pixels) of the inner membrane border.
-        outer_b: Radius (in pixels) of the outer membrane border.
-        comments: List of quality/warning comments.
-        failed: True if detection failed.
+    Returns
+    -------
+    peak_pos : int
+        Detected membrane peak position in pixels.
+    inner_b : int
+        Inner membrane boundary radius in pixels.
+    outer_b : int
+        Outer membrane boundary radius in pixels.
+    comments : List[str]
+        Quality flags and warnings (empty list if no issues).
+    failed : bool
+        True if detection failed and fallback values were used.
+        
+    Notes
+    -----
+    The profile is smoothed with gaussian_filter1d(sigma=1) before peak detection
+    to reduce sensitivity to noise.
     """
     comments = []
     failed = False
     
     # --- Smooth the profile to be robust to noise/clusters ---
-    # sigma=1 applies a light smoothing to average out high-frequency noise
     profile_smooth = gaussian_filter1d(profile, sigma=1)
     
     # --- 1. Define search window around hint ---
-    data_to_search = profile_smooth # Use the smoothed profile for detection
+    data_to_search = profile_smooth
     
-    # Find array indices corresponding to the radius window
     min_radius = max(0, expected_radius * (1.0 - search_factor))
     max_radius = expected_radius * (1.0 + search_factor)
     
     min_idx = np.searchsorted(radii, min_radius, side='left')
     max_idx = np.searchsorted(radii, max_radius, side='right')
     
-    if min_idx < max_idx: # Ensure window is valid
-        # Create a *mask* to nullify data outside this window
+    if min_idx < max_idx:
         search_mask = np.zeros_like(profile_smooth)
         search_mask[min_idx:max_idx] = 1.0
         data_to_search = profile_smooth * search_mask
     else:
         comments.append("invalid_search_window")
-        # data_to_search is already profile_smooth
     
     # --- 2. Find peaks in the masked, smoothed data ---
     try:
-        # Use parameterized peak finding
-        max_prof_val = np.max(profile)  # Base prominence on original max
+        max_prof_val = np.max(profile)
+        if max_prof_val == 0:
+            max_prof_val = 1.0
+            
         peaks, props = find_peaks(
-            data_to_search,             # Uses the smoothed data
-            height=max_prof_val * 0.1,  # Height relative to *original* max
+            data_to_search,
+            height=max_prof_val * 0.1,
             distance=peak_min_dist,     
             prominence=max_prof_val * peak_min_prom 
         )
 
     except Exception as e:
         comments.append(f"find_peaks_failed: {e}")
-        peaks = np.array([]) # Ensure peaks is an empty array
+        peaks = np.array([])
 
     if not np.any(peaks):
         comments.append("no_peak_in_window")
         failed = True
-        # Fallback to using the estimate
-        peak_idx = np.searchsorted(radii, expected_radius) # Find index closest to hint
-        peak_idx = min(peak_idx, len(radii) - 1)           # Clamp to bounds
+        peak_idx = np.searchsorted(radii, expected_radius)
+        peak_idx = min(peak_idx, len(radii) - 1)
     else:
-        # Find the *highest* peak within the allowed window
         heights = props['peak_heights']
         chosen_peak_idx_in_peaks_array = np.argmax(heights)
         peak_idx = peaks[chosen_peak_idx_in_peaks_array]
 
     # --- 3. Calculate width ---
-    # Use the fixed half-width from config
     try:
         inner_idx = max(0, peak_idx - membrane_half_width)
         outer_idx = min(len(profile) - 1, peak_idx + membrane_half_width)
@@ -390,12 +392,10 @@ def membrane_search(profile: np.ndarray,
             
     except Exception as e:
         comments.append(f"width_calc_failed: {e}")
-        # Fallback: use a default width (e.g., 5 pixels) around the peak
         inner_idx = max(0, peak_idx - 5)
         outer_idx = min(len(profile) - 1, peak_idx + 5)
         
     # --- 4. Convert indices back to pixel radii ---
-    # Ensure indices are within the bounds of the radii array
     peak_idx = min(peak_idx, len(radii) - 1)
     inner_idx = min(inner_idx, len(radii) - 1)
     outer_idx = min(outer_idx, len(radii) - 1)
@@ -404,7 +404,6 @@ def membrane_search(profile: np.ndarray,
     inner_b = int(radii[inner_idx])
     outer_b = int(radii[outer_idx])
     
-    # Final sanity check
     if inner_b == 0 and outer_b == 0:
         comments.append("zero_radius_detected")
         failed = True
@@ -429,16 +428,10 @@ def create_guv_masks_with_detection(roi_guide_frame: np.ndarray,
                                    viz_thickness: Optional[int] = None) -> \
                                    Tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
     """
-    Creates GUV masks using the detection logic from skeleton.py, constrained
-    by a search window based on the radius_estimate.
-    
-    (This function now wraps the new skeleton.py-based methods)
+    Creates GUV masks using the detection logic.
     """
     img_shape = roi_guide_frame.shape
     
-    # --- 1. Call functions ---
-    
-    # Step 1: Calculate linear intensity profiles
     profiles, along_radius, theta = linear_profiles(
         roi_guide_frame, 
         center, 
@@ -447,10 +440,8 @@ def create_guv_masks_with_detection(roi_guide_frame: np.ndarray,
         radius=radius_estimate 
     )
     
-    # Step 2: Calculate average radial profile
     radial_profile = average_radial_profile(profiles)
     
-    # Step 3: Detect membrane
     peak_pos, inner_b, outer_b, comments, failed = membrane_search(
         radial_profile, 
         along_radius,
@@ -461,33 +452,25 @@ def create_guv_masks_with_detection(roi_guide_frame: np.ndarray,
         peak_min_prom=peak_min_prom           
     )
 
-    # --- 2. Create Masks ---
-    
-    # 1. Inner GUV Mask (for dye uptake measurement)
     inner_guv_mask = create_circular_mask(img_shape, center, radius=inner_b)
     
-    # 2. Membrane Mask (for visualization)
     if viz_thickness is not None and viz_thickness > 0:
-        # Use a fixed thickness for visualization, anchored to the *inner* radius
         viz_mem_inner_r = inner_b + 1
         viz_mem_outer_r = inner_b + viz_thickness
         membrane_mask = create_annular_mask(img_shape, center, 
                                            inner_radius=viz_mem_inner_r, 
                                            outer_radius=viz_mem_outer_r)
     else:
-        # Original behavior: fill the whole detected membrane area
         membrane_mask = create_annular_mask(img_shape, center, 
                                            inner_radius=inner_b + 1, 
                                            outer_radius=outer_b)
     
-    # 3. Background Ring Mask
     bg_inner_r = outer_b + bg_buffer
     bg_outer_r = outer_b + bg_buffer + bg_width
     background_ring_mask = create_annular_mask(img_shape, center, 
                                               inner_radius=bg_inner_r, 
                                               outer_radius=bg_outer_r)
 
-    # --- 3. Populate detection_info dictionary for run_analysis.py ---
     detection_info = {
         'detected_inner_radius': inner_b,
         'detected_outer_radius': outer_b,
@@ -496,23 +479,135 @@ def create_guv_masks_with_detection(roi_guide_frame: np.ndarray,
         'peak_position': peak_pos,
         'detection_failed': failed,
         'comments': comments,
-        'radial_profile': radial_profile, # Save the *original* noisy profile for plotting
+        'radial_profile': radial_profile,
         'along_radius': along_radius,
         'method': 'skeleton_search',
         'search_factor_used': search_factor
     }
-
-    if not failed:
-         print(f"  Detected membrane: inner={inner_b}px, outer={outer_b}px (estimate was {radius_estimate}px)")
-    else:
-         print(f"  WARNING: Membrane detection failed. Review comments: {comments}")
-
     
     return inner_guv_mask, membrane_mask, background_ring_mask, detection_info
 
 
 # -------------------------------------------------------------------
-# --- 5. LEGACY & TRACE FUNCTIONS ---
+# --- 5. PARALLEL WORKER FUNCTION (NEW) ---
+# -------------------------------------------------------------------
+
+def process_single_guv(guv_id: str, center_orig: tuple, radius_csv_raw: int, 
+                       is_first_guv: bool, 
+                       roi_frame: np.ndarray, dye_files: list) -> tuple:
+    """
+    Runs the full analysis pipeline for a single GUV.
+    
+    This function is designed to be run in a parallel process.
+    It has no logger and returns results and quality info.
+    """
+    
+    # --- Assume CSV 'size' is DIAMETER, divide by 2 for radius ---
+    guv_radius_estimate = int(np.round(radius_csv_raw / 2.0))
+
+    # --- GUV CENTER COORDINATES REFINEMENT ---
+    (xc_refined, yc_refined) = utils.refine_guv_center(
+        roi_frame, 
+        center_orig, 
+        guv_radius_estimate,
+        search_box_factor=0.8
+    )
+    
+    # --- 5a. Define Masks using Membrane Detection ---
+    viz_thickness = getattr(cfg, 'VIZ_MEMBRANE_THICKNESS_PIXELS', None)
+    
+    inner_mask, membrane_mask, background_mask, detection_info = utils.create_guv_masks_with_detection(
+        roi_frame, 
+        (xc_refined, yc_refined),
+        radius_estimate=guv_radius_estimate,
+        bg_buffer=cfg.BG_BUFFER_PIXELS,
+        bg_width=cfg.BG_RING_WIDTH_PIXELS,
+        search_factor=cfg.MEMBRANE_SEARCH_FACTOR,
+        membrane_half_width=cfg.MEMBRANE_FIXED_HALF_WIDTH,
+        peak_min_dist=cfg.PEAK_FIND_MIN_DISTANCE,
+        peak_min_prom=cfg.PEAK_FIND_MIN_PROMINENCE,
+        num_angles=360,
+        length_excess=1.5,
+        viz_thickness=viz_thickness
+    )
+    
+    # Log detection quality
+    quality_entry = {
+        'guv_id': guv_id,
+        'estimated_radius': guv_radius_estimate,
+        'detected_inner': detection_info['detected_inner_radius'],
+        'detected_outer': detection_info['detected_outer_radius'],
+        'failed': detection_info['detection_failed'],
+        'comments': ', '.join(detection_info['comments']) if detection_info['comments'] else 'OK'
+    }
+
+    # --- Export mask visualization ---
+    should_export_viz = (cfg.EXPORT_MASK_VISUALIZATION and quality_entry['failed']) or \
+                       (cfg.EXPORT_MASK_VISUALIZATION and 'OK' not in quality_entry['comments'])
+    
+    if cfg.EXPORT_MASK_VISUALIZATION and is_first_guv:
+         should_export_viz = True
+
+    if should_export_viz:
+        viz_image = utils.create_mask_visualization(
+            roi_frame, inner_mask, membrane_mask, background_mask,
+            alpha=cfg.MASK_VIZ_OVERLAY_ALPHA
+        )
+        viz_name = f"{cfg.EXPERIMENT_BASE_NAME}_mask_viz_GUV_{guv_id}.png"
+        viz_path = os.path.join(cfg.OUTPUT_IMAGE_FOLDER, viz_name)
+        
+        try:
+            cv2.imwrite(viz_path, viz_image)
+        except Exception:
+            pass # Cannot log from a worker process
+            
+        # --- SAVE RADIAL PLOT ---
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.plot(detection_info['along_radius'], detection_info['radial_profile'], 'b-', linewidth=2)
+        ax.axvspan(0, detection_info['detected_inner_radius'], color='purple', alpha=0.2, label='Uptake (Inner) Region')
+        ax.axvspan(detection_info['detected_inner_radius'], detection_info['detected_outer_radius'], color='red', alpha=0.2, label='Membrane Region')
+        bg_r_start = detection_info['bg_inner_radius']
+        bg_r_end = detection_info['bg_outer_radius']
+        ax.axvspan(bg_r_start, bg_r_end, color='blue', alpha=0.2, label=f'Background Region')
+        ax.axvline(x=guv_radius_estimate, color='orange', linestyle=':', label=f"CSV estimate ({guv_radius_estimate}px)")
+        ax.axvline(x=detection_info['peak_position'], color='black', linestyle=':', label=f"Detected Peak ({detection_info['peak_position']:.1f}px)")
+        ax.set_xlabel('Radius (pixels)')
+        ax.set_ylabel('Intensity (a.u.)')
+        ax.set_title(f'Radial Intensity Profile & Regions - GUV {guv_id} (Center: {xc_refined}, {yc_refined})')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        profile_name = f"{cfg.EXPERIMENT_BASE_NAME}_radial_profile_GUV_{guv_id}.png"
+        profile_path = os.path.join(cfg.OUTPUT_IMAGE_FOLDER, profile_name)
+        fig.savefig(profile_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+
+    # --- 5b. Get Intensity Traces ---
+    intensity_trace = utils.get_intensity_trace_lazy(dye_files, inner_mask)
+    background_trace = utils.get_intensity_trace_lazy(dye_files, background_mask)
+    
+    if np.all(intensity_trace == 0):
+        # Mask was empty or invalid
+        return None, quality_entry
+    
+    # --- 5c. Detect Jump ---
+    try:
+        jump_frame = utils.detect_intensity_jump(intensity_trace, sensitivity=cfg.JUMP_SENSITIVITY)
+        if jump_frame == -1:
+            jump_frame = 0 
+        
+    except Exception:
+        jump_frame = 0 
+        
+    result = {
+        "intensity_trace": intensity_trace,
+        "background_trace": background_trace,
+        "jump_frame": jump_frame
+    }
+    # Return a tuple of (data, quality_log)
+    return result, quality_entry
+
+# -------------------------------------------------------------------
+# --- 6. LEGACY & TRACE FUNCTIONS ---
 # -------------------------------------------------------------------
     
 def create_guv_masks(roi_guide_frame: np.ndarray, center: tuple[int, int], guv_radius: int, 
@@ -549,8 +644,32 @@ def get_intensity_trace(im_stack: np.ndarray, mask: np.ndarray) -> np.ndarray:
         
     return trace
 
+def get_intensity_trace_lazy(file_paths: List[str], mask: np.ndarray) -> np.ndarray:
+    """
+    Calculates the average intensity within the mask for every frame
+    by loading one frame at a time ("lazy loading").
+    
+    This is the memory-efficient version recommended in CODE_REVIEW.md.
+    """
+    trace = np.zeros(len(file_paths))
+    num_pixels = np.sum(mask)
+    
+    if num_pixels == 0:
+        return trace
+        
+    for i, filepath in enumerate(file_paths):
+        frame = cv2.imread(filepath, cv2.IMREAD_ANYDEPTH | cv2.IMREAD_GRAYSCALE)
+        if frame is None:
+            trace[i] = 0.0
+            continue
+            
+        masked_frame = frame[mask]
+        trace[i] = np.sum(masked_frame) / num_pixels
+        
+    return trace
+
 # -------------------------------------------------------------------
-# --- 6. DATA PROCESSING & UTILITIES ---
+# --- 7. DATA PROCESSING & UTILITIES ---
 # -------------------------------------------------------------------
 
 def detect_intensity_jump(trace: np.ndarray, sensitivity: float = 3.0) -> int:
