@@ -1,0 +1,8 @@
+numpy
+matplotlib
+opencv-python
+scipy
+pandas
+natsort
+tifffile
+Pillow
