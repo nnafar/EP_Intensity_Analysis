@@ -8,8 +8,8 @@ the membrane location, adapted from the skeleton.py approach.
 
 Key improvements:
 1. Membrane detection from intensity profiles instead of fixed CSV radius
-2. Better handling of irregular vesicles
-3. Quality metrics for each detection
+2. Support for LABELED (Fluorescence) and UNLABELED (Brightfield) membranes
+3. Robust curve fitting with DYNAMIC parameter estimation
 
 REFACTOR NOTES (from CODE_REVIEW.md):
 - main() has been refactored into smaller, single-purpose functions.
@@ -284,32 +284,97 @@ def fit_average_curve(t_aligned: np.ndarray, average_curve: np.ndarray,
                       logger: logging.Logger) -> dict:
     """
     Fits the average normalized curve to the model specified in config.
+    INCLUDES DYNAMIC PARAMETER ESTIMATION AND BOUNDS.
     """
     logger.info(f"Fitting average curve to model: {cfg.MODEL_TO_USE}...")
     
     total_frames = len(t_aligned)
     fit_slice_index = int(np.round(total_frames * cfg.FIT_DATA_PERCENTAGE))
     fit_slice_index = min(fit_slice_index, total_frames) # Ensure in bounds
+    
+    # Extract data slice for fitting
+    t_fit = t_aligned[:fit_slice_index]
+    y_fit = average_curve[:fit_slice_index]
         
     logger.info(f"Fitting first {cfg.FIT_DATA_PERCENTAGE*100:.0f}% of aligned data ({fit_slice_index} frames).")
 
+    # --- DYNAMIC INITIAL GUESS ESTIMATION ---
+    # Calculate basic stats to estimate starting point
+    y_min = np.min(y_fit)
+    y_max = np.max(y_fit)
+    
+    # Estimate Amplitude (A)
+    A_est = y_max - y_min
+    
+    # Estimate Offset
+    offset_est = y_min
+    
+    # Estimate Tau (time to reach ~63% of rise)
+    try:
+        threshold = y_min + 0.63 * A_est
+        # Find first index where curve crosses threshold
+        idx_tau = np.argmax(y_fit > threshold)
+        if idx_tau == 0 and y_fit[0] < threshold:
+             # If argmax returned 0 but it wasn't actually crossed (e.g. flat line), use default
+             tau_est = t_fit[-1] / 2.0
+        else:
+             tau_est = t_fit[idx_tau]
+    except Exception:
+        tau_est = t_fit[-1] / 5.0
+        
+    # Safety for tau
+    if tau_est <= 0: tau_est = 10.0
+
+    # --- DEFINE BOUNDS AND INITIAL GUESSES ---
     if cfg.MODEL_TO_USE == '5-PARAM':
-        p0_guess = cfg.FIT_INITIAL_GUESS_5PARAM
+        # Params: Af, A1, tau1, A2, tau2
         fit_function = utils.dyn_model_5param
+        
+        # Dynamic guess for 5-param is harder, using split
+        p0_guess = (
+            y_max,           # Af
+            A_est * 0.5,     # A1
+            tau_est * 0.5,   # tau1
+            A_est * 0.5,     # A2
+            tau_est * 2.0    # tau2
+        )
+        
+        bounds = (
+            (-1.0, -10.0, 0.01, -10.0, 0.01),  # Lower bounds
+            ( 10.0, 10.0, 5000.0, 10.0, 5000.0) # Upper bounds
+        )
+        
     elif cfg.MODEL_TO_USE == '4-PARAM':
-        p0_guess = cfg.FIT_INITIAL_GUESS_4PARAM
+        # Params: I_offset, A, tau, D
         fit_function = utils.dyn_model_4param
+        
+        p0_guess = (
+            offset_est, # I_offset
+            A_est,      # A
+            tau_est,    # tau
+            0.0         # D (drift)
+        )
+        
+        bounds = (
+            (-2.0, -0.2, 0.01, -0.1),   # Lower bounds
+            ( 2.0,  10.0, 5000.0, 0.1)   # Upper bounds
+        )
+        
     else:
         logger.error(f"Invalid MODEL_TO_USE '{cfg.MODEL_TO_USE}'. Must be '4-PARAM' or '5-PARAM'.")
         raise ValueError("Invalid MODEL_TO_USE specified in config.py.")
 
+    logger.info(f"Initial Guesses: {p0_guess}")
+
     try:
+        # Increase maxfev and provide bounds to help convergence on flat/noisy data
         params, covariance = sc.curve_fit(
             fit_function, 
-            t_aligned[:fit_slice_index], 
-            average_curve[:fit_slice_index], 
+            t_fit, 
+            y_fit, 
             p0=p0_guess,
-            maxfev=5000 
+            bounds=bounds, 
+            maxfev=10000   # Increased iterations
         )
         fit_failed = False
     except RuntimeError as e:
@@ -476,6 +541,14 @@ def validate_config(logger: logging.Logger) -> bool:
     if not (isinstance(cfg.BG_BUFFER_PIXELS, int) and cfg.BG_BUFFER_PIXELS >= 0):
         logger.error(f"Config Error: BG_BUFFER_PIXELS must be an integer >= 0, but got {cfg.BG_BUFFER_PIXELS}")
         is_valid = False
+
+    # --- 2b. Membrane Detection Mode Validation (NEW) ---
+    # We now check the MODE string instead of the boolean
+    valid_modes = ['LABELED', 'UNLABELED']
+    mode = getattr(cfg, 'MEMBRANE_DETECTION_MODE', 'LABELED')
+    if mode.upper() not in valid_modes:
+         logger.error(f"Config Error: MEMBRANE_DETECTION_MODE must be 'LABELED' or 'UNLABELED'. Got '{mode}'")
+         is_valid = False
 
     # --- 3. Fitting Parameters ---
     if cfg.MODEL_TO_USE not in ['4-PARAM', '5-PARAM']:

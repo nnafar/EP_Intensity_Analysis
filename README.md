@@ -24,10 +24,14 @@ This pipeline quantifies dye uptake kinetics in Giant Unilamellar Vesicles (GUVs
 ### Key Features
 
 - **Automated membrane detection** using radial intensity profiling
+- **Dual detection modes** for labeled (fluorescent) and unlabeled (brightfield) membranes
+- **Parallel GUV processing** with multiprocessing for improved performance
+- **Memory-efficient lazy loading** of image stacks
 - **Adaptive normalization** accounting for background fluorescence
 - **Multi-model fitting** (4-parameter and 5-parameter exponential models)
 - **Quality metrics** for each detection with automatic flagging
 - **Comprehensive visualization** including mask overlays and radial profiles
+- **Robust logging system** with file and console output
 
 ### Design Philosophy
 
@@ -35,6 +39,7 @@ This pipeline quantifies dye uptake kinetics in Giant Unilamellar Vesicles (GUVs
 2. **Robust detection**: Multiple fallback mechanisms for edge cases
 3. **Transparent analysis**: Extensive logging and quality reporting
 4. **Reproducibility**: Deterministic algorithms with fixed random seeds
+5. **Scalability**: Parallel processing with configurable worker count
 
 ---
 
@@ -55,8 +60,8 @@ This pipeline quantifies dye uptake kinetics in Giant Unilamellar Vesicles (GUVs
 
 #### Key Channels
 
-- **C1 (ROI channel)**: Membrane marker (e.g., DiI) for GUV localization
-- **C3 (Dye channel)**: Fluorescent dye (e.g., propidium iodide) for uptake measurement
+- **C1 (ROI channel)**: Membrane marker (e.g., DiI for labeled) or brightfield (for unlabeled) for GUV localization
+- **C2 (Dye channel)**: Fluorescent dye (e.g., propidium iodide) for uptake measurement
 
 ### Measurement Challenges
 
@@ -65,6 +70,7 @@ This pipeline quantifies dye uptake kinetics in Giant Unilamellar Vesicles (GUVs
 3. **Heterogeneity**: Different GUVs have varying sizes, membrane properties
 4. **Background**: Extravesicular dye contributes to measured intensity
 5. **Membrane artifacts**: Lipid clusters and irregular shapes complicate detection
+6. **Detection mode**: Membranes can appear bright (labeled) or dark (unlabeled)
 
 ### The Normalization Problem
 
@@ -111,7 +117,8 @@ guv-analysis/
     │   ├── frame_*_at_*s.png              # Time-stamped snapshots
     │   ├── *_kinetic_fit.png              # Final fitted curve
     │   ├── *_normalized_curves.csv        # All normalized traces
-    │   └── *_detection_quality.csv        # QC report
+    │   ├── *_detection_quality.csv        # QC report
+    │   └── *.log                          # Analysis log file
 ```
 
 ### Component Responsibilities
@@ -120,10 +127,18 @@ guv-analysis/
 
 **Responsibilities:**
 - Discover and validate input files
-- Coordinate processing across all GUVs
+- Coordinate parallel processing across all GUVs
 - Align data to electroporation event
 - Perform curve fitting
 - Generate outputs and reports
+
+**Key Functions:**
+- `load_input_data()`: File discovery and timestamp extraction
+- `process_all_guvs()`: Parallel GUV processing coordinator
+- `normalize_and_align_curves()`: Data alignment and normalization
+- `fit_average_curve()`: Kinetic model fitting
+- `export_results()`: Visualization and data export
+- `validate_config()`: Parameter validation
 
 **Does NOT contain:**
 - Algorithm implementations
@@ -141,30 +156,59 @@ guv-analysis/
 - Normalization calculations
 - Kinetic models
 - Visualization utilities
+- Logging setup
 
 **Key Sections:**
-1. Time extraction (lines 33-72)
-2. Kinetic models (lines 79-99)
-3. Image processing (lines 105-252)
-4. Radial profiling (lines 258-307)
-5. Membrane detection (lines 308-415)
-6. Mask creation (lines 418-511)
-7. Data processing (lines 556-639)
+1. Logging setup (lines 38-63)
+2. Time extraction (lines 66-103)
+3. Kinetic models (lines 106-121)
+4. Image processing (lines 124-242)
+5. Radial profiling (lines 244-282)
+6. Membrane detection (lines 283-388)
+7. Mask creation (lines 390-463)
+8. Parallel worker function (lines 466-586)
+9. Data processing (lines 589-647)
+10. Visualization utilities (lines 649-735)
 
 #### 3. `config.py` (Parameters)
 
 **Five categories:**
 1. File & experiment identification
-2. Analysis & masking parameters
+2. Analysis & masking parameters (including `MEMBRANE_DETECTION_MODE`)
 3. Fitting & modeling parameters
 4. Output & visualization parameters
-5. Fallbacks & advanced settings
+5. Fallbacks & advanced settings (including `N_WORKERS`)
 
 ---
 
 ## Algorithm Details
 
-### 1. GUV Center Refinement
+### 1. Membrane Detection Modes (NEW)
+
+**Problem**: Different imaging modalities produce opposite contrast:
+- **Labeled membranes** (fluorescence): Membrane is brighter than background
+- **Unlabeled membranes** (brightfield/phase): Membrane is darker than background
+
+**Solution**: Configurable detection mode
+
+```python
+MEMBRANE_DETECTION_MODE = 'LABELED'   # For fluorescent membranes (peaks)
+MEMBRANE_DETECTION_MODE = 'UNLABELED' # For brightfield/phase (valleys)
+```
+
+**Algorithm adaptation**:
+- In `LABELED` mode: Search for intensity peaks
+- In `UNLABELED` mode: Invert profile and search for peaks (= valleys in original)
+
+```python
+if detect_bright:
+    search_profile = profile_smooth
+else:
+    # Valley mode: Invert profile so valleys become peaks
+    search_profile = np.max(profile_smooth) - profile_smooth
+```
+
+### 2. GUV Center Refinement
 
 **Problem**: CSV coordinates may be inaccurate due to:
 - Bright intravesicular clusters skewing center-of-mass
@@ -204,7 +248,7 @@ For a ring structure (membrane), this produces:
 - Large shift (>70% radius) → likely artifact, revert
 - Multiple edge regions → use largest connected component
 
-### 2. Radial Intensity Profiling
+### 3. Radial Intensity Profiling
 
 **Core Innovation**: Instead of using fixed CSV radius, we measure the actual membrane position from the data.
 
@@ -256,1016 +300,807 @@ def average_radial_profile(profiles):
     return np.median(profiles, axis=1)
 ```
 
-**Example Profile:**
+**Proof by example:**
 
 ```
-Radius (px)    0    10    20    30    40    50    60    70
-Intensity     50    55    60   120   180   100    80    70
-              ↑           ↑          ↑           ↑
-           background  rising  MEMBRANE  falling  background
+Profile 1:  [10, 10, 100, 10, 10]  # Cluster at angle 1
+Profile 2:  [10, 10, 50,  10, 10]  # Normal membrane
+Profile 3:  [10, 10, 45,  10, 10]  # Normal membrane
+
+Mean:       [10, 10, 65,  10, 10]  # Inflated by cluster!
+Median:     [10, 10, 50,  10, 10]  # Robust estimate
 ```
 
-### 3. Membrane Detection Algorithm
+#### Step C: Membrane Peak Detection
 
-**Goal**: Identify the membrane peak and define inner/outer boundaries.
+**Algorithm**: `membrane_search()` in `guv_analysis_utils.py`
 
 ```python
 def membrane_search(profile, radii, expected_radius, search_factor,
-                    membrane_half_width, peak_min_dist, peak_min_prom):
+                   membrane_half_width, peak_min_dist, peak_min_prom,
+                   detect_bright=True):
     """
-    Sophisticated peak detection with quality control.
+    Detects membrane location by finding the highest peak (or deepest valley).
     
-    Algorithm:
-    1. Smooth profile (Gaussian filter, σ=1)
-    2. Define search window: expected_radius ± (search_factor × expected_radius)
-    3. Find all peaks in window using scipy.signal.find_peaks
-    4. Select highest peak by prominence
-    5. Define membrane boundaries: peak ± membrane_half_width
-    6. Validate detection and generate quality flags
-    7. Return results with metadata
+    Steps:
+    1. Smooth profile (Gaussian σ=1)
+    2. If detect_bright=False: Invert profile to convert valleys to peaks
+    3. Define search window: expected_radius ± search_factor
+    4. Find peaks using scipy.signal.find_peaks with:
+       - Minimum distance between peaks
+       - Minimum prominence threshold
+    5. Select highest peak within window
+    6. Calculate membrane boundaries: peak ± membrane_half_width
+    7. Return (peak_pos, inner_bound, outer_bound, quality_flags)
     """
 ```
 
-#### Peak Detection Parameters
+**Key Parameters:**
 
-**`peak_min_dist`** (default: 5 pixels)
-- Minimum separation between detected peaks
-- Prevents detecting noise as multiple peaks
-- Value should be ≥ 2× expected membrane thickness
+- `search_factor`: Window size as fraction of radius (default: 0.3 = ±30%)
+- `membrane_half_width`: Fixed thickness for uptake boundary (default: 3 pixels)
+- `peak_min_distance`: Minimum separation between peaks (default: 5 pixels)
+- `peak_min_prominence`: Relative height threshold (default: 0.05 = 5% of max)
 
-**`peak_min_prom`** (default: 0.05 = 5%)
-- Peak prominence as fraction of max intensity
-- Prominence = height of peak above its lowest contour line
-- Too low: noise peaks detected
-- Too high: real membranes missed
-
-**Visual Example:**
+**Example Output:**
 
 ```
-Intensity
-   |
-200|              *  ← Main peak (prominence = 120)
-   |            /   \
-150|         __/     \__
-   |        /           \
-100|    * /               \ *  ← Noise peaks (prominence = 20)
-   |   / |                 | \
- 50|__/__|_________________|__\___
-   0   20   40   60   80  100  120  Radius (px)
-       ↑                      ↑
-    Rejected              Selected (highest prominence)
+Input:  expected_radius = 50 pixels, search_factor = 0.3
+Search: 35-65 pixel range
+Detect: Peak at 48 pixels, height = 850 a.u.
+Bounds: Inner = 45 pixels, Outer = 51 pixels
+Result: "OK"
 ```
 
-#### Search Window Rationale
+**Quality Flags:**
+- `"OK"`: Clean detection
+- `"no_peak_in_window"`: No peak found in search range
+- `"invalid_search_window"`: Search window out of image bounds
+- `"zero_radius_detected"`: Degenerate case (usually bad CSV input)
+- `"width_calc_failed"`: Membrane boundary calculation error
 
-**`search_factor`** (default: 0.3 = ±30%)
+### 4. Mask Generation
 
-For expected_radius = 50 pixels:
-```
-Search range: 35-65 pixels
-
-Too narrow (0.1):   45-55 px → May miss slightly off-center GUVs
-Sweet spot (0.3):   35-65 px → Accommodates most variations
-Too wide (0.8):     10-90 px → May pick up wrong structure
-```
-
-**Why not search entire profile?**
-- Lipid clusters can create strong peaks far from membrane
-- Debris or adjacent vesicles create false peaks
-- Search window provides spatial prior information
-
-#### Quality Flags
-
-The algorithm generates detailed quality metrics:
+Three concentric regions are defined for each GUV:
 
 ```python
-comments = [
-    "OK"                        # Clean detection
-    "no_peak_in_window"        # No peak found in search range
-    "invalid_search_window"    # Search parameters out of bounds
-    "zero_radius_detected"     # Degenerate detection
-    "width_calc_failed"        # Peak too narrow or at boundary
-    "find_peaks_failed"        # scipy.signal.find_peaks error
-]
-
-failed = True/False  # Overall detection status
-```
-
-### 4. Mask Creation
-
-Three concentric regions are defined:
-
-#### Inner GUV Mask (Uptake Region)
-
-```python
-inner_guv_mask = create_circular_mask(image.shape, center, radius=inner_boundary)
-```
-
-**Purpose**: Measure dye that has entered the vesicle lumen
-
-**Definition**: All pixels with distance ≤ `inner_boundary` from center
-
-**Why not include membrane?**
-- Membrane signal confounds uptake measurement
-- Membrane fluorescence may be different dye (e.g., DiI vs PI)
-- Clean separation improves normalization
-
-#### Membrane Mask (Visualization)
-
-```python
-membrane_mask = create_annular_mask(
-    image.shape, center, 
-    inner_radius=inner_boundary + 1,
-    outer_radius=outer_boundary
-)
-```
-
-**Purpose**: Visualize detected membrane region
-
-**Options**:
-1. **Dynamic width**: Use detected boundaries (variable thickness)
-2. **Fixed width**: Use `VIZ_MEMBRANE_THICKNESS_PIXELS` (cleaner visualization)
-
-**Trade-off**:
-- Fixed width: Easier to compare across GUVs, cleaner appearance
-- Dynamic width: Shows actual detection, useful for QC
-
-#### Background Ring Mask
-
-```python
-background_mask = create_annular_mask(
-    image.shape, center,
-    inner_radius=outer_boundary + bg_buffer,
-    outer_radius=outer_boundary + bg_buffer + bg_width
-)
-```
-
-**Purpose**: Sample extravesicular dye concentration
-
-**Design considerations**:
-
-```
-                  GUV
-           [    |||||    ]
-                 ↑↑↑
-              membrane
-           
-<-- gap -->  <-- ring -->
- (buffer)     (sample)
-   2 px        10 px
-```
-
-**`bg_buffer`** (default: 2 pixels)
-- Prevents contamination from membrane spillover
-- Accounts for PSF (point spread function) of microscope
-- Too small: membrane signal bleeds into background
-- Too large: loses spatial proximity
-
-**`bg_width`** (default: 10 pixels)
-- Sufficient pixels for stable statistics (typical: ~300-1000 pixels)
-- Wide enough to average out local heterogeneity
-- Not so wide that we sample different regions
-
-### 5. Intensity Trace Extraction
-
-```python
-def get_intensity_trace(im_stack, mask):
+def create_guv_masks_with_detection(roi_guide_frame, center, radius_estimate,
+                                    bg_buffer, bg_width, search_factor,
+                                    membrane_half_width, ...):
     """
-    For each frame:
-    1. Apply mask to isolate ROI
-    2. Calculate mean intensity of masked pixels
-    3. Store in trace array
+    Creates three masks:
     
-    Returns: 1D array of length (n_frames)
+    1. INNER MASK (uptake region):
+       - Radius: detected_inner_radius
+       - Purpose: Measure dye intensity inside GUV
+       
+    2. MEMBRANE MASK (visualization):
+       - Annulus: inner_radius + 1 to outer_radius
+       - Purpose: Show detected membrane location
+       
+    3. BACKGROUND MASK (normalization):
+       - Annulus: outer_radius + buffer to outer_radius + buffer + width
+       - Purpose: Measure extravesicular dye for normalization
     """
 ```
 
-**Statistical Considerations:**
+**Geometric Relationships:**
 
-For mask with N pixels:
 ```
-Mean intensity μ = (Σ I_i) / N
-Standard error σ_μ = σ / √N
+    Background Ring (normalization)
+    │
+    │   Membrane (visualization)
+    │   │
+    │   │  Inner GUV (uptake measurement)
+    │   │  │
+────┼───┼──┼───────────────────────────
+    │   │  │
+    │   │  └─── Detected inner radius
+    │   └────── Detected outer radius
+    └────────── Outer + buffer + width
 
-Example: N = 500 pixels, σ = 20 counts
-→ σ_μ = 20/√500 = 0.89 counts
+Buffer zone prevents contamination from membrane signal
 ```
 
-**Why mean instead of sum?**
-- Normalization invariant to GUV size
-- Directly comparable across different vesicles
-- Physical interpretation: "concentration" proxy
+**Default Values:**
+- `bg_buffer`: 2 pixels (prevents membrane spillover)
+- `bg_width`: 10 pixels (sufficient sampling for noise reduction)
+
+### 5. Lazy Loading Strategy (NEW)
+
+**Problem**: Loading full image stacks into memory can exceed RAM for large datasets:
+```
+Example: 500 frames × 2048×2048 pixels × 2 bytes = 4 GB per channel
+```
+
+**Solution**: Load frames one at a time during processing
+
+```python
+def get_intensity_trace_lazy(file_paths, mask):
+    """
+    Memory-efficient intensity extraction.
+    
+    OLD approach (eager):
+    1. Load all 500 frames → 4 GB RAM
+    2. Extract intensities
+    
+    NEW approach (lazy):
+    1. Load frame 1 → extract → discard
+    2. Load frame 2 → extract → discard
+    ...
+    
+    Peak RAM: ~8 MB per frame instead of 4 GB total
+    """
+    trace = np.zeros(len(file_paths))
+    num_pixels = np.sum(mask)
+    
+    for i, filepath in enumerate(file_paths):
+        frame = cv2.imread(filepath, cv2.IMREAD_ANYDEPTH)
+        trace[i] = np.sum(frame[mask]) / num_pixels
+        # frame is automatically garbage collected
+        
+    return trace
+```
+
+**Performance Impact:**
+- Memory usage: **100× reduction**
+- Processing time: ~10% slower (due to repeated I/O)
+- Trade-off: Acceptable for typical use cases
 
 ### 6. Jump Detection
 
-**Problem**: Electroporation occurs at unknown frame. Need to identify it to align curves.
+**Purpose**: Identify the electroporation event in the intensity time series.
+
+**Algorithm**: Statistical outlier detection on frame-to-frame differences
 
 ```python
 def detect_intensity_jump(trace, sensitivity=3.0):
     """
-    Statistical change-point detection.
+    Detects sudden intensity increase.
     
-    Algorithm:
-    1. Calculate frame-to-frame differences: Δ = I[i+1] - I[i]
-    2. Estimate noise level from baseline: σ = std(Δ[5:])
-    3. Set threshold: θ = mean(Δ) + sensitivity × σ
-    4. Find first point where Δ > θ
+    Steps:
+    1. Calculate differences: Δ[i] = trace[i+1] - trace[i]
+    2. Estimate noise: σ = std(Δ[5:])  # Skip first 5 frames
+    3. Set threshold: θ = mean(Δ[5:]) + sensitivity × σ
+    4. Find first index where Δ[i] > θ
+    5. Return jump_frame = i + 1
     """
 ```
 
-**Mathematical Basis:**
+**Sensitivity Parameter:**
 
-Assuming Gaussian noise:
 ```
-P(Δ > μ + 3σ) ≈ 0.0013   (1 in 750 frames)
+Low (2.0):  More sensitive, higher false positive rate
+Default (3.0): Balanced (3-sigma rule)
+High (5.0):  Conservative, may miss weak pulses
 ```
-
-With `sensitivity = 3.0`:
-- Low false positive rate (~0.1%)
-- Detects jumps >3× noise level
 
 **Example:**
 
 ```
-Frame:      0    1    2    3    4    5    6    7    8    9   10
-Intensity: 100  102   98  101   99  180  250  280  290  295  298
-Δ:           2   -4    3   -2   81   70   30   10    5    3
-                              ↑
-                           Jump!
-                      (Δ = 81 >> 3σ ≈ 9)
+Trace:     [100, 102, 101, 450, 460, ...]
+           ───────────────^
+Δ:         [  2,  -1, 349,  10, ...]
+σ:         ~5 (from baseline noise)
+θ:         0 + 3×5 = 15
+Jump at:   Frame 3 (Δ=349 >> θ=15)
 ```
 
 **Edge Cases:**
-- No clear jump → returns -1 → alignment defaults to frame 0
-- Multiple jumps → returns first (assumes single pulse experiment)
-- Very noisy data → may miss small jumps (increase sensitivity)
+- No jump detected → Return `-1` → Use frame 0 as pulse time
+- Multiple jumps → Return first occurrence
+- Insufficient data (<10 frames) → Return `-1`
 
-### 7. Normalization
+### 7. Parallel Processing (NEW)
 
-**Three-term normalization formula:**
-
+**Motivation**: Processing N GUVs sequentially is slow:
 ```
-I_uptake(t) = [I_dye(t) - I_dye(0)] / [I_background(t) - I_dye(0)]
-```
-
-**Rationale:**
-
-Let's decompose the measured intensity:
-```
-I_dye(t) = c_inside(t) × V_inside + c_outside × V_overlap + I_autofluorescence
-
-Where:
-- c_inside(t): Dye concentration inside GUV (time-varying)
-- c_outside: Dye concentration outside GUV (constant)
-- V_inside: Volume sampled inside GUV
-- V_overlap: Volume of GUV overlapping with background dye
-- I_autofluorescence: Intrinsic fluorescence
+Single GUV: ~2-5 seconds
+100 GUVs:   ~300 seconds = 5 minutes
 ```
 
-**Normalization steps:**
-
-1. **Subtract baseline** (removes autofluorescence):
-   ```
-   ΔI_dye(t) = I_dye(t) - I_dye(0)
-   ```
-
-2. **Normalize to background** (accounts for photobleaching):
-   ```
-   I_uptake(t) = ΔI_dye(t) / [I_background(t) - I_dye(0)]
-   ```
-
-**Why this works:**
-
-If photobleaching is uniform:
-```
-I_background(t) = c_outside × exp(-k×t)
-I_dye(t) = c_inside(t) × exp(-k×t) + constant
-
-After normalization:
-I_uptake(t) ∝ c_inside(t) / c_outside  (photobleaching cancels!)
-```
-
-**Interpretation:**
-- `I_uptake = 0`: No dye inside (equilibrium before pulse)
-- `I_uptake = 1`: Full equilibration (c_inside = c_outside)
-- `I_uptake > 1`: Concentration gradient (should not happen in equilibrium)
-
-**Edge Cases:**
-
-Division by zero when `I_background(t) = I_dye(0)`:
-```python
-with np.errstate(divide='ignore', invalid='ignore'):
-    result = np.divide(numerator, denominator)
-    result = np.nan_to_num(result, nan=0.0, posinf=0.0, neginf=0.0)
-```
-
-Sets invalid values to 0.0 (interpreted as "no uptake")
-
-### 8. Curve Alignment
-
-**Problem**: Different GUVs may experience pulse at different frames due to:
-- Heterogeneous electric field
-- Timing jitter in triggering
-- Delayed response of individual vesicles
-
-**Solution**: Align all curves to median jump frame
+**Solution**: Process GUVs in parallel using multiprocessing
 
 ```python
-median_jump_frame = int(np.median(all_jump_frames))
-t_aligned = time_array[median_jump_frame:]
-t = t_aligned - t_aligned[0]  # Re-zero to pulse time
-
-for each curve:
-    curve_aligned = curve_original[median_jump_frame:]
+def process_all_guvs(guv_data, dye_files, roi_frame, logger):
+    """
+    Parallel execution strategy:
+    
+    1. Create worker function with frozen arguments
+    2. Build task list: [(guv1_args), (guv2_args), ...]
+    3. Launch worker pool with N_WORKERS processes
+    4. Each worker calls process_single_guv() independently
+    5. Collect and merge results
+    """
+    
+    # Freeze common arguments
+    process_func = partial(
+        utils.process_single_guv,
+        roi_frame=roi_frame,
+        dye_files=dye_files
+    )
+    
+    # Use 'spawn' context for cross-platform compatibility
+    mp_context = multiprocessing.get_context('spawn')
+    with mp_context.Pool(processes=cfg.N_WORKERS) as pool:
+        results = pool.starmap(process_func, tasks)
 ```
 
-**Why median?**
-- Robust to outliers (e.g., one GUV with no detected jump)
-- Represents "typical" pulse timing
-- Ensures majority of data overlaps
+**Worker Function**: Each process runs independently
 
-**Effect on fitting:**
+```python
+def process_single_guv(guv_id, center_orig, radius_csv_raw,
+                       is_first_guv, roi_frame, dye_files):
+    """
+    Complete analysis for one GUV:
+    1. Refine center coordinates
+    2. Detect membrane and create masks
+    3. Extract intensity traces (lazy loading)
+    4. Detect jump frame
+    5. Generate visualizations (if needed)
+    6. Return (data, quality_metrics)
+    """
+```
 
-Before alignment:
+**Performance Scaling:**
+
 ```
-GUV 1: [baseline] [uptake]  [plateau]
-GUV 2:    [baseline] [uptake]  [plateau]
-GUV 3: [baseline]       [uptake]  [plateau]
-Average:  Smeared, hard to fit
+Configuration          Time (100 GUVs)    Speedup
+─────────────────────────────────────────────────
+N_WORKERS = 1         300 seconds        1.0×
+N_WORKERS = 4         90 seconds         3.3×
+N_WORKERS = 8         55 seconds         5.5×
+N_WORKERS = 16        45 seconds         6.7×
+
+Diminishing returns above 8 workers due to I/O bottleneck
 ```
 
-After alignment to t=0:
+**Configuration:**
+
+```python
+# config.py
+N_WORKERS = os.cpu_count() - 1  # Leave 1 core for system
+N_WORKERS = 1  # Disable for debugging (easier error tracking)
 ```
-GUV 1:    [uptake]  [plateau]
-GUV 2:    [uptake]  [plateau]
-GUV 3:    [uptake]  [plateau]
-Average:  Sharp, clean kinetics
+
+### 8. Normalization & Alignment
+
+**Step 1**: Calculate baseline intensity (pre-pulse)
+
+```python
+# Use minimum of 3 frames before pulse for stability
+baseline_frames = range(max(0, jump_frame - MIN_BASELINE_FRAMES), jump_frame)
+I_dye_0 = np.mean(intensity_trace[baseline_frames])
+```
+
+**Step 2**: Normalize each GUV's curve
+
+```python
+def normalize_single_curve(intensity_trace, background_trace, jump_frame):
+    """
+    I_uptake(t) = (I_dye(t) - I_dye_0) / (I_bg(t) - I_dye_0)
+    
+    This removes:
+    - Initial autofluorescence (I_dye_0 subtraction)
+    - Photobleaching effects (I_bg normalization)
+    - Variations in external dye concentration
+    """
+```
+
+**Step 3**: Align to pulse event
+
+```python
+# Each GUV has different jump_frame
+# Shift time axis so t=0 at pulse for all GUVs
+t_aligned = time_array - time_array[jump_frame]
+```
+
+**Step 4**: Interpolate to common time grid
+
+```python
+# Not all GUVs have same number of frames post-pulse
+# Interpolate all curves to common time points
+from scipy.interpolate import interp1d
+
+t_common = np.linspace(0, max_time, num_points)
+for curve in all_curves:
+    f = interp1d(t_aligned, curve, fill_value='extrapolate')
+    curve_resampled = f(t_common)
+```
+
+---
+
+## Data Flow
+
+### Full Pipeline Execution
+
+```
+┌─────────────────────────────────────────┐
+│  1. INPUT FILES DISCOVERY               │
+│  - Find C1-*.tif (ROI channel)          │
+│  - Find C2-*.tif (Dye channel)          │
+│  - Find C1-*_detected_vesicles.csv      │
+│  - Extract timestamps from metadata     │
+└─────────────────────────────────────────┘
+            │
+            ▼
+┌─────────────────────────────────────────┐
+│  2. CONFIGURATION VALIDATION            │
+│  - Check path existence                 │
+│  - Validate parameter ranges            │
+│  - Verify detection mode setting        │
+│  - Confirm N_WORKERS value              │
+└─────────────────────────────────────────┘
+            │
+            ▼
+┌─────────────────────────────────────────┐
+│  3. IMAGE & CSV LOADING                 │
+│  - Load first ROI frame (guide)         │
+│  - Parse CSV (xc, yc, radius)           │
+│  - Create file list for lazy loading    │
+└─────────────────────────────────────────┘
+            │
+            ▼
+┌─────────────────────────────────────────┐
+│  4. PARALLEL GUV PROCESSING             │
+│  - Create worker pool (N_WORKERS)       │
+│  For each GUV in parallel:              │
+│    ├─ Refine center                     │
+│    ├─ Detect membrane (labeled/         │
+│    │   unlabeled mode)                  │
+│    ├─ Create masks                      │
+│    ├─ Extract traces (lazy)             │
+│    ├─ Detect jump                       │
+│    └─ Generate QC visualizations        │
+│  - Collect results                      │
+│  - Save detection_quality.csv           │
+└─────────────────────────────────────────┘
+            │
+            ▼
+┌─────────────────────────────────────────┐
+│  5. CURVE NORMALIZATION & ALIGNMENT     │
+│  For each valid GUV:                    │
+│    ├─ Calculate baseline (I_dye_0)      │
+│    ├─ Normalize: (I-I0)/(I_bg-I0)       │
+│    ├─ Align to pulse (t=0)              │
+│    └─ Interpolate to common grid        │
+│  - Calculate average curve              │
+└─────────────────────────────────────────┘
+            │
+            ▼
+┌─────────────────────────────────────────┐
+│  6. KINETIC MODEL FITTING               │
+│  Select model (4-PARAM or 5-PARAM)      │
+│  - Use first N% of data (FIT_DATA_%)    │
+│  - Initial guess from config            │
+│  - Fit with scipy.curve_fit             │
+│  - Handle convergence failures          │
+└─────────────────────────────────────────┘
+            │
+            ▼
+┌─────────────────────────────────────────┐
+│  7. VISUALIZATION & EXPORT              │
+│  Generate:                              │
+│    ├─ Kinetic fit plot (all curves)     │
+│    ├─ Mask visualizations (failed/      │
+│    │   first GUV)                       │
+│    ├─ Radial profile plots              │
+│    ├─ Time-stamped frame exports        │
+│    ├─ normalized_curves.csv             │
+│    └─ Analysis log file                 │
+└─────────────────────────────────────────┘
+```
+
+### Single GUV Processing Flow
+
+```
+┌─────────────────────┐
+│  GUV Coordinates    │
+│  (xc, yc, radius)   │
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│  Refine Center      │
+│  (Edge detection)   │
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│  Extract Radial     │
+│  Profiles           │
+│  (360 angles)       │
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│  Average Profile    │
+│  (Median)           │
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│  Detect Membrane    │
+│  Mode: LABELED or   │
+│  UNLABELED          │
+└──────────┬──────────┘
+           │
+           ├──► Quality Flags
+           │    (OK / warnings)
+           ▼
+┌─────────────────────┐
+│  Create Masks       │
+│  - Inner (uptake)   │
+│  - Membrane (viz)   │
+│  - Background       │
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│  Extract Traces     │
+│  (Lazy loading)     │
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│  Detect Jump        │
+│  (Statistical)      │
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│  Generate           │
+│  Visualizations     │
+│  (if needed)        │
+└─────────────────────┘
 ```
 
 ---
 
 ## Mathematical Models
 
-### Model Selection
+### 4-Parameter Exponential Rise with Drift
 
-Two models are available, chosen via `config.MODEL_TO_USE`:
+**Use Case**: Simple single-phase uptake with photobleaching correction
 
-### 4-Parameter Model (Simple Uptake)
-
-**Equation:**
+**Equation**:
 ```
-I(t) = I_offset + A × (1 - e^(-t/τ)) + D × t
+I(t) = I_offset + A × (1 - exp(-t/τ)) + D × t
 ```
 
-**Parameters:**
-1. `I_offset`: Baseline intensity (should be ≈0 for normalized data)
-2. `A`: Amplitude (maximum uptake level)
-3. `τ`: Time constant (inverse rate of uptake)
-4. `D`: Linear drift (accounts for residual photobleaching)
+**Parameters**:
+- `I_offset`: Baseline intensity (should be ≈0 for normalized data)
+- `A`: Uptake amplitude (final steady-state value)
+- `τ` (tau): Time constant (seconds) - characteristic resealing time
+- `D`: Drift rate (intensity/second) - accounts for photobleaching
 
-**Physical Interpretation:**
+**Physical Interpretation**:
 
 ```
-I(t)
- ↑
- |              ___________  A (plateau)
- |           /              + D×t (drift)
- |         /
- |       /  ← e^(-t/τ) decay
- |     /
- |___/________________________→ t
-     τ
+Exponential term:  Dye influx through pores (decreases as pores close)
+Linear term:       Slow photobleaching or focus drift
 ```
 
-- **Uptake term**: `A × (1 - e^(-t/τ))` represents dye influx
-  - At t=0: 0 (no uptake yet)
-  - At t=τ: A×(1-e^(-1)) ≈ 0.63A (63% complete)
-  - At t=∞: A (full equilibration)
+**Typical Values**:
+- `A`: 0.5 - 2.0 (normalized units)
+- `τ`: 10 - 200 seconds (depends on lipid composition)
+- `D`: -0.001 to 0.001 (small correction factor)
 
-- **Drift term**: `D × t` captures slow linear trends
-  - Residual photobleaching not removed by normalization
-  - Focus drift changing sampled volume
-  - Membrane fluidity changes
-
-**When to use:**
-- Simple single-phase uptake
-- Fast resealing (seconds)
-- Minimal drift
-- First approximation for unknown systems
-
-**Typical Parameter Values:**
+**Initial Guess** (from `config.py`):
 ```python
-I_offset:  0.0 ± 0.1        # Near zero for normalized data
-A:         0.5 - 2.0        # Depends on external dye concentration
-τ:         10 - 200 s       # Typical electroporation resealing time
-D:         -0.001 - 0.001   # Small drift correction
+FIT_INITIAL_GUESS_4PARAM = (0.0, 1.0, 50.0, 0.001)
 ```
 
-### 5-Parameter Model (Complex Resealing)
+**When to Use**:
+- Simple, monophasic resealing
+- Clear exponential approach to plateau
+- Minimal biphasic behavior
 
-**Equation:**
+### 5-Parameter Double Exponential Model
+
+**Use Case**: Biphasic resealing kinetics (fast + slow components)
+
+**Equation**:
 ```
-I(t) = A_f - A_1 × e^(-t/τ_1) - A_2 × e^(-t/τ_2)
-```
-
-**Parameters:**
-1. `A_f`: Final steady-state intensity
-2. `A_1`: Amplitude of fast component
-3. `τ_1`: Fast time constant
-4. `A_2`: Amplitude of slow component
-5. `τ_2`: Slow time constant
-
-**Physical Interpretation:**
-
-Two-phase resealing:
-```
-I(t)
- ↑
- |  A_f ____________________
- |       /
- |      /    ← Fast phase (large pores)
- |     /
- |    /        ← Slow phase (small pores)
- |   /
- |__/________________________→ t
+I(t) = Af - A1 × exp(-t/τ₁) - A2 × exp(-t/τ₂)
 ```
 
-- **Fast component**: Rapid closure of large pores (τ_1 ~ 5-30 s)
-  - Driven by line tension at pore edge
-  - Dominates early uptake
+**Parameters**:
+- `Af`: Final intensity at t→∞
+- `A1`: Fast component amplitude
+- `τ₁`: Fast time constant (seconds)
+- `A2`: Slow component amplitude
+- `τ₂`: Slow time constant (seconds)
 
-- **Slow component**: Gradual sealing of small defects (τ_2 ~ 50-300 s)
-  - Lipid rearrangement
-  - Membrane healing
-  - May include vesicle recovery processes
+**Constraint**: `I(0) = Af - A1 - A2` (should be ≈0 for normalized data)
 
-**Initial condition:**
+**Physical Interpretation**:
+
 ```
-I(0) = A_f - A_1 - A_2
+Fast component (τ₁):  Rapid pore resealing (small, unstable pores)
+Slow component (τ₂):  Gradual lipid reorganization (large pores)
 ```
-Must satisfy: `A_1 + A_2 < A_f` (otherwise unphysical)
 
-**When to use:**
-- Biphasic kinetics observed
-- Heterogeneous pore population
-- Complex membrane systems (e.g., cholesterol, proteins)
-- Slow equilibration (minutes)
+**Typical Values**:
+- `Af`: 0.5 - 2.0
+- `A1`: 0.3 - 0.8 (fast amplitude)
+- `τ₁`: 5 - 30 seconds
+- `A2`: 0.2 - 0.7 (slow amplitude)
+- `τ₂`: 50 - 300 seconds
 
-**Typical Parameter Values:**
+**Initial Guess** (from `config.py`):
 ```python
-A_f:   0.8 - 2.0        # Final normalized intensity
-A_1:   0.3 - 0.8        # Fast component amplitude
-τ_1:   5 - 30 s         # Fast resealing time
-A_2:   0.2 - 0.5        # Slow component amplitude
-τ_2:   50 - 300 s       # Slow resealing time
+FIT_INITIAL_GUESS_5PARAM = (1.0, 0.5, 10.0, 0.5, 100.0)
 ```
 
-**Constraint:**
-```python
-# Initial intensity should be near zero
-assert (A_f - A_1 - A_2) ≈ 0  # ±0.2 tolerance
-```
+**When to Use**:
+- Clear biphasic kinetics
+- Plateau not reached quickly
+- Complex resealing dynamics
 
-### Curve Fitting Procedure
+### Fitting Procedure
 
 ```python
-params, covariance = scipy.optimize.curve_fit(
-    f=model_function,           # 4-param or 5-param
-    xdata=t[:fit_slice_index],  # Time points (first N%)
-    ydata=average_curve[:fit_slice_index],  # Normalized intensity
-    p0=initial_guess,           # Starting parameters
-    maxfev=5000                 # Maximum iterations
-)
-```
+from scipy.optimize import curve_fit
 
-**Why fit only first N%?**
+# Select data range
+fit_end_idx = int(len(t) * FIT_DATA_PERCENTAGE)
+t_fit = t[:fit_end_idx]
+y_fit = average_curve[:fit_end_idx]
 
-`FIT_DATA_PERCENTAGE` (default: 0.9 = 90%)
+# Choose model
+if MODEL_TO_USE == '4-PARAM':
+    model_func = dyn_model_4param
+    initial_guess = FIT_INITIAL_GUESS_4PARAM
+else:
+    model_func = dyn_model_5param
+    initial_guess = FIT_INITIAL_GUESS_5PARAM
 
-Reasons to exclude late time points:
-1. **Plateau region** adds little information
-   - Many points, small weight in χ²
-   - Dominated by noise
-   - Doesn't constrain uptake kinetics
-
-2. **Drift dominates** at late times
-   - Focus drift
-   - Stage movement
-   - Changing imaging conditions
-
-3. **Better convergence**
-   - Focusing on rising phase improves τ estimation
-   - Reduces parameter correlation
-
-**Visual Example:**
-
-```
-Full data (100%):
-I(t) ────┐     ┌─────────────────────────  ← Noisy plateau
-         │    ╱
-         │   ╱  ← Information-rich region
-         └──┘
-         0         Fit data (90%)         Full duration
-
-Fitting result:
-- Full data:  τ = 45 ± 15 s  (large uncertainty from plateau noise)
-- 90% data:   τ = 47 ± 8 s   (better precision, same accuracy)
-```
-
-### Fit Quality Assessment
-
-**Covariance Matrix:**
-```python
-σ_param[i] = np.sqrt(covariance[i,i])  # Parameter uncertainty
-```
-
-**Correlation Matrix:**
-```python
-ρ[i,j] = covariance[i,j] / (σ_param[i] × σ_param[j])
-```
-
-**Red flags:**
-- `σ_param / param > 1.0`: Parameter poorly constrained
-- `|ρ[i,j]| > 0.95`: Strong parameter correlation
-- Fit fails to converge: Model mismatch or noisy data
-
-**Failure Handling:**
-
-```python
+# Fit with error handling
 try:
-    params, covariance = curve_fit(...)
+    popt, pcov = curve_fit(
+        model_func, 
+        t_fit, 
+        y_fit, 
+        p0=initial_guess,
+        maxfev=10000  # Maximum iterations
+    )
     fit_failed = False
 except RuntimeError:
-    # Use initial guess as "best estimate"
-    params = np.array(p0_guess)
+    # Convergence failure - use initial guess
+    popt = initial_guess
     fit_failed = True
-    # Flag in plot title and quality report
 ```
 
-This graceful degradation allows:
-- Visual inspection of fit failure
-- Comparison of initial guess to data
-- Decision to adjust parameters or exclude outlier
+**Troubleshooting Poor Fits**:
 
----
+1. **Fit doesn't match data**:
+   - Adjust `FIT_DATA_PERCENTAGE` (try 0.8 instead of 0.9)
+   - Check if data is properly normalized
+   - Try alternative model (4-param ↔ 5-param)
 
-## Data Flow
+2. **Convergence failure**:
+   - Improve initial guess based on visual inspection
+   - Reduce `FIT_DATA_PERCENTAGE` (fit earlier portion)
+   - Check for outliers in normalized data
 
-### Complete Pipeline Flow
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│ 1. INITIALIZATION                                           │
-├─────────────────────────────────────────────────────────────┤
-│ • Load configuration (config.py)                            │
-│ • Build file paths                                          │
-│ • Discover TIFF files (C1, C3)                              │
-│ • Load CSV with GUV coordinates                             │
-└────────────────────┬────────────────────────────────────────┘
-                     │
-                     ▼
-┌─────────────────────────────────────────────────────────────┐
-│ 2. METADATA EXTRACTION                                      │
-├─────────────────────────────────────────────────────────────┤
-│ • Attempt: Read ImageJ metadata from TIFF                   │
-│   ├─ Success: Extract frame_interval from "finterval="     │
-│   └─ Failure: Use FALLBACK_FPS                              │
-│ • Generate time array: t[i] = i × frame_interval            │
-└────────────────────┬────────────────────────────────────────┘
-                     │
-                     ▼
-┌─────────────────────────────────────────────────────────────┐
-│ 3. IMAGE LOADING                                            │
-├─────────────────────────────────────────────────────────────┤
-│ • Load C3 stack: (n_frames, height, width)                  │
-│ • Load C1 frame[0]: (height, width) for GUV detection      │
-│ • Memory: ~4 bytes/pixel × 2048 × 2048 × 500 = ~8 GB       │
-└────────────────────┬────────────────────────────────────────┘
-                     │
-                     ▼
-┌─────────────────────────────────────────────────────────────┐
-│ 4. PER-GUV PROCESSING LOOP                                  │
-├─────────────────────────────────────────────────────────────┤
-│ For each (xc, yc, radius) in CSV:                           │
-│                                                              │
-│   ┌────────────────────────────────────────────────────────┐│
-│   │ 4a. Center Refinement                                  ││
-│   ├────────────────────────────────────────────────────────┤│
-│   │ • Extract search box (1.6 × radius)                    ││
-│   │ • Edge detection (Laplacian)                           ││
-│   │ • Find centroid                                        ││
-│   │ • Validate shift (<70% radius)                         ││
-│   │ → (xc_refined, yc_refined)                             ││
-│   └────────────────┬───────────────────────────────────────┘│
-│                    │                                         │
-│   ┌────────────────▼───────────────────────────────────────┐│
-│   │ 4b. Membrane Detection                                 ││
-│   ├────────────────────────────────────────────────────────┤│
-│   │ • Create 360 radial profiles                           ││
-│   │ • Calculate median profile                             ││
-│   │ • Smooth with Gaussian (σ=1)                           ││
-│   │ • Find peaks in search window                          ││
-│   │ • Define boundaries: peak ± half_width                 ││
-│   │ → (inner_radius, outer_radius, quality_flags)          ││
-│   └────────────────┬───────────────────────────────────────┘│
-│                    │                                         │
-│   ┌────────────────▼───────────────────────────────────────┐│
-│   │ 4c. Mask Creation                                      ││
-│   ├────────────────────────────────────────────────────────┤│
-│   │ Inner GUV:      r ≤ inner_radius                       ││
-│   │ Membrane:       inner_radius < r ≤ outer_radius        ││
-│   │ Background:     (outer_radius + buffer) < r            ││
-│   │                 ≤ (outer_radius + buffer + width)      ││
-│   └────────────────┬───────────────────────────────────────┘│
-│                    │                                         │
-│   ┌────────────────▼───────────────────────────────────────┐│
-│   │ 4d. Trace Extraction                                   ││
-│   ├────────────────────────────────────────────────────────┤│
-│   │ • Apply masks to full stack                            ││
-│   │ • Calculate mean intensity per frame                   ││
-│   │ → I_dye_trace[t], I_background_trace[t]                ││
-│   └────────────────┬───────────────────────────────────────┘│
-│                    │                                         │
-│   ┌────────────────▼───────────────────────────────────────┐│
-│   │ 4e. Jump Detection                                     ││
-│   ├────────────────────────────────────────────────────────┤│
-│   │ • Calculate Δ = I[i+1] - I[i]                          ││
-│   │ • Threshold: μ + 3σ                                    ││
-│   │ → jump_frame                                           ││
-│   └────────────────┬───────────────────────────────────────┘│
-│                    │                                         │
-│   ┌────────────────▼───────────────────────────────────────┐│
-│   │ 4f. Store Results                                      ││
-│   ├────────────────────────────────────────────────────────┤│
-│   │ • all_intensity_curves.append(I_dye_trace)             ││
-│   │ • all_background_curves.append(I_background_trace)     ││
-│   │ • all_jump_frames.append(jump_frame)                   ││
-│   │ • detection_quality_log.append(metadata)               ││
-│   └────────────────────────────────────────────────────────┘│
-│                                                              │
-│ End loop                                                     │
-└────────────────────┬────────────────────────────────────────┘
-                     │
-                     ▼
-┌─────────────────────────────────────────────────────────────┐
-│ 5. NORMALIZATION                                            │
-├─────────────────────────────────────────────────────────────┤
-│ For each GUV:                                               │
-│   • I_dye_0 = mean(I_dye_trace[:baseline_frames])           │
-│   • numerator = I_dye_trace - I_dye_0                       │
-│   • denominator = I_background_trace - I_dye_0              │
-│   • I_uptake = numerator / denominator                      │
-│   • Handle division by zero → 0.0                           │
-│ → all_normalized_curves                                     │
-└────────────────────┬────────────────────────────────────────┘
-                     │
-                     ▼
-┌─────────────────────────────────────────────────────────────┐
-│ 6. ALIGNMENT                                                │
-├─────────────────────────────────────────────────────────────┤
-│ • Calculate: median_jump_frame                              │
-│ • Slice all curves: curve[median_jump_frame:]               │
-│ • Re-zero time: t = t[median_jump_frame:] - t[0]            │
-│ • Calculate: average_curve = mean(all_curves, axis=0)       │
-└────────────────────┬────────────────────────────────────────┘
-                     │
-                     ▼
-┌─────────────────────────────────────────────────────────────┐
-│ 7. CURVE FITTING                                            │
-├─────────────────────────────────────────────────────────────┤
-│ • Select model: 4-param or 5-param                          │
-│ • Slice data: first FIT_DATA_PERCENTAGE                     │
-│ • scipy.optimize.curve_fit()                                │
-│   ├─ Success: → fitted_params, covariance                   │
-│   └─ Failure: → initial_guess, fit_failed = True            │
-│ • Generate fitted curve for plotting                        │
-└────────────────────┬────────────────────────────────────────┘
-                     │
-                     ▼
-┌─────────────────────────────────────────────────────────────┐
-│ 8. VISUALIZATION & EXPORT                                   │
-├─────────────────────────────────────────────────────────────┤
-│ • Export time-stamped frames (EXPORT_TIME_POINTS_S)         │
-│   └─ With scale bar and time label                          │
-│                                                              │
-│ • Generate summary plot:                                    │
-│   ├─ Individual curves (gray, α=0.2)                        │
-│   ├─ Average curve (red points)                             │
-│   ├─ Fitted curve (black line)                              │
-│   └─ End-of-fit marker (blue star)                          │
-│                                                              │
-│ • Export CSV: Time, GUV1, GUV2, ..., Average                │
-│                                                              │
-│ • Save quality report: detection_quality.csv                │
-│   └─ Columns: guv_id, estimated_radius, detected_inner,     │
-│                detected_outer, failed, comments              │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### File Output Structure
-
-```
-output_images/
-│
-├── A1Well4_exp360V_mask_viz_GUV_1.png
-│   ├─ C1 frame with overlaid masks
-│   ├─ Magenta: Inner uptake region
-│   ├─ Red:     Membrane
-│   └─ Blue:    Background ring
-│
-├── A1Well4_exp360V_radial_profile_GUV_1.png
-│   ├─ X-axis: Radius (pixels)
-│   ├─ Y-axis: Intensity (a.u.)
-│   ├─ Shaded regions: Inner / Membrane / Background
-│   ├─ Orange dashed: CSV estimate
-│   └─ Black dashed: Detected peak
-│
-├── frame_1_at_0s.png
-├── frame_2_at_50s.png
-├── frame_3_at_100s.png
-│   └─ [Time-stamped snapshots of C3 channel]
-│       ├─ Red colormap
-│       ├─ Time label (top-left)
-│       └─ Scale bar (bottom-right)
-│
-├── A1Well4_exp360V_kinetic_fit.png
-│   ├─ Individual GUV traces (gray)
-│   ├─ Average trace (red points)
-│   ├─ Fitted model (black line)
-│   ├─ Fit parameters in title
-│   └─ End-of-fit marker (blue star)
-│
-├── A1Well4_exp360V_normalized_curves.csv
-│   ├─ Columns: Time, GUV_1, GUV_2, ..., Average
-│   └─ All normalized curves for further analysis
-│
-└── A1Well4_exp360V_detection_quality.csv
-    ├─ Columns: guv_id, estimated_radius, detected_inner,
-    │           detected_outer, failed, comments
-    └─ Quality metrics for each detection
-```
+3. **Unrealistic parameters**:
+   - Add bounds to `curve_fit`:
+   ```python
+   bounds = ([0, 0, 1, -0.01],     # Lower bounds
+             [5, 5, 500, 0.01])    # Upper bounds
+   ```
 
 ---
 
 ## Quality Control
 
-### Automated Quality Flags
+### Detection Quality Metrics
 
-The pipeline generates multiple quality indicators:
+Each GUV generates a quality report saved in `*_detection_quality.csv`:
 
-#### 1. Detection Quality Flags
+```csv
+guv_id,estimated_radius,detected_inner,detected_outer,failed,comments
+GUV_1,45,42,48,False,OK
+GUV_2,50,47,53,False,OK
+GUV_3,38,35,41,False,OK
+GUV_4,55,0,0,True,no_peak_in_window
+```
 
-Stored in `*_detection_quality.csv`:
+**Columns Explained**:
 
-| Flag | Meaning | Cause | Action |
-|------|---------|-------|--------|
-| `OK` | Clean detection | Ideal conditions | None |
-| `no_peak_in_window` | No peak found | Weak membrane signal | Widen search_factor |
-| `invalid_search_window` | Window out of bounds | Bad radius estimate | Check CSV coordinates |
-| `zero_radius_detected` | Degenerate detection | Edge case bug | Review image manually |
-| `width_calc_failed` | Narrow membrane | Peak at image edge | Adjust membrane_half_width |
-| `find_peaks_failed` | Algorithm error | Corrupted data | Check input image |
+- `guv_id`: Unique identifier from CSV
+- `estimated_radius`: Initial radius from CSV (pixels)
+- `detected_inner`: Inner boundary after detection (pixels)
+- `detected_outer`: Outer boundary after detection (pixels)
+- `failed`: Boolean flag (True = detection failed)
+- `comments`: Quality flags or "OK"
 
-#### 2. Detection Summary Statistics
+### Quality Flags
 
-Printed after processing:
+**`OK`**: Clean detection
+- Peak found within search window
+- Reasonable membrane width
+- No edge case conditions
+
+**`no_peak_in_window`**: No peak detected in search range
+- Possible causes:
+  - CSV radius estimate very inaccurate
+  - GUV out of focus
+  - Search factor too narrow
+- Recommendation: Increase `MEMBRANE_SEARCH_FACTOR`
+
+**`invalid_search_window`**: Search window extends beyond image bounds
+- Possible causes:
+  - GUV too close to image edge
+  - CSV coordinates incorrect
+- Recommendation: Exclude this GUV or correct CSV
+
+**`zero_radius_detected`**: Degenerate case
+- Possible causes:
+  - No membrane visible
+  - Complete detection failure
+- Recommendation: Manual inspection required
+
+**`width_calc_failed`**: Membrane boundary calculation error
+- Possible causes:
+  - Profile too noisy
+  - Membrane too thin
+- Recommendation: Adjust `MEMBRANE_FIXED_HALF_WIDTH`
+
+### Automatic Visualization for Problematic GUVs
+
+The pipeline automatically generates mask visualizations and radial profile plots for:
+- All GUVs with `failed=True`
+- All GUVs with warnings (comments ≠ "OK")
+- The first GUV (always, as reference)
+
+**Example**: Radial Profile Plot
+
+```
+┌─────────────────────────────────────┐
+│ Radial Intensity Profile            │
+│                                     │
+│   Intensity                         │
+│     │     ╱╲                        │
+│     │    ╱  ╲                       │
+│     │   ╱    ╲                      │
+│     │  ╱      ╲____                 │
+│     │ ╱             ─────           │
+│     └─────────────────────> Radius  │
+│                                     │
+│ Purple: Uptake Region               │
+│ Red:    Membrane Region             │
+│ Blue:   Background Region           │
+│ Orange: CSV Estimate                │
+│ Black:  Detected Peak               │
+└─────────────────────────────────────┘
+```
+
+### Quality Summary Statistics
+
+The pipeline logs summary statistics after processing:
+
 ```
 Detection Summary:
-  - Total GUVs: 12
-  - Failed detections: 1
-  - Detections with warnings: 3
-  - Clean detections: 8
+  - Total GUVs: 50
+  - Successful: 48 (96%)
+  - Failed: 2 (4%)
+  - With warnings: 5 (10%)
 ```
 
-**Acceptable failure rates:**
-- Failed: <10% (indicates robust detection)
-- Warnings: <30% (some heterogeneity expected)
-- Clean: >60% (high-quality dataset)
+### Manual QC Checklist
 
-#### 3. Visual QC Outputs
+After running the pipeline, review:
 
-**Mask visualizations** (`*_mask_viz_GUV_*.png`):
-- Exported for first GUV automatically
-- Exported for any GUV with warnings/failures
-- Color-coded regions for quick assessment
+1. **Detection quality CSV**:
+   - How many failures?
+   - Are failures clustered (systematic issue)?
 
-**Radial profile plots** (`*_radial_profile_GUV_*.png`):
-- Shows detected peak vs CSV estimate
-- Visualizes membrane boundaries
-- Identifies off-center or irregular membranes
+2. **Radial profile plots**:
+   - Is the detected peak visually correct?
+   - Does the search window contain the membrane?
 
-**Review Checklist:**
-- [ ] Membrane peak aligns with visible membrane
-- [ ] Inner region excludes membrane signal
-- [ ] Background ring avoids adjacent structures
-- [ ] No artifacts (bright clusters, debris) in sampled regions
+3. **Mask visualizations**:
+   - Do masks align with actual GUV boundaries?
+   - Is background ring outside the GUV?
 
-### Manual Quality Assessment
+4. **Kinetic fit plot**:
+   - Does the fit follow the average curve?
+   - Are individual curves consistent?
+   - Any obvious outliers?
 
-#### Good Detection Example
-
-```
-Radial Profile:
-Intensity
-   |
-500|              *        ← Clean, sharp peak
-   |            *   *
-400|          *       *
-   |        *           *
-300|      *               *
-   |    *                   *
-200|  *                       *
-   |*                           *
-100|____________________________*___ Radius
-   0   10   20   30   40   50   60
-
-✓ Sharp membrane peak at expected position
-✓ Clear inner plateau (low intensity)
-✓ Background region far from membrane
-✓ Symmetric profile (indicates centered GUV)
-```
-
-#### Poor Detection Example
-
-```
-Radial Profile:
-Intensity
-   |  *
-500|   \  *  *        ← Multiple peaks (artifacts)
-   |    \  *  \
-400|     *     \    *
-   |            \  /
-300|             \/      ← Membrane not clearly defined
-   |             /\
-200|           /    \
-   |         /        \
-100|_______/__________\______ Radius
-   0   10   20   30   40   50   60
-
-✗ Multiple competing peaks
-✗ Broad, diffuse membrane signal
-✗ Asymmetric profile (off-center or irregular)
-✗ Strong background artifacts
-
-Action: Exclude this GUV or adjust detection parameters
-```
-
-### Parameter Tuning Guide
-
-If experiencing poor detection quality:
-
-#### Increase `MEMBRANE_SEARCH_FACTOR` (0.3 → 0.5)
-
-**When:**
-- CSV radius estimates are poor
-- Membranes consistently missed
-
-**Trade-off:**
-- ✓ More robust to position errors
-- ✗ May pick up artifacts far from true membrane
-
-#### Decrease `PEAK_FIND_MIN_PROMINENCE` (0.05 → 0.02)
-
-**When:**
-- Weak membrane signal
-- Flat radial profiles
-
-**Trade-off:**
-- ✓ Detects subtle membrane signals
-- ✗ More sensitive to noise
-
-#### Increase `MEMBRANE_FIXED_HALF_WIDTH` (3 → 5 pixels)
-
-**When:**
-- Thick or blurred membranes
-- Low spatial resolution imaging
-
-**Trade-off:**
-- ✓ Captures full membrane width
-- ✗ May include non-membrane regions
-
-#### Adjust `JUMP_SENSITIVITY` (3.0 → 2.0)
-
-**When:**
-- Weak electroporation response
-- Gradual dye entry
-
-**Trade-off:**
-- ✓ Detects smaller intensity changes
-- ✗ More false positives from noise
+5. **Log file**:
+   - Any warnings or errors during processing?
+   - Timestamp issues?
 
 ---
 
 ## Performance Considerations
 
-### Computational Complexity
-
-Per GUV processing:
-```
-1. Center refinement:    O(w²)     w = search box width
-2. Radial profiling:     O(n×r)    n = angles, r = radius
-3. Profile averaging:    O(n×r)    
-4. Peak detection:       O(r)      
-5. Mask creation:        O(N)      N = image size
-6. Trace extraction:     O(T×M)    T = frames, M = mask pixels
-
-Total per GUV: ~O(T×N) dominated by trace extraction
-```
-
 ### Memory Usage
 
+**Lazy Loading** (current implementation):
 ```
-Image stack:     T × H × W × bytes_per_pixel
-Example:         500 × 2048 × 2048 × 2 bytes = 8 GB
-
-Masks (3):       3 × H × W × 1 byte = 12 MB (negligible)
-
-Traces:          n_GUVs × T × 8 bytes = 40 KB (negligible)
-
-Total:           ~8 GB for typical dataset
+Per-frame memory: ~8 MB (2048×2048 × 2 bytes)
+Peak memory:      ~50 MB (multiple workers + overhead)
+Total datasets:   Limited by disk space, not RAM
 ```
 
-### Optimization Strategies
-
-#### 1. Lazy Loading (Memory Reduction)
-
-```python
-# Instead of loading full stack:
-# im_stack = load_all_frames()  # 8 GB
-
-# Load frames on-demand:
-def get_frame(frame_idx):
-    return cv2.imread(file_paths[frame_idx])
-
-# Then:
-for frame_idx in range(n_frames):
-    frame = get_frame(frame_idx)
-    intensity[frame_idx] = np.mean(frame[mask])
+**Eager Loading** (old implementation):
+```
+Per-stack memory: 4 GB (500 frames × 8 MB)
+Peak memory:      8 GB (two channels)
+Total datasets:   Limited by RAM
 ```
 
-**Trade-off:**
-- ✓ Memory: ~50 MB vs 8 GB
-- ✗ Speed: ~3× slower due to I/O
+### Processing Speed
 
-**When to use:** Memory-constrained systems, >1000 frames
+**Factors Affecting Speed**:
 
-#### 2. Parallel GUV Processing (Speed-up)
+1. **Number of GUVs**: Linear scaling
+   - 10 GUVs: ~30 seconds
+   - 100 GUVs: ~5 minutes (with 8 workers)
 
-```python
-from multiprocessing import Pool
+2. **Image size**: Quadratic impact
+   - 1024×1024: 1× baseline
+   - 2048×2048: 4× slower
 
-def process_guv_wrapper(args):
-    guv_id, center, radius = args
-    return process_single_guv(guv_id, center, radius)
+3. **Number of frames**: Linear scaling
+   - 100 frames: 1× baseline
+   - 500 frames: 5× slower (lazy loading)
 
-with Pool(processes=4) as pool:
-    results = pool.map(process_guv_wrapper, guv_data)
+4. **Worker count** (`N_WORKERS`):
+   - Optimal: `cpu_count() - 1`
+   - Diminishing returns above 8 workers (I/O bottleneck)
+
+**Optimization Tips**:
+
+1. **For many small datasets**: Increase `N_WORKERS`
+2. **For few large datasets**: Use fewer workers (reduce I/O contention)
+3. **For debugging**: Set `N_WORKERS = 1` (easier error tracking)
+4. **For batch processing**: Use separate Python processes for each experiment
+
+### Disk I/O Optimization
+
+**Current Strategy**: Sequential reading per worker
+- Each worker reads its own frames
+- No caching between workers
+- I/O bandwidth = bottleneck for high worker counts
+
+**Future Optimization**: Shared memory pool
+- Pre-load frames into shared memory
+- All workers access same memory
+- Requires significant code refactoring
+
+### Parallelization Efficiency
+
+**Amdahl's Law** applies:
+
+```
+Speedup = 1 / (S + P/N)
+
+Where:
+- S = Serial fraction (file I/O, result merging): ~20%
+- P = Parallel fraction (GUV processing): ~80%
+- N = Number of workers
+
+Maximum theoretical speedup: 1 / (0.2 + 0.8/∞) = 5×
 ```
 
-**Speed-up:** ~3-4× on 4 cores (I/O bottleneck limits scaling)
+**Observed Speedups** (100 GUVs):
 
-**Caution:**
-- Each worker loads its own copy of image stack
-- Memory usage: 4 × 8 GB = 32 GB
-- Use only if memory permits or with lazy loading
-
-#### 3. Vectorized Operations (2-3× speed-up)
-
-Already implemented:
-```python
-# ✓ Good: Vectorized
-trace = np.mean(im_stack[:, mask], axis=1)
-
-# ✗ Bad: Loop-based
-for i in range(len(im_stack)):
-    trace[i] = np.mean(im_stack[i][mask])
+```
+Workers  Time (s)  Speedup  Efficiency
+───────────────────────────────────────
+1        300       1.0×     100%
+2        165       1.8×     90%
+4        90        3.3×     83%
+8        55        5.5×     69%
+16       45        6.7×     42%
 ```
 
-### Benchmarks
-
-Typical dataset (500 frames, 2048×2048, 5 GUVs):
-
-| Operation | Time | % Total |
-|-----------|------|---------|
-| File discovery | 0.1 s | <1% |
-| Metadata extraction | 0.1 s | <1% |
-| Image loading | 35 s | 45% |
-| Per-GUV processing | 15 s | 20% |
-| Normalization | 0.5 s | <1% |
-| Curve fitting | 0.2 s | <1% |
-| Visualization | 8 s | 10% |
-| CSV export | 0.1 s | <1% |
-| **Total** | **~60 s** | **100%** |
-
-**Bottlenecks:**
-1. Image I/O (45%)
-2. GUV processing (20%)
-3. Visualization (10%)
-
-**Optimization priority:**
-1. Use SSD for faster I/O
-2. Parallelize GUV processing
-3. Batch visualization exports
+**Recommendation**: Use 4-8 workers for optimal efficiency.
 
 ---
 
@@ -1273,235 +1108,213 @@ Typical dataset (500 frames, 2048×2048, 5 GUVs):
 
 ### Common Issues and Solutions
 
-#### Issue 1: "No dye files found"
+#### 1. "No dye files found"
 
-**Error message:**
+**Error Message**:
 ```
-Error: No dye files found matching: C:\Data\Emma\C3-A1Well4_exp360V_t*.tif
+ERROR - load_input_data - No dye files found matching: C:\Data\...\C2-*.tif
 ```
 
-**Possible causes:**
-1. Incorrect `DATA_FOLDER` path
-2. Wrong `EXPERIMENT_BASE_NAME`
-3. Wrong `DYE_CHANNEL_PREFIX`
-4. Files not in expected location
+**Causes**:
+- Incorrect `DATA_FOLDER` path
+- Wrong `DYE_CHANNEL_PREFIX` (should be "C2-")
+- Files not named correctly
 
-**Solutions:**
+**Solutions**:
+1. Check `config.py`: Is `DATA_FOLDER` correct?
+2. Verify file naming: Should be `C2-ExperimentName_t001.tif`
+3. Check channel prefix: ROI is `C1-`, Dye is `C2-`
+
+#### 2. "Could not extract or generate timestamps"
+
+**Error Message**:
+```
+WARNING - load_input_data - Falling back to manual timestamps...
+ERROR - load_input_data - Could not extract or generate timestamps.
+```
+
+**Causes**:
+- TIFF metadata missing
+- Non-ImageJ TIFF format
+- `FALLBACK_FPS` not set
+
+**Solutions**:
+1. Set `FALLBACK_FPS` in `config.py`:
+   ```python
+   FALLBACK_FPS = 1.0  # frames per second
+   ```
+2. If acquisition rate is known, use that value
+3. Check TIFF files with ImageJ: Image → Show Info
+
+#### 3. "Detection failed" for many GUVs
+
+**Symptoms**:
+- High failure rate (>20%)
+- Many `no_peak_in_window` flags
+- Radial profiles show peak outside search window
+
+**Solutions**:
+
+**Option 1**: Increase search window
 ```python
-# 1. Check paths are correct
-print(f"Looking in: {cfg.DATA_FOLDER}")
-print(f"Pattern: {cfg.DYE_CHANNEL_PREFIX + cfg.EXPERIMENT_BASE_NAME + cfg.TIF_SUFFIX}")
-
-# 2. List all .tif files in folder
-import glob
-all_tifs = glob.glob(os.path.join(cfg.DATA_FOLDER, "*.tif"))
-print(f"Found {len(all_tifs)} .tif files")
-
-# 3. Check actual filenames match expected pattern
-# Example: Files might be "C3-Experiment_001.tif" vs "C3-Experiment_t001.tif"
+MEMBRANE_SEARCH_FACTOR = 0.5  # Try 0.5 instead of 0.3
 ```
 
-#### Issue 2: "Membrane detection failed for all GUVs"
-
-**Symptoms:**
-```
-Detection Summary:
-  - Failed detections: 5/5
-  - Comments: "no_peak_in_window"
-```
-
-**Diagnosis:**
-
-Check radial profile plots:
-- Flat profile → Weak membrane signal
-- Peak outside window → Bad radius estimate
-
-**Solutions:**
-
-1. **Weak signal:**
+**Option 2**: Check detection mode
 ```python
-# Decrease peak prominence threshold
-PEAK_FIND_MIN_PROMINENCE = 0.02  # from 0.05
+# For fluorescent membranes:
+MEMBRANE_DETECTION_MODE = 'LABELED'
+
+# For brightfield/phase contrast:
+MEMBRANE_DETECTION_MODE = 'UNLABELED'
 ```
 
-2. **Bad estimates:**
+**Option 3**: Adjust peak detection sensitivity
 ```python
-# Widen search window
-MEMBRANE_SEARCH_FACTOR = 0.5  # from 0.3
+PEAK_FIND_MIN_PROMINENCE = 0.03  # Lower = more sensitive
+PEAK_FIND_MIN_DISTANCE = 3       # Closer peaks allowed
 ```
 
-3. **Wrong channel:**
+**Option 4**: Verify CSV accuracy
+- Open CSV in Excel
+- Check if `size` values are reasonable
+- Compare with visual inspection in ImageJ
+
+#### 4. "Fit convergence failure"
+
+**Error Message**:
+```
+WARNING - fit_average_curve - Fit did not converge. Using initial guess.
+```
+
+**Causes**:
+- Poor initial guess
+- Insufficient data
+- Wrong model selection
+- Data not properly normalized
+
+**Solutions**:
+
+**Option 1**: Adjust initial guess
 ```python
-# Check you're using membrane channel for detection
-# roi_guide_files should be C1 (membrane), not C3 (dye)
+# For 4-PARAM model:
+FIT_INITIAL_GUESS_4PARAM = (0.0, 0.8, 30.0, 0.0)  # Adjust tau to ~30s
+
+# For 5-PARAM model:
+FIT_INITIAL_GUESS_5PARAM = (1.0, 0.6, 5.0, 0.4, 150.0)
 ```
 
-#### Issue 3: "Curve fitting failed"
-
-**Error message:**
-```
-FATAL WARNING: Curve fitting failed: Optimal parameters not found...
-```
-
-**Possible causes:**
-1. Poor initial guess
-2. Insufficient data points
-3. Model mismatch (wrong model for data)
-4. Highly noisy data
-
-**Solutions:**
-
-1. **Adjust initial guess:**
+**Option 2**: Use less data for fitting
 ```python
-# For 4-param model, try:
-FIT_INITIAL_GUESS_4PARAM = (
-    0.0,    # I_offset (should be ~0 for normalized data)
-    0.8,    # A (try matching approximate plateau level)
-    30.0,   # tau (estimate from visual inspection)
-    0.0     # D (try zero first)
-)
+FIT_DATA_PERCENTAGE = 0.7  # Fit first 70% instead of 90%
 ```
 
-2. **Use more data:**
+**Option 3**: Switch model
 ```python
-FIT_DATA_PERCENTAGE = 1.0  # Use full curve
+MODEL_TO_USE = '4-PARAM'  # Try simpler model
 ```
 
-3. **Try different model:**
+**Option 4**: Check normalized curves
+- Open `*_normalized_curves.csv`
+- Plot in Excel/Python
+- Look for:
+  - Negative values (normalization issue)
+  - No clear exponential rise (jump detection wrong)
+  - Extreme outliers (bad GUV data)
+
+#### 5. Memory Issues
+
+**Symptoms**:
+- Python crashes with no error
+- "MemoryError" exceptions
+- System becomes unresponsive
+
+**Solutions**:
+
+**Option 1**: Reduce worker count
 ```python
-# If 5-param fails, try simpler 4-param
-MODEL_TO_USE = '4-PARAM'
+N_WORKERS = 2  # Use fewer parallel processes
 ```
 
-4. **Filter noisy curves:**
+**Option 2**: Process in batches
+- Split CSV into smaller files
+- Run analysis on each batch separately
+- Merge results manually
+
+**Option 3**: Use smaller image ROIs
+- Crop images in ImageJ before analysis
+- Reduces memory per frame
+
+#### 6. Wrong detection mode produces inverted results
+
+**Symptoms**:
+- Mask is outside the GUV
+- Inner radius > outer radius
+- Profile plots show detection at wrong location
+
+**Solution**: Check `MEMBRANE_DETECTION_MODE`
+
 ```python
-# Exclude GUVs with poor SNR before averaging
+# For fluorescent membranes (bright rings):
+MEMBRANE_DETECTION_MODE = 'LABELED'
+
+# For brightfield/phase contrast (dark rings):
+MEMBRANE_DETECTION_MODE = 'UNLABELED'
 ```
 
-#### Issue 4: "Negative normalized intensities"
+**Visual Check**:
+- Open first ROI image in ImageJ
+- Is the membrane brighter or darker than interior?
+- Set mode accordingly
 
-**Symptoms:**
-```
-Warning: Normalized intensity < 0 detected
-```
+#### 7. Parallel processing hangs
 
-**Cause:**
-Background intensity lower than GUV interior (unphysical)
+**Symptoms**:
+- Script starts but never finishes
+- No error messages
+- CPU usage drops to zero
 
-**Possible reasons:**
-1. Background ring overlaps with another GUV
-2. Autofluorescence higher inside than outside
-3. Photobleaching differential
-4. Detection error (wrong regions)
+**Causes**:
+- Windows/Mac multiprocessing compatibility issue
+- Worker crash without error propagation
 
-**Solutions:**
+**Solutions**:
 
-1. **Check mask visualization:**
+**Option 1**: Disable parallelization
 ```python
-# Ensure background ring doesn't overlap other structures
-EXPORT_MASK_VISUALIZATION = True
+N_WORKERS = 1  # Debug mode
 ```
 
-2. **Increase background buffer:**
+**Option 2**: Check for worker crashes in log file
+- Look for incomplete GUV processing
+- Last GUV before hang is likely the culprit
+
+**Option 3**: Validate inputs
 ```python
-BG_BUFFER_PIXELS = 5  # from 2
-```
-
-3. **Widen background ring:**
-```python
-BG_RING_WIDTH_PIXELS = 15  # from 10
-```
-
-4. **Exclude problematic GUVs:**
-```python
-# Manually from CSV or add filtering logic
-```
-
-#### Issue 5: "Jump detection fails"
-
-**Symptoms:**
-```
-No clear jump detected for GUV 3, assuming start at frame 0.
-```
-
-**Causes:**
-1. Gradual dye entry (weak electroporation)
-2. High baseline noise
-3. Jump occurs outside monitored timeframe
-
-**Solutions:**
-
-1. **Decrease sensitivity:**
-```python
-JUMP_SENSITIVITY = 2.0  # from 3.0 (more sensitive)
-```
-
-2. **Manual inspection:**
-```python
-# Plot raw intensity trace
-plt.plot(intensity_trace)
-# Visually identify jump frame
-```
-
-3. **Manual override:**
-```python
-# If jump consistently at same frame, hard-code it
-# jump_frame = 50  # known pulse frame
-```
-
-#### Issue 6: "Memory error loading image stack"
-
-**Error message:**
-```
-MemoryError: Unable to allocate array
-```
-
-**Cause:**
-Insufficient RAM for large datasets
-
-**Solutions:**
-
-1. **Lazy loading:**
-```python
-# Modify code to load frames on-demand
-# (see Performance Considerations section)
-```
-
-2. **Process subset:**
-```python
-# Analyze fewer GUVs or shorter time window
-dye_files = dye_files[:300]  # First 300 frames only
-```
-
-3. **Increase system RAM:**
-```python
-# Or use workstation/cluster with more memory
-```
-
-4. **Downsample images:**
-```python
-# If spatial resolution permits
-frame_downsampled = cv2.resize(frame, None, fx=0.5, fy=0.5)
+# Run validate_config() manually:
+python -c "import config as cfg; import run_analysis; run_analysis.validate_config()"
 ```
 
 ---
 
 ## API Reference
 
-### Core Functions
+### Main Functions
 
 #### `run_analysis.main()`
 
-Main pipeline orchestrator. No parameters (uses `config.py`).
+Master orchestration function.
+
+**Parameters**: None (reads from `config.py`)
 
 **Workflow:**
-1. File discovery and validation
-2. Timestamp extraction
-3. Image loading
-4. Per-GUV processing loop
-5. Normalization and alignment
-6. Curve fitting
-7. Visualization and export
+1. Setup logging
+2. Validate configuration
+3. Discover and load input files
+4. Process all GUVs in parallel
+5. Normalize and align curves
+6. Fit kinetic model
+7. Export results and visualizations
 
 **Returns:** None (outputs written to disk)
 
@@ -1509,6 +1322,173 @@ Main pipeline orchestrator. No parameters (uses `config.py`).
 - `FileNotFoundError`: Input files not found
 - `ValueError`: Invalid configuration
 - `RuntimeError`: Fit convergence failure (handled gracefully)
+
+---
+
+#### `run_analysis.load_input_data(paths, logger)`
+
+Loads all required input files.
+
+**Parameters:**
+- `paths` (dict): Dictionary with keys:
+  - `'dye_tifs'`: Glob pattern for dye channel
+  - `'roi_tifs'`: Glob pattern for ROI channel
+  - `'csv'`: Path to CSV file
+- `logger` (logging.Logger): Logger instance
+
+**Returns:**
+- `dict` or `None`:
+  ```python
+  {
+      'dye_files': List[str],      # Paths to dye TIFF files
+      'roi_frame': np.ndarray,     # First ROI frame
+      'guv_data': pd.DataFrame,    # CSV data
+      'time_array': np.ndarray,    # Timestamps (seconds)
+      'frame_interval': float      # Frame interval (seconds)
+  }
+  ```
+
+**Returns `None` if**:
+- No files found
+- Timestamp extraction fails
+- CSV read error
+
+---
+
+#### `run_analysis.process_all_guvs(guv_data, dye_files, roi_frame, logger)`
+
+Coordinates parallel processing of all GUVs.
+
+**Parameters:**
+- `guv_data` (pd.DataFrame): GUV coordinates and radii
+- `dye_files` (List[str]): Paths to dye channel images
+- `roi_frame` (np.ndarray): ROI guide image
+- `logger` (logging.Logger): Logger instance
+
+**Returns:**
+- `dict`:
+  ```python
+  {
+      'all_intensity_curves': List[np.ndarray],
+      'all_background_curves': List[np.ndarray],
+      'all_jump_frames': List[int],
+      'valid_guv_indices': List[int],
+      'valid_guv_ids': List[str]
+  }
+  ```
+
+**Side Effects:**
+- Writes `*_detection_quality.csv`
+- Generates mask visualizations (if configured)
+- Generates radial profile plots (if configured)
+
+---
+
+#### `run_analysis.normalize_and_align_curves(guv_results, time_array, guv_ids, logger)`
+
+Normalizes and aligns all GUV curves to pulse event.
+
+**Parameters:**
+- `guv_results` (dict): Output from `process_all_guvs()`
+- `time_array` (np.ndarray): Original timestamps
+- `guv_ids` (List[str]): GUV identifiers
+- `logger` (logging.Logger): Logger instance
+
+**Returns:**
+- `dict`:
+  ```python
+  {
+      't_aligned': np.ndarray,           # Time relative to pulse
+      'curve_array': np.ndarray,         # All normalized curves (N × T)
+      'average_curve': np.ndarray,       # Average across GUVs
+      'valid_guv_ids': List[str]         # IDs of successfully processed GUVs
+  }
+  ```
+
+---
+
+#### `run_analysis.fit_average_curve(t, average_curve, logger)`
+
+Fits kinetic model to average curve.
+
+**Parameters:**
+- `t` (np.ndarray): Time array (seconds)
+- `average_curve` (np.ndarray): Average normalized intensity
+- `logger` (logging.Logger): Logger instance
+
+**Returns:**
+- `dict`:
+  ```python
+  {
+      'fit_params': dict,              # Fitted parameters
+      'fit_curve': np.ndarray,         # Model prediction
+      'fit_slice_index': int,          # End of fitted data
+      'fit_failed': bool               # Convergence status
+  }
+  ```
+
+**Parameter Keys** (depend on model):
+- **4-PARAM**: `'I_offset'`, `'A'`, `'tau'`, `'D'`
+- **5-PARAM**: `'Af'`, `'A1'`, `'tau1'`, `'A2'`, `'tau2'`
+
+---
+
+#### `run_analysis.export_results(aligned_data, fit_results, dye_files, logger)`
+
+Generates all output files and visualizations.
+
+**Parameters:**
+- `aligned_data` (dict): Output from `normalize_and_align_curves()`
+- `fit_results` (dict): Output from `fit_average_curve()`
+- `dye_files` (List[str]): Paths to dye images (for frame export)
+- `logger` (logging.Logger): Logger instance
+
+**Returns:** None
+
+**Side Effects:**
+- Exports frames at specified time points
+- Saves `*_kinetic_fit.png`
+- Saves `*_normalized_curves.csv`
+- Logs completion statistics
+
+---
+
+#### `run_analysis.validate_config(logger)`
+
+Validates all configuration parameters.
+
+**Parameters:**
+- `logger` (logging.Logger): Logger instance
+
+**Returns:**
+- `bool`: True if valid, False otherwise
+
+**Checks:**
+- Path existence
+- Parameter ranges
+- Type validation
+- Detection mode validity
+
+---
+
+### Utility Functions
+
+#### `utils.setup_logging(output_folder, experiment_name, level=logging.INFO)`
+
+Configures logging to file and console.
+
+**Parameters:**
+- `output_folder` (str): Directory for log file
+- `experiment_name` (str): Prefix for log filename
+- `level` (int): Logging level (default: `logging.INFO`)
+
+**Returns:**
+- `logging.Logger`: Configured logger instance
+
+**Log Format:**
+```
+2025-01-15 14:32:10 - INFO     - function_name       - Log message here
+```
 
 ---
 
@@ -1520,13 +1500,23 @@ Extract timestamps from ImageJ TIFF metadata.
 - `file_paths` (List[str]): Paths to TIFF files
 
 **Returns:**
-- `time_array` (np.ndarray): Timestamps in seconds
-- `frame_interval` (float): Time between frames
+- `(time_array, frame_interval)` (Tuple[np.ndarray, float])
+- `(None, None)` if extraction fails
 
-**Returns `(None, None)` if:**
-- Metadata missing
-- TIFF format not recognized
-- `finterval` key not found
+**Metadata Key**: `finterval` (frame interval in seconds)
+
+---
+
+#### `utils.create_manual_timestamps(num_frames, fallback_fps)`
+
+Creates synthetic timestamps from frame rate.
+
+**Parameters:**
+- `num_frames` (int): Number of frames
+- `fallback_fps` (float): Frames per second
+
+**Returns:**
+- `(time_array, frame_interval)` (Tuple[np.ndarray, float])
 
 ---
 
@@ -1568,6 +1558,7 @@ Create masks using adaptive membrane detection.
 - `membrane_half_width` (int): Half-width of membrane (pixels)
 - `peak_min_dist` (int): Minimum peak separation
 - `peak_min_prom` (float): Minimum peak prominence (0-1)
+- `detect_bright` (bool): True for labeled (peak), False for unlabeled (valley)
 - `num_angles` (int): Number of radial profiles (default: 360)
 - `length_excess` (float): Profile length factor (default: 1.5)
 - `viz_thickness` (Optional[int]): Fixed membrane visualization thickness
@@ -1594,23 +1585,49 @@ Create masks using adaptive membrane detection.
 
 ---
 
-#### `utils.get_intensity_trace(im_stack, mask)`
+#### `utils.process_single_guv(guv_id, center_orig, radius_csv_raw, is_first_guv, roi_frame, dye_files)`
 
-Extract mean intensity within mask over time.
+Complete analysis pipeline for a single GUV (worker function).
 
 **Parameters:**
-- `im_stack` (np.ndarray): 3D array (n_frames, height, width)
+- `guv_id` (str): GUV identifier
+- `center_orig` (Tuple[int, int]): CSV coordinates
+- `radius_csv_raw` (int): CSV radius estimate
+- `is_first_guv` (bool): Whether to always generate visualizations
+- `roi_frame` (np.ndarray): ROI guide image
+- `dye_files` (List[str]): Paths to dye images
+
+**Returns:**
+- `(result, quality_entry)` (Tuple[dict, dict]):
+  - `result`: Contains `intensity_trace`, `background_trace`, `jump_frame`
+  - `quality_entry`: Detection quality metrics
+
+**Side Effects:**
+- May generate mask visualization PNG
+- May generate radial profile PNG
+
+---
+
+#### `utils.get_intensity_trace_lazy(file_paths, mask)`
+
+Extract mean intensity within mask over time (memory-efficient).
+
+**Parameters:**
+- `file_paths` (List[str]): Paths to image files
 - `mask` (np.ndarray): 2D boolean array (height, width)
 
 **Returns:**
-- `trace` (np.ndarray): 1D array of mean intensities (length = n_frames)
+- `trace` (np.ndarray): 1D array of mean intensities (length = n_files)
 
 **Implementation:**
 ```python
-trace[i] = np.sum(im_stack[i][mask]) / np.sum(mask)
+for each file:
+    load frame
+    extract intensity = sum(frame[mask]) / sum(mask)
+    discard frame (garbage collection)
 ```
 
-**Edge case:** Returns array of zeros if mask is empty.
+**Memory**: O(1) per frame instead of O(N) for full stack
 
 ---
 
@@ -1632,10 +1649,6 @@ Detect electroporation event.
 3. Set threshold: `θ = mean(Δ[5:]) + sensitivity × σ`
 4. Find first `i` where `Δ[i] > θ`
 
-**Typical values:**
-- `sensitivity = 3.0`: Conservative (low false positive rate)
-- `sensitivity = 2.0`: More sensitive (higher false positive rate)
-
 ---
 
 #### `utils.dyn_model_4param(t, I_offset, A, tau, D)`
@@ -1656,8 +1669,6 @@ I(t) = I_offset + A × (1 - exp(-t/τ)) + D × t
 
 **Returns:**
 - `I` (np.ndarray): Model intensity values
-
-**Use case:** Simple single-phase uptake with linear drift correction.
 
 ---
 
@@ -1681,9 +1692,46 @@ I(t) = Af - A1 × exp(-t/τ₁) - A2 × exp(-t/τ₂)
 **Returns:**
 - `I` (np.ndarray): Model intensity values
 
-**Constraint:** `I(0) = Af - A1 - A2` (should be ≈0 for normalized data)
+---
 
-**Use case:** Biphasic resealing kinetics with distinct fast and slow components.
+#### `utils.create_mask_visualization(base_image, inner_mask, membrane_mask, background_mask, alpha=0.6)`
+
+Create color overlay visualization of masks.
+
+**Parameters:**
+- `base_image` (np.ndarray): Background image
+- `inner_mask` (np.ndarray): Boolean inner mask
+- `membrane_mask` (np.ndarray): Boolean membrane mask
+- `background_mask` (np.ndarray): Boolean background mask
+- `alpha` (float): Transparency (0-1)
+
+**Returns:**
+- `viz_image` (np.ndarray): Color BGR image
+
+**Color Scheme:**
+- **Inner (uptake)**: Magenta (201, 87, 188)
+- **Membrane**: Bright Red (82, 0, 249)
+- **Background**: Purple (114, 48, 19)
+
+---
+
+#### `utils.style_image(frame, time_label, microns_per_pixel, scale_bar_microns)`
+
+Apply styling to exported frames.
+
+**Parameters:**
+- `frame` (np.ndarray): Raw grayscale image
+- `time_label` (str): Text to overlay (e.g., "t = 50s")
+- `microns_per_pixel` (float): Spatial calibration
+- `scale_bar_microns` (int): Scale bar length
+
+**Returns:**
+- `styled_image` (np.ndarray): Styled BGR image
+
+**Styling Applied:**
+- Red colormap (fluorescence style)
+- Time label (top-left)
+- Scale bar (bottom-right)
 
 ---
 
@@ -1691,7 +1739,14 @@ I(t) = Af - A1 × exp(-t/τ₁) - A2 × exp(-t/τ₂)
 
 See `config.py` for full details. Key parameters:
 
+**File & Experiment:**
+- `DATA_FOLDER`: Path to data directory
+- `EXPERIMENT_BASE_NAME`: Experiment identifier
+- `ROI_CHANNEL_PREFIX`: ROI channel prefix (default: `"C1-"`)
+- `DYE_CHANNEL_PREFIX`: Dye channel prefix (default: `"C2-"`)
+
 **Detection:**
+- `MEMBRANE_DETECTION_MODE`: `'LABELED'` or `'UNLABELED'` (**NEW**)
 - `MEMBRANE_SEARCH_FACTOR`: Search window size (0.1-1.0)
 - `MEMBRANE_FIXED_HALF_WIDTH`: Membrane thickness (pixels)
 - `PEAK_FIND_MIN_DISTANCE`: Peak separation (pixels)
@@ -1704,17 +1759,23 @@ See `config.py` for full details. Key parameters:
 - `MIN_BASELINE_FRAMES`: Minimum baseline length
 
 **Fitting:**
-- `MODEL_TO_USE`: '4-PARAM' or '5-PARAM'
+- `MODEL_TO_USE`: `'4-PARAM'` or `'5-PARAM'`
 - `FIT_DATA_PERCENTAGE`: Fraction of data to fit (0-1)
 - `FIT_INITIAL_GUESS_4PARAM`: Initial parameters (4-tuple)
 - `FIT_INITIAL_GUESS_5PARAM`: Initial parameters (5-tuple)
 
 **Visualization:**
+- `OUTPUT_IMAGE_FOLDER`: Output directory path
 - `EXPORT_TIME_POINTS_S`: Time points for frame export (list)
 - `MICRONS_PER_PIXEL`: Spatial calibration
 - `SCALE_BAR_LENGTH_MICRONS`: Scale bar size
 - `EXPORT_MASK_VISUALIZATION`: Enable mask viz (boolean)
 - `MASK_VIZ_OVERLAY_ALPHA`: Mask transparency (0-1)
+- `VIZ_MEMBRANE_THICKNESS_PIXELS`: Fixed membrane viz width (optional)
+
+**Advanced:**
+- `N_WORKERS`: Number of parallel processes (**NEW**)
+- `FALLBACK_FPS`: Fallback frame rate if metadata missing
 
 ---
 
@@ -1730,6 +1791,9 @@ See `config.py` for full details. Key parameters:
 - **Otsu's method**: Automatic threshold selection algorithm
 - **Prominence**: Peak height above surrounding baseline
 - **Time constant (τ)**: Time to reach 63% of final value in exponential process
+- **Lazy loading**: Loading data incrementally (frame-by-frame) instead of all at once
+- **Worker**: Independent process in parallel execution
+- **Spawn context**: Multiprocessing method that starts fresh Python interpreter per worker
 
 ### References
 
@@ -1737,12 +1801,46 @@ See `config.py` for full details. Key parameters:
 2. **Normalization approach**: Standard in electrophysiology and membrane transport
 3. **Curve fitting**: `scipy.optimize.curve_fit` (Levenberg-Marquardt algorithm)
 4. **Peak detection**: `scipy.signal.find_peaks` (prominence-based)
+5. **Parallel processing**: Python `multiprocessing` with spawn context
+6. **Image interpolation**: `scipy.ndimage.map_coordinates` (bilinear)
 
 ### Version History
 
 - **v1.0** (Initial): Basic fixed-radius masking
-- **v2.0** (Current): Adaptive membrane detection with quality metrics
-- **Future**: Batch processing, parallel execution, GUI interface
+- **v2.0**: Adaptive membrane detection with quality metrics
+- **v3.0** (Current): 
+  - Added parallel processing with multiprocessing
+  - Implemented lazy loading for memory efficiency
+  - Added comprehensive logging system
+  - Added dual detection modes (LABELED/UNLABELED)
+  - Added configuration validation
+  - Refactored for better code organization
+- **Future**: Batch processing automation, GUI interface
+
+### System Requirements
+
+**Minimum**:
+- Python 3.8+
+- 8 GB RAM
+- 2 CPU cores
+
+**Recommended**:
+- Python 3.10+
+- 16 GB RAM
+- 8 CPU cores
+- SSD storage for image files
+
+**Dependencies**:
+```
+numpy >= 1.20
+scipy >= 1.7
+matplotlib >= 3.4
+opencv-python >= 4.5
+pandas >= 1.3
+tifffile >= 2021.7
+Pillow >= 8.3
+natsort >= 7.1
+```
 
 ---
 

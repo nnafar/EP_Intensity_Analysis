@@ -5,6 +5,7 @@
 ======================================================
 This enhanced version includes membrane detection from radial intensity profiles.
 It incorporates gradient-based and hybrid methods for more robust detection.
+Supports 'LABELED' (fluorescence) and 'UNLABELED' (brightfield) modes.
 """
 
 # --- Core Packages ---
@@ -34,14 +35,12 @@ import guv_analysis_utils as utils # Imports itself for internal calls
 
 
 # -------------------------------------------------------------------
-# --- 0. LOGGING SETUP (NEW) ---
+# --- 0. LOGGING SETUP ---
 # -------------------------------------------------------------------
 
 def setup_logging(output_folder: str, experiment_name: str, level: int = logging.INFO) -> logging.Logger:
     """
     Configures logging to file and console.
-    
-    Based on the recommendation from CODE_REVIEW.md.
     """
     log_filename = os.path.join(
         output_folder, 
@@ -288,50 +287,15 @@ def membrane_search(
     search_factor: float,
     membrane_half_width: int,
     peak_min_dist: int,      
-    peak_min_prom: float     
+    peak_min_prom: float,
+    detect_bright: bool = True
 ) -> Tuple[int, int, int, List[str], bool]:
     """
-    Detects membrane location by finding the highest peak in a search window.
+    Detects membrane location by finding the highest peak (or deepest valley).
 
     The algorithm searches for the highest intensity peak within a window
-    centered on expected_radius. The membrane boundaries are defined as
-    peak_position ± membrane_half_width. This implementation is based on
-    the code review's recommendation.
-    
-    Parameters
-    ----------
-    profile : np.ndarray
-        1D array of radial intensity values (averaged across angles).
-    radii : np.ndarray
-        1D array of pixel radii corresponding to profile values.
-    expected_radius : int
-        Expected membrane radius in pixels (from CSV).
-    search_factor : float
-        Fractional search window size (e.g., 0.3 = ±30% of expected_radius).
-    membrane_half_width : int
-        Half-width of membrane region in pixels (defines inner/outer boundaries).
-    peak_min_dist : int
-        Minimum distance between detected peaks (pixels).
-    peak_min_prom : float
-        Minimum peak prominence as fraction of max intensity (0-1).
-    
-    Returns
-    -------
-    peak_pos : int
-        Detected membrane peak position in pixels.
-    inner_b : int
-        Inner membrane boundary radius in pixels.
-    outer_b : int
-        Outer membrane boundary radius in pixels.
-    comments : List[str]
-        Quality flags and warnings (empty list if no issues).
-    failed : bool
-        True if detection failed and fallback values were used.
-        
-    Notes
-    -----
-    The profile is smoothed with gaussian_filter1d(sigma=1) before peak detection
-    to reduce sensitivity to noise.
+    centered on expected_radius. If detect_bright is False, it searches for
+    a valley by inverting the profile.
     """
     comments = []
     failed = False
@@ -339,8 +303,17 @@ def membrane_search(
     # --- Smooth the profile to be robust to noise/clusters ---
     profile_smooth = gaussian_filter1d(profile, sigma=1)
     
+    # --- HANDLE DETECTION MODE (Peak vs Valley) ---
+    if detect_bright:
+        # Standard mode: look for high intensity peaks
+        search_profile = profile_smooth
+    else:
+        # Valley mode: Invert profile so valleys become peaks
+        # We subtract profile from max to keep values positive for 'find_peaks'
+        search_profile = np.max(profile_smooth) - profile_smooth
+
     # --- 1. Define search window around hint ---
-    data_to_search = profile_smooth
+    data_to_search = search_profile
     
     min_radius = max(0, expected_radius * (1.0 - search_factor))
     max_radius = expected_radius * (1.0 + search_factor)
@@ -349,23 +322,23 @@ def membrane_search(
     max_idx = np.searchsorted(radii, max_radius, side='right')
     
     if min_idx < max_idx:
-        search_mask = np.zeros_like(profile_smooth)
+        search_mask = np.zeros_like(search_profile)
         search_mask[min_idx:max_idx] = 1.0
-        data_to_search = profile_smooth * search_mask
+        data_to_search = search_profile * search_mask
     else:
         comments.append("invalid_search_window")
     
     # --- 2. Find peaks in the masked, smoothed data ---
     try:
-        max_prof_val = np.max(profile)
-        if max_prof_val == 0:
-            max_prof_val = 1.0
+        max_search_val = np.max(search_profile)
+        if max_search_val == 0:
+            max_search_val = 1.0
             
         peaks, props = find_peaks(
             data_to_search,
-            height=max_prof_val * 0.1,
+            height=max_search_val * 0.1,
             distance=peak_min_dist,     
-            prominence=max_prof_val * peak_min_prom 
+            prominence=max_search_val * peak_min_prom 
         )
 
     except Exception as e:
@@ -422,7 +395,8 @@ def create_guv_masks_with_detection(roi_guide_frame: np.ndarray,
                                    search_factor: float,
                                    membrane_half_width: int,
                                    peak_min_dist: int,      
-                                   peak_min_prom: float,     
+                                   peak_min_prom: float,
+                                   detect_bright: bool = True,
                                    num_angles: int = 360, 
                                    length_excess: float = 1.5,
                                    viz_thickness: Optional[int] = None) -> \
@@ -449,7 +423,8 @@ def create_guv_masks_with_detection(roi_guide_frame: np.ndarray,
         search_factor=search_factor,
         membrane_half_width=membrane_half_width,
         peak_min_dist=peak_min_dist,          
-        peak_min_prom=peak_min_prom           
+        peak_min_prom=peak_min_prom,
+        detect_bright=detect_bright
     )
 
     inner_guv_mask = create_circular_mask(img_shape, center, radius=inner_b)
@@ -489,7 +464,7 @@ def create_guv_masks_with_detection(roi_guide_frame: np.ndarray,
 
 
 # -------------------------------------------------------------------
-# --- 5. PARALLEL WORKER FUNCTION (NEW) ---
+# --- 5. PARALLEL WORKER FUNCTION ---
 # -------------------------------------------------------------------
 
 def process_single_guv(guv_id: str, center_orig: tuple, radius_csv_raw: int, 
@@ -497,9 +472,6 @@ def process_single_guv(guv_id: str, center_orig: tuple, radius_csv_raw: int,
                        roi_frame: np.ndarray, dye_files: list) -> tuple:
     """
     Runs the full analysis pipeline for a single GUV.
-    
-    This function is designed to be run in a parallel process.
-    It has no logger and returns results and quality info.
     """
     
     # --- Assume CSV 'size' is DIAMETER, divide by 2 for radius ---
@@ -516,6 +488,12 @@ def process_single_guv(guv_id: str, center_orig: tuple, radius_csv_raw: int,
     # --- 5a. Define Masks using Membrane Detection ---
     viz_thickness = getattr(cfg, 'VIZ_MEMBRANE_THICKNESS_PIXELS', None)
     
+    # --- HANDLE DETECTION MODE ---
+    # If user sets 'UNLABELED', we look for dark membranes (detect_bright=False)
+    # Default is 'LABELED' (detect_bright=True)
+    mode = getattr(cfg, 'MEMBRANE_DETECTION_MODE', 'LABELED').upper()
+    detect_bright = (mode != 'UNLABELED')
+    
     inner_mask, membrane_mask, background_mask, detection_info = utils.create_guv_masks_with_detection(
         roi_frame, 
         (xc_refined, yc_refined),
@@ -526,6 +504,7 @@ def process_single_guv(guv_id: str, center_orig: tuple, radius_csv_raw: int,
         membrane_half_width=cfg.MEMBRANE_FIXED_HALF_WIDTH,
         peak_min_dist=cfg.PEAK_FIND_MIN_DISTANCE,
         peak_min_prom=cfg.PEAK_FIND_MIN_PROMINENCE,
+        detect_bright=detect_bright,
         num_angles=360,
         length_excess=1.5,
         viz_thickness=viz_thickness
@@ -570,7 +549,7 @@ def process_single_guv(guv_id: str, center_orig: tuple, radius_csv_raw: int,
         bg_r_end = detection_info['bg_outer_radius']
         ax.axvspan(bg_r_start, bg_r_end, color='blue', alpha=0.2, label=f'Background Region')
         ax.axvline(x=guv_radius_estimate, color='orange', linestyle=':', label=f"CSV estimate ({guv_radius_estimate}px)")
-        ax.axvline(x=detection_info['peak_position'], color='black', linestyle=':', label=f"Detected Peak ({detection_info['peak_position']:.1f}px)")
+        ax.axvline(x=detection_info['peak_position'], color='black', linestyle=':', label=f"Detected Position ({detection_info['peak_position']:.1f}px)")
         ax.set_xlabel('Radius (pixels)')
         ax.set_ylabel('Intensity (a.u.)')
         ax.set_title(f'Radial Intensity Profile & Regions - GUV {guv_id} (Center: {xc_refined}, {yc_refined})')
@@ -648,8 +627,6 @@ def get_intensity_trace_lazy(file_paths: List[str], mask: np.ndarray) -> np.ndar
     """
     Calculates the average intensity within the mask for every frame
     by loading one frame at a time ("lazy loading").
-    
-    This is the memory-efficient version recommended in CODE_REVIEW.md.
     """
     trace = np.zeros(len(file_paths))
     num_pixels = np.sum(mask)
