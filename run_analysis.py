@@ -3,19 +3,19 @@
 ======================================================
 --- GUV INTENSITY ANALYSIS ---
 ======================================================
-This enhanced version uses radial profile analysis to accurately detect
-the membrane location, adapted from the skeleton.py approach.
+Main execution script.
 
-Key improvements:
-1. Membrane detection from intensity profiles instead of fixed CSV radius
-2. Support for LABELED (Fluorescence) and UNLABELED (Brightfield) membranes
-3. Robust curve fitting with DYNAMIC parameter estimation
-
-REFACTOR NOTES (from CODE_REVIEW.md):
-- main() has been refactored into smaller, single-purpose functions.
-- All print() statements have been replaced with logging.
-- Memory-intensive stack loading has been replaced with lazy loading.
-- GUV processing is parallelized using multiprocessing.
+Pipeline Overview:
+1. Load Data: Images, CSV coordinates, Timestamps.
+2. Process GUVs (Parallel): 
+   - Detect membrane boundaries.
+   - Extract intensity traces.
+   - Detect "Jump" (Dye entry) time.
+3. Normalize:
+   - Calculate Uptake = (Dye - Dye_0) / (Background - Dye_0).
+   - Align all curves so t=0 is the jump time.
+4. Fit: Apply kinetic model to the average curve.
+5. Export: Save plots, CSVs, and images.
 """
 
 # --- Standard Library Imports ---
@@ -43,9 +43,6 @@ import guv_analysis_utils as utils
 def load_input_data(paths: dict, logger: logging.Logger) -> dict:
     """
     Loads all required input files (images, CSV, timestamps).
-    
-    This function combines file discovery, timestamp extraction, and
-    data loading into a single step.
     """
     
     # --- 1a. Load File Names ---
@@ -59,7 +56,7 @@ def load_input_data(paths: dict, logger: logging.Logger) -> dict:
         logger.error(f"No ROI files found matching: {paths['roi_tifs']}")
         return None
         
-    roi_guide_file = roi_guide_files[0] # Only need the first frame for ROI
+    roi_guide_file = roi_guide_files[0] # Only need the first frame for ROI detection
     
     logger.info(f"Loading Dye (measurement) files from: {paths['dye_tifs']}")
     logger.info(f"Loading ROI (guide) files from: {paths['roi_tifs']}")
@@ -82,9 +79,6 @@ def load_input_data(paths: dict, logger: logging.Logger) -> dict:
     logger.info(f"Found frame interval: {frame_interval} seconds. {len(time_array)} timestamps.")
     
     # --- 1c. Load Image Stacks and ROI Data ---
-    # NOTE: We are NOT loading the full dye stack to save memory.
-    # Frames will be loaded one by one during processing.
-    
     logger.info("Loading ROI (C1) guide image...")
     roi_guide_frame = cv2.imread(roi_guide_file, cv2.IMREAD_ANYDEPTH | cv2.IMREAD_GRAYSCALE)
     
@@ -95,6 +89,7 @@ def load_input_data(paths: dict, logger: logging.Logger) -> dict:
     logger.info(f"Loading GUV coordinates from: {paths['csv']}")
     try:
         df_vesicles = pd.read_csv(paths['csv'], comment='#', header=None)
+        # Expecting columns: [id, xc, yc, size, score]
         df_vesicles = df_vesicles.iloc[:, :5]
         df_vesicles.columns = ['id', 'xc', 'yc', 'size', 'score']
         
@@ -120,45 +115,39 @@ def process_all_guvs(guv_data: pd.DataFrame, dye_files: list,
                      roi_frame: np.ndarray, logger: logging.Logger) -> dict:
     """
     Iterates over all GUVs and runs 'process_single_guv' for each
-    in a parallel process pool.
+    using Multiprocessing for speed.
     """
     
     guv_coords = guv_data[['xc', 'yc']].values.astype(int)
     guv_sizes = guv_data['size'].values.astype(int) 
     
-    # --- 1. Create a "partial" function ---
-    # This "freezes" the arguments that are the same for all GUVs.
-    # It's necessary for pool.starmap.
+    # Partial allows us to freeze the 'constant' arguments
     process_func = partial(
-        utils.process_single_guv, # This function is now in utils
+        utils.process_single_guv,
         roi_frame=roi_frame,
         dye_files=dye_files
     )
 
-    # --- 2. Create the list of tasks ---
-    # Each item is a tuple of the arguments for one GUV
+    # Prepare arguments for each worker
     tasks = []
     for i, (xc, yc) in enumerate(guv_coords):
         tasks.append((
             guv_data.loc[i, 'id'],
             (xc, yc),
             guv_sizes[i],
-            (i == 0) # is_first_guv flag
+            (i == 0) # Flag to force mask visualization for the first GUV
         ))
 
     logger.info(f"Starting parallel processing of {len(tasks)} GUVs using {cfg.N_WORKERS} workers...")
 
-    # --- 3. Run the parallel pool ---
-    # We must use 'spawn' context for cross-platform compatibility
+    # 'spawn' context is safer for Windows/Mac compatibility with OpenCV
     mp_context = multiprocessing.get_context('spawn')
     with mp_context.Pool(processes=cfg.N_WORKERS) as pool:
-        # starmap unpacks the argument tuples from 'tasks'
-        # and passes them to 'process_func'
         results = pool.starmap(process_func, tasks)
         
     logger.info("...Parallel processing complete.")
 
-    # --- 4. Process results and log quality ---
+    # Unpack Results
     all_intensity_curves = []
     all_background_curves = [] 
     all_jump_frames = []
@@ -169,7 +158,6 @@ def process_all_guvs(guv_data: pd.DataFrame, dye_files: list,
         guv_id = quality_entry['guv_id']
         detection_quality_log.append(quality_entry)
         
-        # Log the quality results *now*
         if quality_entry['failed'] or quality_entry['comments'] != 'OK':
             logger.warning(f"  - GUV {guv_id}: Detection failed or has warnings: {quality_entry['comments']}")
         else:
@@ -185,21 +173,11 @@ def process_all_guvs(guv_data: pd.DataFrame, dye_files: list,
 
     logger.info(f"--- Analysis Complete: {len(all_intensity_curves)} / {len(guv_coords)} GUVs processed ---")
     
-    # Save detection quality log
+    # Save a log file of which GUVs were detected/failed
     df_quality = pd.DataFrame(detection_quality_log)
     quality_log_path = os.path.join(cfg.OUTPUT_IMAGE_FOLDER, f"{cfg.EXPERIMENT_BASE_NAME}_detection_quality.csv")
     df_quality.to_csv(quality_log_path, index=False)
-    logger.info(f"Saved detection quality log to: {quality_log_path}")
     
-    # Print summary statistics
-    num_failed = df_quality['failed'].sum()
-    num_with_warnings = (df_quality['comments'] != 'OK').sum()
-    logger.info("Detection Summary:")
-    logger.info(f"  - Total GUVs: {len(df_quality)}")
-    logger.info(f"  - Failed detections: {num_failed}")
-    logger.info(f"  - Detections with warnings: {num_with_warnings}")
-    logger.info(f"  - Clean detections: {len(df_quality) - num_with_warnings}")
-
     return {
         "all_intensity_curves": all_intensity_curves,
         "all_background_curves": all_background_curves,
@@ -214,8 +192,8 @@ def process_all_guvs(guv_data: pd.DataFrame, dye_files: list,
 def normalize_and_align_curves(guv_results: dict, time_array: np.ndarray, 
                                all_guv_ids: np.ndarray, logger: logging.Logger) -> dict:
     """
-    Normalizes all traces using three-term equation and aligns them
-    to the median jump frame.
+    Normalizes raw intensity using the background and baseline, 
+    then aligns all curves in time so the 'Jump' happens at t=0.
     """
     
     logger.info("Normalizing intensity curves using $I_{uptake} = (I_{dye,t} - I_{dye,0}) / (I_{background,t} - I_{dye,0})$...")
@@ -227,12 +205,16 @@ def normalize_and_align_curves(guv_results: dict, time_array: np.ndarray,
         guv_results['all_background_curves'], 
         guv_results['all_jump_frames']
     )):
+        # Determine baseline window (must be before the jump)
         baseline_frames_end = max(cfg.MIN_BASELINE_FRAMES, jump_f)
         if baseline_frames_end >= len(dye_trace):
              logger.warning(f"  - Skipping GUV {idx+1} due to insufficient baseline frames.")
              continue
              
+        # Calculate initial dye intensity (I_dye_0)
         I_dye_0 = np.mean(dye_trace[:baseline_frames_end])
+        
+        # Calculate Normalization
         denominator = bg_trace - I_dye_0
         numerator = dye_trace - I_dye_0
         
@@ -248,27 +230,31 @@ def normalize_and_align_curves(guv_results: dict, time_array: np.ndarray,
 
     all_intensity_curves = normalized_curves
     
-    # --- 6. Calculate Average Curve (and perform alignment) ---
+    # --- ALIGNMENT ---
     curve_array_original = np.array(all_intensity_curves)
-    
     valid_jump_frames = np.array(guv_results['all_jump_frames'])
-    median_jump_frame = int(np.median(valid_jump_frames))
+    
+    # We align to the MEDIAN jump frame to keep the timeline consistent for all
+    valid_jumps_nonzero = valid_jump_frames[valid_jump_frames > 0]
+    if len(valid_jumps_nonzero) > 0:
+        median_jump_frame = int(np.median(valid_jumps_nonzero))
+    else:
+        median_jump_frame = 0
+        
     logger.info(f"Aligning all data using the median jump frame index: {median_jump_frame}")
     
     total_frames_original = len(time_array)
     if median_jump_frame >= total_frames_original:
-        logger.error(f"Median jump frame {median_jump_frame} is out of bounds. Capping at 0.")
         median_jump_frame = 0
     
-    # Slice the time array from the median jump frame and re-zero it
+    # Reset Time: The median jump frame becomes t=0
     t_aligned = time_array[median_jump_frame:]
     t_aligned = t_aligned - t_aligned[0]
     
-    # Slice the curve data
+    # Slice Curves: Remove pre-jump data
     average_curve = np.mean(curve_array_original[:, median_jump_frame:], axis=0)
     curve_array = curve_array_original[:, median_jump_frame:]
     
-    # Get the original GUV IDs for the curves that were successfully normalized
     valid_guv_ids = all_guv_ids[guv_results['valid_guv_indices']]
 
     return {
@@ -283,111 +269,70 @@ def normalize_and_align_curves(guv_results: dict, time_array: np.ndarray,
 def fit_average_curve(t_aligned: np.ndarray, average_curve: np.ndarray, 
                       logger: logging.Logger) -> dict:
     """
-    Fits the average normalized curve to the model specified in config.
-    INCLUDES DYNAMIC PARAMETER ESTIMATION AND BOUNDS.
+    Fits the averaged normalized curve to the kinetic model specified in config.
     """
+
     logger.info(f"Fitting average curve to model: {cfg.MODEL_TO_USE}...")
     
+    # Slice data for fitting (e.g., ignore last 10%)
     total_frames = len(t_aligned)
     fit_slice_index = int(np.round(total_frames * cfg.FIT_DATA_PERCENTAGE))
-    fit_slice_index = min(fit_slice_index, total_frames) # Ensure in bounds
+    fit_slice_index = min(fit_slice_index, total_frames) 
     
-    # Extract data slice for fitting
     t_fit = t_aligned[:fit_slice_index]
     y_fit = average_curve[:fit_slice_index]
         
     logger.info(f"Fitting first {cfg.FIT_DATA_PERCENTAGE*100:.0f}% of aligned data ({fit_slice_index} frames).")
 
     # --- DYNAMIC INITIAL GUESS ESTIMATION ---
-    # Calculate basic stats to estimate starting point
+    # Helps the optimizer converge by guessing reasonable starting values
     y_min = np.min(y_fit)
     y_max = np.max(y_fit)
-    
-    # Estimate Amplitude (A)
     A_est = y_max - y_min
-    
-    # Estimate Offset
     offset_est = y_min
     
-    # Estimate Tau (time to reach ~63% of rise)
+    # Guess Tau (time to reach ~63% of rise)
     try:
         threshold = y_min + 0.63 * A_est
-        # Find first index where curve crosses threshold
         idx_tau = np.argmax(y_fit > threshold)
         if idx_tau == 0 and y_fit[0] < threshold:
-             # If argmax returned 0 but it wasn't actually crossed (e.g. flat line), use default
              tau_est = t_fit[-1] / 2.0
         else:
              tau_est = t_fit[idx_tau]
     except Exception:
         tau_est = t_fit[-1] / 5.0
-        
-    # Safety for tau
     if tau_est <= 0: tau_est = 10.0
 
-    # --- DEFINE BOUNDS AND INITIAL GUESSES ---
+    # --- CONFIGURE MODEL & BOUNDS ---
     if cfg.MODEL_TO_USE == '5-PARAM':
-        # Params: Af, A1, tau1, A2, tau2
         fit_function = utils.dyn_model_5param
-        
-        # Dynamic guess for 5-param is harder, using split
-        p0_guess = (
-            y_max,           # Af
-            A_est * 0.5,     # A1
-            tau_est * 0.5,   # tau1
-            A_est * 0.5,     # A2
-            tau_est * 2.0    # tau2
-        )
-        
-        bounds = (
-            (-1.0, -10.0, 0.01, -10.0, 0.01),  # Lower bounds
-            ( 10.0, 10.0, 5000.0, 10.0, 5000.0) # Upper bounds
-        )
+        # Guess: (Af, A1, tau1, A2, tau2)
+        p0_guess = (y_max, A_est * 0.5, tau_est * 0.5, A_est * 0.5, tau_est * 2.0)
+        bounds = ((-1.0, -10.0, 0.01, -10.0, 0.01), (10.0, 10.0, 5000.0, 10.0, 5000.0))
         
     elif cfg.MODEL_TO_USE == '4-PARAM':
-        # Params: I_offset, A, tau, D
         fit_function = utils.dyn_model_4param
-        
-        p0_guess = (
-            offset_est, # I_offset
-            A_est,      # A
-            tau_est,    # tau
-            0.0         # D (drift)
-        )
-        
-        bounds = (
-            (-2.0, -0.2, 0.01, -0.1),   # Lower bounds
-            ( 2.0,  10.0, 5000.0, 0.1)   # Upper bounds
-        )
-        
+        # Guess: (Offset, A, tau, drift)
+        p0_guess = (offset_est, A_est, tau_est, 0.0)
+        bounds = ((-2.0, -0.2, 0.01, -0.1), (2.0, 10.0, 5000.0, 0.1))
     else:
-        logger.error(f"Invalid MODEL_TO_USE '{cfg.MODEL_TO_USE}'. Must be '4-PARAM' or '5-PARAM'.")
         raise ValueError("Invalid MODEL_TO_USE specified in config.py.")
 
     logger.info(f"Initial Guesses: {p0_guess}")
 
     try:
-        # Increase maxfev and provide bounds to help convergence on flat/noisy data
-        params, covariance = sc.curve_fit(
-            fit_function, 
-            t_fit, 
-            y_fit, 
-            p0=p0_guess,
-            bounds=bounds, 
-            maxfev=10000   # Increased iterations
-        )
+        params, covariance = sc.curve_fit(fit_function, t_fit, y_fit, p0=p0_guess, bounds=bounds, maxfev=10000)
         fit_failed = False
     except RuntimeError as e:
         logger.error(f"Curve fitting failed: {e}. Using initial guess parameters for output.")
         params = np.array(p0_guess)
         fit_failed = True
         
-    # --- 8. Extract Parameters and Generate Fit Curve ---
+    # Generate the fitted curve for plotting
     if cfg.MODEL_TO_USE == '5-PARAM':
         param_names = ['Af', 'A1', 'tau1', 'A2', 'tau2']
         fit_curve = utils.dyn_model_5param(t_aligned, *params)
         logger.info(f"Fit Complete. Af={params[0]:.2f}, A1={params[1]:.2f}, tau1={params[2]:.2f} s, A2={params[3]:.2f}, tau2={params[4]:.2f} s")
-        
     elif cfg.MODEL_TO_USE == '4-PARAM':
         param_names = ['I_offset', 'A', 'tau', 'D']
         fit_curve = utils.dyn_model_4param(t_aligned, *params)
@@ -409,7 +354,7 @@ def fit_average_curve(t_aligned: np.ndarray, average_curve: np.ndarray,
 def export_results(aligned_data: dict, fit_results: dict, dye_files: list, 
                    logger: logging.Logger):
     """
-    Exports all final plots, images, and CSV files.
+    Exports all final plots, images, and CSV files to the output folder.
     """
     
     t = aligned_data['t_aligned']
@@ -422,57 +367,44 @@ def export_results(aligned_data: dict, fit_results: dict, dye_files: list,
     fit_params = fit_results['params']
     fit_slice_index = fit_results['fit_slice_index']
     
-    # Get the list of file paths aligned to the jump frame
+    # Get the file list corresponding to the aligned timeframe
     dye_files_aligned = dye_files[aligned_data['median_jump_frame']:]
     
-    
-    # --- 9. Export Representative Frames ---
+    # --- EXPORT SNAPSHOT FRAMES ---
     logger.info("Exporting representative frames...")
-    
     for i, time_point in enumerate(cfg.EXPORT_TIME_POINTS_S):
         frame_idx, actual_time = utils.find_closest_frame(t, time_point)
         
-        if frame_idx >= len(dye_files_aligned):
-            logger.warning(f"  - Time point {time_point}s (frame {frame_idx}) is out of range. Skipping.")
-            continue
+        if frame_idx >= len(dye_files_aligned): continue
             
-        # Load only the specific frame we need
         frame_path = dye_files_aligned[frame_idx]
         frame_data = cv2.imread(frame_path, cv2.IMREAD_ANYDEPTH | cv2.IMREAD_GRAYSCALE)
         
-        if frame_data is None:
-            logger.warning(f"  - Could not load frame {frame_path}. Skipping.")
-            continue
+        if frame_data is None: continue
             
         label = f"{int(np.round(time_point))} S" 
-        
-        styled_frame = utils.style_image(
-            frame_data, 
-            label, 
-            cfg.MICRONS_PER_PIXEL,
-            cfg.SCALE_BAR_LENGTH_MICRONS
-            )
-        out_name = f"frame_{i+1}_at_{int(np.round(time_point))}s.png"
-        out_path = os.path.join(cfg.OUTPUT_IMAGE_FOLDER, out_name)
-        cv2.imwrite(out_path, styled_frame)
-        logger.info(f"  - Saved {out_name} (actual time: {actual_time:.3f}s relative to pulse)")
+        styled_frame = utils.style_image(frame_data, label, cfg.MICRONS_PER_PIXEL, cfg.SCALE_BAR_LENGTH_MICRONS)
+        cv2.imwrite(os.path.join(cfg.OUTPUT_IMAGE_FOLDER, f"frame_{i+1}_at_{int(np.round(time_point))}s.png"), styled_frame)
         
     logger.info("Frame export complete.")
 
-    # --- 10. PLOT KINETIC RESULTS (Summary Plot) ---
+    # --- PLOT KINETIC RESULTS ---
     logger.info("Generating summary plot...")
     fig,ax = plt.subplots(nrows=1,ncols=1, figsize=(10, 6))
     
+    # Plot faint lines for individual traces
     for curve in curve_array:
         ax.plot(t[:len(curve)], curve, color='gray', alpha=0.2)
         
+    # Plot Average and Fit
     ax.plot(t, average_curve, 'r.', markersize=3, label=f'Average (n={len(curve_array)})')
     ax.plot(t, fit_curve, 'k-', linewidth=2, label='Fitted Curve')
     
+    # Mark where the fit data ended
     if fit_slice_index > 0 and fit_slice_index <= len(t):
         ax.plot(t[fit_slice_index-1], average_curve[fit_slice_index-1], 'b*', markersize=10, label='End of Fit Data')
 
-    # Build title
+    # Build informative title with parameters
     if cfg.MODEL_TO_USE == '5-PARAM':
         p = fit_params
         fig_title = f"Fit: $A_f = {p['Af']:.2f}$, $A_1 = {p['A1']:.2f}$, $\\tau_1 = {p['tau1']:.2f}$ s, $A_2 = {p['A2']:.2f}$, $\\tau_2 = {p['tau2']:.2f}$ s"
@@ -480,36 +412,26 @@ def export_results(aligned_data: dict, fit_results: dict, dye_files: list,
         p = fit_params
         fig_title = f"Fit: $I_{{offset}} = {p['I_offset']:.2f}$, $A = {p['A']:.2f}$, $\\tau = {p['tau']:.2f}$ s, $D = {p['D']:.4f}$"
     
-    if fit_failed:
-        fig_title = "FIT FAILED: Using Initial Guess\n" + fig_title
+    if fit_failed: fig_title = "FIT FAILED: Using Initial Guess\n" + fig_title
     ax.set_title(fig_title)
-    
     ax.set_xlabel("Time (s) relative to Electroporation Pulse")
     ax.set_ylabel("Normalized Intensity ($I_{uptake}$)") 
     ax.legend(loc='lower right')
     plt.grid(True)
     
-    plot_name = f"{cfg.EXPERIMENT_BASE_NAME}_kinetic_fit.png"
-    plot_path = os.path.join(cfg.OUTPUT_IMAGE_FOLDER, plot_name)
-    fig.savefig(plot_path, dpi=300, bbox_inches='tight')
+    fig.savefig(os.path.join(cfg.OUTPUT_IMAGE_FOLDER, f"{cfg.EXPERIMENT_BASE_NAME}_kinetic_fit.png"), dpi=300, bbox_inches='tight')
     plt.close(fig)
-    logger.info(f"Saved kinetic plot to: {plot_path}")
+    logger.info(f"Saved kinetic plot.")
 
-    # --- 11. EXPORT NORMALIZED CURVE DATA ---
+    # --- EXPORT NORMALIZED CURVE DATA ---
     logger.info("Exporting normalized curve data to CSV...")
-    
     try:
         headers = ['Time (s)'] + [f'GUV_{gid}_I_uptake' for gid in valid_guv_ids] + ['Average_I_uptake']
         t_col = t.reshape(-1, 1)
         avg_col = average_curve.reshape(-1, 1)
-        
         data_to_save = np.hstack((t_col, curve_array.T, avg_col))
         df_curves = pd.DataFrame(data_to_save, columns=headers)
-        
-        curves_csv_path = os.path.join(cfg.OUTPUT_IMAGE_FOLDER, f"{cfg.EXPERIMENT_BASE_NAME}_normalized_curves.csv")
-        df_curves.to_csv(curves_csv_path, index=False, float_format='%.6f')
-        logger.info(f"  - Saved normalized data to: {curves_csv_path}")
-        
+        df_curves.to_csv(os.path.join(cfg.OUTPUT_IMAGE_FOLDER, f"{cfg.EXPERIMENT_BASE_NAME}_normalized_curves.csv"), index=False, float_format='%.6f')
     except Exception as e:
         logger.warning(f"  - Could not export normalized curve CSV: {e}")
 
@@ -519,58 +441,25 @@ def export_results(aligned_data: dict, fit_results: dict, dye_files: list,
 
 def validate_config(logger: logging.Logger) -> bool:
     """
-    Validates parameters from config.py to prevent common user errors.
-    Based on recommendation from CODE_REVIEW.md.
+    Validates parameters from config.py.
     """
     is_valid = True
-    
-    # --- 1. Path Validation ---
     if not os.path.exists(cfg.DATA_FOLDER):
         logger.error(f"Config Error: DATA_FOLDER does not exist: {cfg.DATA_FOLDER}")
         is_valid = False
-        
-    # --- 2. Detection Parameters ---
     if not (0.1 <= cfg.MEMBRANE_SEARCH_FACTOR <= 1.0):
-        logger.error(f"Config Error: MEMBRANE_SEARCH_FACTOR must be between 0.1 and 1.0, but got {cfg.MEMBRANE_SEARCH_FACTOR}")
+        logger.error(f"Config Error: MEMBRANE_SEARCH_FACTOR invalid.")
         is_valid = False
-        
-    if not (isinstance(cfg.MEMBRANE_FIXED_HALF_WIDTH, int) and cfg.MEMBRANE_FIXED_HALF_WIDTH >= 1):
-        logger.error(f"Config Error: MEMBRANE_FIXED_HALF_WIDTH must be an integer >= 1, but got {cfg.MEMBRANE_FIXED_HALF_WIDTH}")
-        is_valid = False
-        
-    if not (isinstance(cfg.BG_BUFFER_PIXELS, int) and cfg.BG_BUFFER_PIXELS >= 0):
-        logger.error(f"Config Error: BG_BUFFER_PIXELS must be an integer >= 0, but got {cfg.BG_BUFFER_PIXELS}")
-        is_valid = False
-
-    # --- 2b. Membrane Detection Mode Validation (NEW) ---
-    # We now check the MODE string instead of the boolean
-    valid_modes = ['LABELED', 'UNLABELED']
-    mode = getattr(cfg, 'MEMBRANE_DETECTION_MODE', 'LABELED')
-    if mode.upper() not in valid_modes:
-         logger.error(f"Config Error: MEMBRANE_DETECTION_MODE must be 'LABELED' or 'UNLABELED'. Got '{mode}'")
-         is_valid = False
-
-    # --- 3. Fitting Parameters ---
     if cfg.MODEL_TO_USE not in ['4-PARAM', '5-PARAM']:
-        logger.error(f"Config Error: MODEL_TO_USE must be '4-PARAM' or '5-PARAM', but got '{cfg.MODEL_TO_USE}'")
+        logger.error(f"Config Error: MODEL_TO_USE must be '4-PARAM' or '5-PARAM'")
         is_valid = False
-        
-    if not (0.1 <= cfg.FIT_DATA_PERCENTAGE <= 1.0):
-        logger.warning(f"Config Warning: FIT_DATA_PERCENTAGE is {cfg.FIT_DATA_PERCENTAGE}. Recommended range is 0.1 to 1.0.")
-        
-    # --- 4. Visualization ---
-    if not (0.0 <= cfg.MICRONS_PER_PIXEL):
-        logger.error(f"Config Error: MICRONS_PER_PIXEL must be >= 0, but got {cfg.MICRONS_PER_PIXEL}")
+    
+    # Validate Threshold
+    if not (0.05 <= getattr(cfg, 'JUMP_THRESHOLD_PERCENT', 0.20) <= 0.90):
+        logger.error("Config Error: JUMP_THRESHOLD_PERCENT should be between 0.05 and 0.90")
         is_valid = False
 
-    # --- 5. Advanced ---
-    if not (isinstance(cfg.N_WORKERS, int) and cfg.N_WORKERS >= 1):
-        logger.error(f"Config Error: N_WORKERS must be an integer >= 1, but got {cfg.N_WORKERS}")
-        is_valid = False
-
-    if not is_valid:
-        logger.critical("Configuration validation failed. Please correct config.py.")
-        
+    if not is_valid: logger.critical("Configuration validation failed.")
     return is_valid
 
 # -------------------------------------------------------------------
@@ -578,18 +467,11 @@ def validate_config(logger: logging.Logger) -> bool:
 # -------------------------------------------------------------------
 
 def main():
-    """Main analysis orchestration function."""
-    
-    # --- 1. Setup Paths & Logger ---
-    # Ensure output directory exists *before* initializing logger
     os.makedirs(cfg.OUTPUT_IMAGE_FOLDER, exist_ok=True)
-    
     logger = utils.setup_logging(cfg.OUTPUT_IMAGE_FOLDER, cfg.EXPERIMENT_BASE_NAME)
     logger.info("--- GUV Analysis Pipeline Started ---")
     
-    # --- 1b. Validate Configuration ---
-    if not validate_config(logger):
-        return  # Stop execution if config is invalid
+    if not validate_config(logger): return 
     
     try:
         paths = {
@@ -598,13 +480,9 @@ def main():
             'csv': os.path.join(cfg.DATA_FOLDER, cfg.ROI_CHANNEL_PREFIX + cfg.EXPERIMENT_BASE_NAME + cfg.CSV_SUFFIX)
         }
 
-        # --- 2. Load Input Data ---
         input_data = load_input_data(paths, logger)
-        if input_data is None:
-            logger.critical("Failed to load input data. Exiting.")
-            return
+        if input_data is None: return
 
-        # --- 3. Process GUVs ---
         guv_results = process_all_guvs(
             input_data['guv_data'], 
             input_data['dye_files'], 
@@ -612,42 +490,23 @@ def main():
             logger
         )
         
-        if not guv_results['all_intensity_curves']:
-            logger.error("No valid intensity curves were processed. Cannot continue to fitting.")
-            return
+        if not guv_results['all_intensity_curves']: return
 
-        # --- 4. Normalize & Align ---
         aligned_data = normalize_and_align_curves(
             guv_results, 
             input_data['time_array'], 
             input_data['guv_data']['id'].values,
             logger
         )
-        if aligned_data is None:
-            logger.error("Normalization and alignment failed. Exiting.")
-            return
+        if aligned_data is None: return
 
-        # --- 5. Fit Model ---
-        fit_results = fit_average_curve(
-            aligned_data['t_aligned'], 
-            aligned_data['average_curve'],
-            logger
-        )
-
-        # --- 6. Export Results ---
-        export_results(
-            aligned_data,
-            fit_results,
-            input_data['dye_files'], # Pass the file list
-            logger
-        )
+        fit_results = fit_average_curve(aligned_data['t_aligned'], aligned_data['average_curve'], logger)
+        export_results(aligned_data, fit_results, input_data['dye_files'], logger)
         
         logger.info("--- GUV Analysis Pipeline Finished Successfully ---")
         
     except Exception as e:
-        # Catch any unhandled exceptions
         logger.critical(f"An unhandled exception occurred in main: {e}", exc_info=True)
-
 
 if __name__ == "__main__":
     main()
