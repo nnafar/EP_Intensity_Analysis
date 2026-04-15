@@ -63,28 +63,15 @@ PEAK_FIND_MIN_DISTANCE   = 5
 PEAK_FIND_MIN_PROMINENCE = 0.05
 
 # Background annulus geometry
-BG_BUFFER_PIXELS     = 1     # gap (px) between outer membrane edge and bg ring start
+BG_BUFFER_PIXELS     = 1    # gap (px) between outer membrane edge and bg ring start
 BG_RING_WIDTH_PIXELS = 4    # width (px) of background sampling ring
 
-
 # -------------------------------------------------------------------
-# --- 3. JUMP DETECTION ---
-# -------------------------------------------------------------------
-
-# Fraction of the (Max−Min) range the signal must cross to be called a jump.
-# 0.20 is robust; decrease for more sensitivity, increase for less noise.
-JUMP_THRESHOLD_PERCENT = 0.20
-
-# Minimum frames before the jump used for baseline (I₀) calculation.
-MIN_BASELINE_FRAMES = 3
-
-
-# -------------------------------------------------------------------
-# --- 4. FITTING & MODELING ---
+# --- 3. FITTING & MODELING ---
 # -------------------------------------------------------------------
 
 # ['EFFLUX-1EXP' or 'EFFLUX-2EXP'] ['INFLUX-1EXP' or 'INFLUX-2EXP']
-MODEL_TO_USE        = 'EFFLUX-1EXP' 
+MODEL_TO_USE        = 'EFFLUX-2EXP' 
 FIT_DATA_PERCENTAGE = 0.9
 
 FIT_INITIAL_GUESS_5PARAM = (1.0,  0.5,  10.0, 0.5, 100.0)
@@ -92,7 +79,7 @@ FIT_INITIAL_GUESS_4PARAM = (0.0,  1.0,  50.0, 0.001)
 
 
 # -------------------------------------------------------------------
-# --- 5. OUTPUT & VISUALIZATION ---
+# --- 4. OUTPUT & VISUALIZATION ---
 # -------------------------------------------------------------------
 
 OUTPUT_IMAGE_FOLDER      = os.path.join(DATA_FOLDER, "output_images")
@@ -102,7 +89,11 @@ EXPORT_DEBUG_PLOTS       = True
 MICRONS_PER_PIXEL        = 0.11 # Plan Apo λ 60x Oil
 SCALE_BAR_LENGTH_MICRONS = 10
 
-EXPORT_MASK_VISUALIZATION     = True
+# Percentiles for contrast boosting (Lower p_low or lower p_high = more contrast)
+CONTRAST_P_LOW  = 0.5  # Ignore bottom 0.5% of pixels
+CONTRAST_P_HIGH = 98.0 # Ignore top 2.0% of pixels
+
+EXPORT_MASK_VISUALIZATION     = False
 MASK_VIZ_OVERLAY_ALPHA        = 0.8
 VIZ_MEMBRANE_THICKNESS_PIXELS = None
 
@@ -113,7 +104,7 @@ VIDEO_EXPORT_FPS                = 10.0
 
 
 # -------------------------------------------------------------------
-# --- 6. TRACKING PARAMETERS ---
+# --- 5. TRACKING PARAMETERS ---
 # -------------------------------------------------------------------
 
 # Add this flag to disable dye analysis
@@ -154,7 +145,7 @@ EXPORT_TRACK_VISUALIZATION = True
 
 
 # -------------------------------------------------------------------
-# --- 7. ADVANCED ---
+# --- 6. ADVANCED ---
 # -------------------------------------------------------------------
 
 N_WORKERS    = 3 #os.cpu_count() - 1 if os.cpu_count() > 1 else 1

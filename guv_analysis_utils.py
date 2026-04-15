@@ -16,6 +16,7 @@ import cv2
 import pandas as pd
 import os
 import re
+from tqdm import tqdm
 import logging
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
@@ -119,11 +120,16 @@ def efflux_2exp(t, Iinf, a1, tau1, a2, tau2, D=0):
 # -------------------------------------------------------------------
 
 def _convert_to_8bit_gray(image: np.ndarray) -> np.ndarray:
+    """ Boosts contrast by clipping outliers before normalizing to 8-bit. """
+    p_low  = getattr(cfg, 'CONTRAST_P_LOW', 1.0)
+    p_high = getattr(cfg, 'CONTRAST_P_HIGH', 99.0)
+    
     img = image[:, :, 0] if image.ndim == 3 else image
     if img.dtype != np.uint8:
-        return cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
+        low, high = np.percentile(img, (p_low, p_high))
+        img_clipped = np.clip(img, low, high)
+        return cv2.normalize(img_clipped, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
     return img
-
 def generate_vectorized_masks(shape, center, axes, angle, mem_hw, bg_buf, bg_w) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Generates inner, membrane, and background boolean masks simultaneously."""
     h, w = shape[:2]
@@ -487,8 +493,6 @@ def track_guv_across_frames(
 # --- 7. INTENSITY EXTRACTION ---
 # -------------------------------------------------------------------
 
-# guv_analysis_utils.py
-
 def get_intensity_trace_tracked(dye_stack: np.ndarray,
                                 n_frames: int,
                                 per_frame_masks: List[Optional[np.ndarray]],
@@ -514,6 +518,11 @@ def get_intensity_trace_tracked(dye_stack: np.ndarray,
         
     return trace
 
+def find_closest_frame(time_array: np.ndarray, target: float) -> Tuple[int, float]:
+    """Find the index and actual time value closest to the target time."""
+    idx = int(np.abs(time_array - target).argmin())
+    return idx, float(time_array[idx])
+
 
 # -------------------------------------------------------------------
 # --- 8. PARALLEL WORKER ---
@@ -528,172 +537,75 @@ def process_single_guv(guv_id: str,
                         n_frames: int) -> Tuple:
     """
     Full analysis pipeline for a single GUV using frame-by-frame tracking.
+    Modified to strip heavy masks and return only coordinate data to save RAM.
     """
     detect_bright = (getattr(cfg, 'MEMBRANE_DETECTION_MODE', 'LABELED').upper() != 'UNLABELED')
 
-    # Reconstruct the memmaps in read-only mode for this specific worker process
     roi_path, roi_shape, roi_dtype = roi_mmap_info
     roi_stack = np.memmap(roi_path, dtype=roi_dtype, mode='r', shape=roi_shape)
     
+    dye_stack = None
     if dye_mmap_info[0] is not None:
         dye_path, dye_shape, dye_dtype = dye_mmap_info
         dye_stack = np.memmap(dye_path, dtype=dye_dtype, mode='r', shape=dye_shape)
-    else:
-        dye_stack = None
 
-    # ── Track GUV across all frames ────────────────────────────────────────
+    # --- 1. Track GUV ---
     tracking = track_guv_across_frames(
-        roi_stack        = roi_stack,
-        n_frames         = n_frames,
-        initial_center   = initial_center,
-        initial_radius   = initial_radius,
-        search_window_factor    = getattr(cfg, 'TRACKING_SEARCH_WINDOW_FACTOR', 0.7),
-        grid_step_factor        = getattr(cfg, 'TRACKING_GRID_STEP_FACTOR', 0.15),
-        search_factor           = cfg.MEMBRANE_SEARCH_FACTOR,
-        membrane_half_width     = cfg.MEMBRANE_FIXED_HALF_WIDTH,
-        detect_bright           = detect_bright,
-        bg_buffer               = cfg.BG_BUFFER_PIXELS,
-        bg_width                = cfg.BG_RING_WIDTH_PIXELS,
-        max_radius_change_factor   = getattr(cfg, 'TRACKING_MAX_RADIUS_CHANGE_FACTOR', 0.20),
-        rupture_score_threshold    = getattr(cfg, 'RUPTURE_SCORE_THRESHOLD', 4.0),
-        rupture_consecutive_fails  = getattr(cfg, 'RUPTURE_DETECTION_CONSECUTIVE_FAILS', 3),
+        roi_stack=roi_stack, n_frames=n_frames, 
+        initial_center=initial_center, initial_radius=initial_radius,
+        search_window_factor=getattr(cfg, 'TRACKING_SEARCH_WINDOW_FACTOR', 0.7),
+        grid_step_factor=getattr(cfg, 'TRACKING_GRID_STEP_FACTOR', 0.15),
+        search_factor=cfg.MEMBRANE_SEARCH_FACTOR,
+        membrane_half_width=cfg.MEMBRANE_FIXED_HALF_WIDTH,
+        detect_bright=detect_bright,
+        bg_buffer=cfg.BG_BUFFER_PIXELS,
+        bg_width=cfg.BG_RING_WIDTH_PIXELS,
+        max_radius_change_factor=getattr(cfg, 'TRACKING_MAX_RADIUS_CHANGE_FACTOR', 0.20),
+        rupture_score_threshold=getattr(cfg, 'RUPTURE_SCORE_THRESHOLD', 4.0),
+        rupture_consecutive_fails=getattr(cfg, 'RUPTURE_DETECTION_CONSECUTIVE_FAILS', 3),
     )
 
-    ruptured_at = tracking['ruptured_at']
-    n_valid     = tracking['n_valid_frames']
-
-    quality_entry = {
-        'guv_id':            guv_id,
-        'initial_radius':    initial_radius,
-        'failed':            ruptured_at is not None,
-        'ruptured_at_frame': ruptured_at,
-        'n_valid_frames':    n_valid,
-        'mean_ring_score':   float(np.mean([s for s in tracking['ring_scores'] if s > 0])) if n_valid > 0 else 0.0,
-        'comments':          f"RUPTURED_AT_F{ruptured_at}" if ruptured_at is not None else 'OK',
-    }
-
-    # ── Export first-frame mask visualisation ──────────────────────────────
-    if cfg.EXPORT_MASK_VISUALIZATION and (quality_entry['failed'] or is_first_guv):
-        if tracking['inner_masks'][0] is not None:
-            roi_f0 = roi_stack[0].copy()
-            if roi_f0 is not None:
-                mem_m = tracking['mem_masks'][0]
-                if mem_m is None:
-                    c0 = tracking['centers'][0] if tracking['centers'][0] is not None else initial_center
-                    el0 = tracking['ellipses'][0]
-                    ax0 = el0['axes'] if el0 is not None else (initial_radius, initial_radius)
-                    ang0 = el0['angle'] if el0 is not None else 0.0
-                    
-                    _, mem_m, _ = generate_vectorized_masks(
-                        roi_f0.shape, c0, ax0, ang0,
-                        cfg.MEMBRANE_FIXED_HALF_WIDTH,
-                        cfg.BG_BUFFER_PIXELS,
-                        cfg.BG_RING_WIDTH_PIXELS
-                    )
-                viz = create_mask_visualization(roi_f0, tracking['inner_masks'][0],
-                                                mem_m, tracking['bg_masks'][0],
-                                                cfg.MASK_VIZ_OVERLAY_ALPHA)
-                try:
-                    cv2.imwrite(os.path.join(cfg.OUTPUT_IMAGE_FOLDER,
-                               f"{cfg.EXPERIMENT_BASE_NAME}_mask_viz_GUV_{guv_id}.png"), viz)
-                except Exception:
-                    pass
-
-    # ── Export tracking trajectory ─────────────────────────────────────────
-    if getattr(cfg, 'EXPORT_TRACK_VISUALIZATION', True):
-        try:
-            export_track_visualization(
-                cfg.OUTPUT_IMAGE_FOLDER, cfg.EXPERIMENT_BASE_NAME, guv_id,
-                roi_stack, tracking['centers'], tracking['ellipses'],
-                tracking['ring_scores'], ruptured_at
-            )
-        except Exception:
-            pass
-        
-    if getattr(cfg, 'EXPORT_TRACK_VIDEO', False):
-        try:
-            export_track_video(
-                cfg.OUTPUT_IMAGE_FOLDER, cfg.EXPERIMENT_BASE_NAME, guv_id,
-                roi_stack, tracking['centers'], tracking['ellipses'],
-                fps=getattr(cfg, 'VIDEO_EXPORT_FPS', 10.0)
-            )
-        except Exception as e:
-            logging.getLogger(__name__).warning(f"Failed to export video for GUV {guv_id}: {e}")
-    
-    if getattr(cfg, 'TRACKING_ONLY_MODE', False):
-        result = {
-            'intensity_trace':  None,
-            'background_trace': None,
-            'jump_frame':       None,
-            'tracking':         tracking,
-        }
-        return result, quality_entry
-
-    # ── Extract intensity traces ───────────────────────────────────────────
+    # --- 2. Extract Intensity (Calculation happens here while masks are still in RAM) ---
     intensity_trace  = get_intensity_trace_tracked(dye_stack, n_frames, tracking['inner_masks'], method='mean')
     background_trace = get_intensity_trace_tracked(dye_stack, n_frames, tracking['bg_masks'], method='median')
-    trace_for_jump = np.where(np.isnan(intensity_trace), 0.0, intensity_trace)
 
-    if np.all(trace_for_jump == 0) or np.all(np.isnan(intensity_trace)):
-        return None, quality_entry
+    # --- 3. Diagnostics and Export ---
+    ruptured_at = tracking['ruptured_at']
+    n_valid     = tracking['n_valid_frames']
+    
+    quality_entry = {
+        'guv_id': guv_id, 'initial_radius': initial_radius, 'failed': ruptured_at is not None,
+        'ruptured_at_frame': ruptured_at, 'n_valid_frames': n_valid,
+        'mean_ring_score': float(np.mean([s for s in tracking['ring_scores'] if s > 0])) if n_valid > 0 else 0.0,
+        'comments': f"RUPTURED_AT_F{ruptured_at}" if ruptured_at is not None else 'OK',
+    }
 
-    # ── Detect dye-entry jump ──────────────────────────────────────────────
-    try:
-        jump_frame = detect_intensity_jump_robust(
-            trace_for_jump,
-            threshold_percent=getattr(cfg, 'JUMP_THRESHOLD_PERCENT', 0.20)
-        )
-    except Exception:
-        jump_frame = 0
+    match = re.search(r'frame(\d+)', cfg.EXPERIMENT_BASE_NAME)
+    pf = int(match.group(1)) if match else None
+
+    if getattr(cfg, 'EXPORT_TRACK_VISUALIZATION', True):
+        export_track_visualization(cfg.OUTPUT_IMAGE_FOLDER, cfg.EXPERIMENT_BASE_NAME, guv_id,
+                                    roi_stack, tracking['centers'], tracking['ellipses'],
+                                    tracking['ring_scores'], ruptured_at, pulse_frame=pf)
+
+    # --- 4. LIGHTWEIGHT RETURN (Discard heavy masks to prevent MemoryError) ---
+    # We strip 'inner_masks', 'mem_masks', and 'bg_masks' here
+    light_tracking = {
+        'centers':     tracking['centers'],
+        'radii':       tracking['radii'],
+        'ellipses':    tracking['ellipses'],
+        'ring_scores': tracking['ring_scores']
+    }
 
     result = {
         'intensity_trace':  intensity_trace,
         'background_trace': background_trace,
-        'jump_frame':       jump_frame,
-        'tracking':         tracking,
+        'tracking':         light_tracking, 
     }
     return result, quality_entry
 
-
 # -------------------------------------------------------------------
-# --- 9. JUMP DETECTION ---
-# -------------------------------------------------------------------
-
-def detect_intensity_jump_robust(trace: np.ndarray,
-                                  threshold_percent: float = 0.20) -> int:
-    """
-    Detects the 'toe' of the dye-entry step function.
-
-    Uses threshold-crossing rather than gradient peak so that baseline
-    noise does not trigger a false positive at frame 0.
-    """
-    if len(trace) < 5:
-        return 0
-
-    smoothed = gaussian_filter1d(trace, sigma=2)
-    mn, mx   = smoothed.min(), smoothed.max()
-    if (mx - mn) < 20:
-        return 0
-
-    threshold    = mn + threshold_percent * (mx - mn)
-    search_end   = int(len(smoothed) * 0.95)
-    crossings    = np.where(smoothed[:search_end] > threshold)[0]
-
-    if len(crossings) == 0:
-        return 0
-    
-    first     = crossings[0]
-    look_back = min(first, 20)
-    segment   = smoothed[first - look_back: first + 1]
-    return max(0, first - look_back + int(np.argmin(segment)))
-
-def find_closest_frame(time_array: np.ndarray, target: float) -> Tuple[int, float]:
-    idx = int(np.abs(time_array - target).argmin())
-    return idx, float(time_array[idx])
-
-
-# -------------------------------------------------------------------
-# --- 10. VISUALIZATION HELPERS ---
+# --- 9. VISUALIZATION HELPERS ---
 # -------------------------------------------------------------------
 
 def create_mask_visualization(base_image, inner_mask, membrane_mask,
@@ -709,7 +621,7 @@ def create_mask_visualization(base_image, inner_mask, membrane_mask,
 
 def export_track_visualization(output_folder, experiment_name, guv_id,
                                 roi_stack, centers, ellipses, ring_scores,
-                                ruptured_at):
+                                ruptured_at, pulse_frame=None):
     """
     Saves a diagnostic PNG showing the GUV trajectory and ring scores.
     Left panel: last valid ROI frame with centre path overlaid.
@@ -754,7 +666,13 @@ def export_track_visualization(output_folder, experiment_name, guv_id,
     # ── Right: ring score plot ─────────────────────────────────────────────
     fig, ax = plt.subplots(figsize=(5, 3))
     ax.plot(ring_scores, 'b-', lw=1, alpha=0.8, label='Ring score')
+   
+    # Add Pulse Line
+    if pulse_frame is not None:
+        ax.axvline(pulse_frame, color='gray', ls='--', lw=1.5, label='Pulse', zorder=0)
+   
     ax.axhline(getattr(cfg, 'RUPTURE_SCORE_THRESHOLD', 4.0), color='orange', ls='--', lw=1, label='Rupture threshold')
+    
     if ruptured_at is not None:
         ax.axvline(ruptured_at, color='red', ls=':', lw=1, label=f'Rupture F{ruptured_at}')
     ax.set_xlabel("Frame"); ax.set_ylabel("Ring quality score")
@@ -818,13 +736,10 @@ def export_track_video(output_folder: str, experiment_name: str, guv_id: str,
 
     for i, (center, el) in enumerate(zip(centers, ellipses)):
         img = roi_stack[i]
-        if img is None:
-            continue
+        if img is None: continue
 
-        # Apply percentile clipping for visibility
-        p_low, p_high = np.percentile(img, (1, 99.5))
-        clipped = np.clip(img, p_low, p_high)
-        img8 = cv2.normalize(clipped, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U).astype(np.uint8)
+        # Use the improved contrast function here
+        img8 = _convert_to_8bit_gray(img)
         canvas = cv2.cvtColor(img8, cv2.COLOR_GRAY2BGR)
 
         if center is not None and el is not None:
@@ -847,9 +762,8 @@ def export_full_stack_videos(output_folder: str, experiment_name: str,
                              roi_stack: np.ndarray, raw_results: list, 
                              circles: list[dict], fps: float = 10.0):
     """
-    Generates two consolidated videos for all GUVs:
-    1. Tracking: Contours and IDs overlaid on ROI frames.
-    2. Masks: Inner, membrane, and background masks overlaid on ROI frames.
+    Generates consolidated videos by recalculating masks on-the-fly.
+    This prevents the MemoryError seen during data transfer.
     """
     h, w = roi_stack[0].shape[:2]
     n_frames = roi_stack.shape[0]
@@ -861,15 +775,17 @@ def export_full_stack_videos(output_folder: str, experiment_name: str,
     out_track = cv2.VideoWriter(track_path, fourcc, fps, (w, h))
     out_mask = cv2.VideoWriter(mask_path, fourcc, fps, (w, h))
 
-    # Wrap frame loop in tqdm for a progress bar in the console
-    for i in range(n_frames):
+    # Constants needed for on-the-fly masks (pulling from config)
+    mem_hw = cfg.MEMBRANE_FIXED_HALF_WIDTH
+    bg_buf = cfg.BG_BUFFER_PIXELS
+    bg_w   = cfg.BG_RING_WIDTH_PIXELS
+
+    for i in tqdm(range(n_frames), desc="Rendering consolidated videos"):
         frame = roi_stack[i]
         if frame is None: continue
 
         img8 = _convert_to_8bit_gray(frame)
         canvas_track = cv2.cvtColor(img8, cv2.COLOR_GRAY2BGR)
-        
-        # Prepare Mask Frame
         canvas_mask = cv2.cvtColor(img8, cv2.COLOR_GRAY2BGR)
         overlay = np.zeros_like(canvas_mask)
         
@@ -878,29 +794,38 @@ def export_full_stack_videos(output_folder: str, experiment_name: str,
             tr = res.get('tracking', {})
             gid = circles[idx]['id']
             
-            # --- Draw Tracking ---
-            center = tr['centers'][i]
             el = tr['ellipses'][i]
-            if center is not None and el is not None:
-                cv2.ellipse(canvas_track, (int(el['center'][0]), int(el['center'][1])),
-                            (int(el['axes'][0]), int(el['axes'][1])), el['angle'], 
-                            0, 360, (0, 255, 255), 1, cv2.LINE_AA)
-                cv2.putText(canvas_track, f"ID:{gid}", (int(center[0]), int(center[1])),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+            if el is None: continue
 
-            # --- Draw Masks ---
-            inner = tr['inner_masks'][i]
-            mem = tr['mem_masks'][i]
-            bg = tr['bg_masks'][i]
+            # --- Draw Tracking Video ---
+            cv2.ellipse(canvas_track, (int(el['center'][0]), int(el['center'][1])),
+                        (int(el['axes'][0]), int(el['axes'][1])), el['angle'], 
+                        0, 360, (0, 255, 255), 2, cv2.LINE_AA)
+
+            # --- Generate Masks on-the-fly to save memory ---
+            inner_m, mem_m, bg_m = generate_vectorized_masks(
+                (h, w), el['center'], el['axes'], el['angle'],
+                mem_hw, bg_buf, bg_w
+            )
             
-            if inner is not None: overlay[inner] = (201, 87, 188) # Purple
-            if mem is not None:   overlay[mem]   = (82, 0, 249)   # Pink
-            if bg is not None:    overlay[bg]    = (114, 48, 19)  # Dark Blue
-        
-        # Apply mask overlay
+            if inner_m is not None: overlay[inner_m] = (201, 87, 188) # Purple
+            if mem_m is not None:   overlay[mem_m]   = (82, 0, 249)   # Pink
+            if bg_m is not None:    overlay[bg_m]    = (114, 48, 19)  # Dark Blue
+
+        # Finalize Mask Video Frame
         alpha = getattr(cfg, 'MASK_VIZ_OVERLAY_ALPHA', 0.6)
         cv2.addWeighted(canvas_mask, alpha, overlay, 1.0 - alpha, 0, canvas_mask)
         
+        # Draw IDs on top of both
+        for idx, res in enumerate(raw_results):
+            if res is None: continue
+            center = res.get('tracking', {}).get('centers', [None]*n_frames)[i]
+            if center is not None:
+                txt_pos = (int(center[0]), int(center[1]))
+                gid = circles[idx]['id']
+                cv2.putText(canvas_track, f"ID:{gid}", txt_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                cv2.putText(canvas_mask, f"ID:{gid}", txt_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
         out_track.write(canvas_track)
         out_mask.write(canvas_mask)
 
@@ -909,7 +834,7 @@ def export_full_stack_videos(output_folder: str, experiment_name: str,
     
 def plot_tracking_metrics(df: pd.DataFrame, time_array: np.ndarray, 
                           output_folder: str, experiment_name: str, 
-                          um_per_px: float = 1.0):
+                          um_per_px: float = 1.0, pulse_time=None):
     """
     Generates a 3-panel figure plotting Size (Radius), Deformation (Eccentricity),
     and Mean Square Displacement (MSD) for each tracked GUV.
@@ -962,6 +887,12 @@ def plot_tracking_metrics(df: pd.DataFrame, time_array: np.ndarray,
     axes[2].set_title('Mean Square Displacement')
     axes[2].set_xlabel('Frame Lag (frames)')
     axes[2].set_ylabel(r'MSD ($\mu$m$^2$)')
+    
+    # Add Pulse lines to Size and Deformation plots
+    if pulse_time is not None:
+        for i in [0, 1]:
+            axes[i].axvline(pulse_time, color='k', ls='--', alpha=0.5, label='Pulse')
+            axes[i].legend(fontsize=8)
     
     for ax in axes:
         ax.grid(True, alpha=0.3)

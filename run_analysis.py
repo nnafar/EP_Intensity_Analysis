@@ -324,28 +324,31 @@ def process_all_guvs(circles: list[dict],
 # --- 4. NORMALISATION & ALIGNMENT ---
 # -------------------------------------------------------------------
 
+# run_analysis.py
+
 def normalize_and_align_curves(guv_results: dict,
                                 time_array: np.ndarray,
                                 circles: list[dict],
                                 logger: logging.Logger) -> dict | None:
     """
     Normalises: Fractional Retention = (I_dye - I_bg) / (I0 - bg0)
-    Aligns:     t = 0 at the pulse frame.
+    Aligns:     t = 0 at the pulse frame extracted from filename.
     """
     logger.info("Normalising intensity curves for dye efflux...")
     
+    # Extract pulse frame from experiment name (e.g., frame7)
     match = re.search(r'frame(\d+)', cfg.EXPERIMENT_BASE_NAME)
-    PULSE_FRAME = int(match.group(1)) if match else 7
+    PULSE_FRAME = int(match.group(1)) if match else 0
+    
     normalised = []
-
     for dye, bg in zip(guv_results['all_intensity_curves'],
                        guv_results['all_background_curves']):
         if PULSE_FRAME >= len(dye):
             continue
 
+        # Baseline is everything before the pulse
         I0  = float(np.nanmean(dye[:PULSE_FRAME]))
         bg0 = float(np.nanmean(bg[:PULSE_FRAME]))
-        
         den = I0 - bg0
         
         with np.errstate(divide='ignore', invalid='ignore'):
@@ -353,13 +356,13 @@ def normalize_and_align_curves(guv_results: dict,
                 norm = np.full_like(dye, np.nan)
             else:
                 norm = (dye - bg) / den
-                
         normalised.append(norm)
 
     if not normalised:
         logger.error("Normalisation failed for all GUVs.")
         return None
 
+    # Align curves to start at t=0 on the pulse frame
     arr   = np.array(normalised)[:, PULSE_FRAME:]
     t_al  = time_array[PULSE_FRAME:] - time_array[PULSE_FRAME]
     avg   = np.nanmean(arr, axis=0)
@@ -445,6 +448,9 @@ def fit_individual_curves(aligned: dict, guv_results: dict, t: np.ndarray, logge
             fig, ax = plt.subplots()
             ax.plot(t_c, y_c, 'k.', alpha=0.5, label='Data')
             ax.plot(t_c, fn(t_c, *params), 'r-', label='Fit')
+            # Add Pulse line at t=0 (since data is aligned to pulse)
+            ax.axvline(0, color='gray', ls='--', lw=1.5, label='Pulse', zorder=0)
+            
             if 'tau2' in names:
                 ax.set_title(f"GUV {guv_id} (R={r_um:.1f} $\mu$m)\nTau1: {params[2]:.2f} s, Tau2: {params[4]:.2f} s")
             else:
@@ -501,9 +507,14 @@ def export_results(aligned: dict, dye_files: list, logger: logging.Logger):
     for i, tp in enumerate(cfg.EXPORT_TIME_POINTS_S):
         fi, _ = utils.find_closest_frame(t, tp)
         if fi >= len(dye_al): continue
-        img = cv2.imread(dye_al[fi], cv2.IMREAD_ANYDEPTH | cv2.IMREAD_GRAYSCALE)
-        if img is None: continue
-        styled = utils.style_image(img, f"{int(round(tp))} S",
+        img_raw = cv2.imread(dye_al[fi], cv2.IMREAD_ANYDEPTH | cv2.IMREAD_GRAYSCALE)
+        if img_raw is None: continue
+        
+    
+        # USE THE BOOSTED CONTRAST FUNCTION HERE
+        img_bright = utils._convert_to_8bit_gray(img_raw)
+        
+        styled = utils.style_image(img_bright, f"{int(round(tp))} S",
                                    cfg.MICRONS_PER_PIXEL, cfg.SCALE_BAR_LENGTH_MICRONS)
         cv2.imwrite(os.path.join(cfg.OUTPUT_IMAGE_FOLDER,
                     f"frame_{i+1}_at_{int(round(tp))}s.png"), styled)
@@ -576,6 +587,7 @@ def main():
             data['circles'], data['roi_mmap_info'], data['dye_mmap_info'], logger
         )
         
+        
         if getattr(cfg, 'EXPORT_CONSOLIDATED_TRACK_VIDEO', False) or \
            getattr(cfg, 'EXPORT_CONSOLIDATED_MASK_VIDEO', False):
             
@@ -592,6 +604,11 @@ def main():
                 fps=getattr(cfg, 'VIDEO_EXPORT_FPS', 10.0)
             )
         
+        # Calculate pulse time for the absolute-time tracking plots
+        match = re.search(r'frame(\d+)', cfg.EXPERIMENT_BASE_NAME)
+        PULSE_FRAME = int(match.group(1)) if match else 7
+        t_pulse = data['time_array'][PULSE_FRAME]
+        
         # Generate the Size, Deformation, and MSD plots
         df_track = guv_results.get('tracking_dataframe')
         if df_track is not None:
@@ -601,7 +618,8 @@ def main():
                     data['time_array'], 
                     cfg.OUTPUT_IMAGE_FOLDER, 
                     cfg.EXPERIMENT_BASE_NAME, 
-                    getattr(cfg, 'MICRONS_PER_PIXEL', 1.0)
+                    getattr(cfg, 'MICRONS_PER_PIXEL', 1.0),
+                    pulse_time=t_pulse
                 )
                 logger.info("Saved size, deformation, and MSD tracking plots.")
             except Exception as e:
