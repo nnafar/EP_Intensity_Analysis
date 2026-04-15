@@ -452,9 +452,9 @@ def fit_individual_curves(aligned: dict, guv_results: dict, t: np.ndarray, logge
             ax.axvline(0, color='gray', ls='--', lw=1.5, label='Pulse', zorder=0)
             
             if 'tau2' in names:
-                ax.set_title(f"GUV {guv_id} (R={r_um:.1f} $\mu$m)\nTau1: {params[2]:.2f} s, Tau2: {params[4]:.2f} s")
+                ax.set_title(rf"GUV {guv_id} (R={r_um:.1f} $\mu$m)\nTau1: {params[2]:.2f} s, Tau2: {params[4]:.2f} s")
             else:
-                ax.set_title(f"GUV {guv_id} (R={r_um:.1f} $\mu$m)\nTau: {params[2]:.2f} s")
+                ax.set_title(rf"GUV {guv_id} (R={r_um:.1f} $\mu$m)\nTau: {params[2]:.2f} s")
             ax.set_xlabel("Time (s)")
             ax.set_ylabel("Normalized Intensity")
             ax.legend()
@@ -485,7 +485,7 @@ def generate_parameter_boxplots(df_fits: pd.DataFrame, logger: logging.Logger):
         sns.boxplot(data=df_fits, x='size_group', y=param, ax=ax)
         sns.stripplot(data=df_fits, x='size_group', y=param, ax=ax, color='black', alpha=0.5)
         ax.set_title(param)
-        ax.set_xlabel('Radius ($\mu$m)')
+        ax.set_xlabel(r'Radius ($\mu$m)')
         
     plt.tight_layout()
     fig.savefig(os.path.join(cfg.OUTPUT_IMAGE_FOLDER, f"{cfg.EXPERIMENT_BASE_NAME}_parameter_boxplots.png"), dpi=300)
@@ -510,8 +510,6 @@ def export_results(aligned: dict, dye_files: list, logger: logging.Logger):
         img_raw = cv2.imread(dye_al[fi], cv2.IMREAD_ANYDEPTH | cv2.IMREAD_GRAYSCALE)
         if img_raw is None: continue
         
-    
-        # USE THE BOOSTED CONTRAST FUNCTION HERE
         img_bright = utils._convert_to_8bit_gray(img_raw)
         
         styled = utils.style_image(img_bright, f"{int(round(tp))} S",
@@ -603,6 +601,9 @@ def main():
                 data['circles'],
                 fps=getattr(cfg, 'VIDEO_EXPORT_FPS', 10.0)
             )
+            
+            # free the file handle
+            del roi_stack
         
         # Calculate pulse time for the absolute-time tracking plots
         match = re.search(r'frame(\d+)', cfg.EXPERIMENT_BASE_NAME)

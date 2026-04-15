@@ -71,7 +71,7 @@ BG_RING_WIDTH_PIXELS = 4    # width (px) of background sampling ring
 # -------------------------------------------------------------------
 
 # ['EFFLUX-1EXP' or 'EFFLUX-2EXP'] ['INFLUX-1EXP' or 'INFLUX-2EXP']
-MODEL_TO_USE        = 'EFFLUX-2EXP' 
+MODEL_TO_USE        = 'EFFLUX-1EXP' 
 FIT_DATA_PERCENTAGE = 0.9
 
 FIT_INITIAL_GUESS_5PARAM = (1.0,  0.5,  10.0, 0.5, 100.0)
