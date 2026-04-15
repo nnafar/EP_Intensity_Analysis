@@ -158,14 +158,22 @@ def load_input_data(circles: list[dict], logger: logging.Logger) -> dict | None:
     logger.info(f"Frame interval: {frame_interval:.3f} s  ({len(time_array)} frames)")
     
     
-    # Reroute the memory maps to the local machine's fast temporary storage
-    local_temp_dir = tempfile.gettempdir()
-    roi_mmap_path = os.path.join(local_temp_dir, f"roi_stack_{cfg.EXPERIMENT_BASE_NAME}.dat")
-    dye_mmap_path = os.path.join(local_temp_dir, f"dye_stack_{cfg.EXPERIMENT_BASE_NAME}.dat")
+    # Reroute the memory maps to a shorter, dedicated local path
+    mmap_dir = r"C:\temp_guv_data" 
+    if not os.path.exists(mmap_dir):
+        try:
+            os.makedirs(mmap_dir)
+        except Exception:
+            # Fallback to the experiment folder if C: is restricted
+            mmap_dir = cfg.DATA_FOLDER
+   
+    # Use a generic name to keep the path length short
+    roi_mmap_path = os.path.join(mmap_dir, "roi_temp.dat")
+    dye_mmap_path = os.path.join(mmap_dir, "dye_temp.dat")
     
     tracking_only = getattr(cfg, 'TRACKING_ONLY_MODE', False)
     
-    logger.info(f"Compiling TIFFs into local memory-mapped stacks at {local_temp_dir}...")
+    logger.info(f"Compiling TIFFs into local memory-mapped stacks at {mmap_dir}...")
     roi_mmap_info = create_memmap_stack(roi_files, roi_mmap_path, desc="ROI Stack")
     
     if tracking_only:
@@ -304,6 +312,7 @@ def process_all_guvs(circles: list[dict],
         logger.info("Saved per-frame tracking data.")
 
     return {
+        'raw_results':           results, 
         'all_intensity_curves':  all_intensity,
         'all_background_curves': all_background,
         'valid_guv_indices':     valid_indices,
@@ -566,6 +575,22 @@ def main():
         guv_results = process_all_guvs(
             data['circles'], data['roi_mmap_info'], data['dye_mmap_info'], logger
         )
+        
+        if getattr(cfg, 'EXPORT_CONSOLIDATED_TRACK_VIDEO', False) or \
+           getattr(cfg, 'EXPORT_CONSOLIDATED_MASK_VIDEO', False):
+            
+            # Re-open the ROI stack for reading (the main process needs it now)
+            roi_path, roi_shape, roi_dtype = data['roi_mmap_info']
+            roi_stack = np.memmap(roi_path, dtype=roi_dtype, mode='r', shape=roi_shape)
+            
+            utils.export_full_stack_videos(
+                cfg.OUTPUT_IMAGE_FOLDER, 
+                cfg.EXPERIMENT_BASE_NAME,
+                roi_stack,
+                [r[0] for r in guv_results['raw_results']], # List of 'result' dicts
+                data['circles'],
+                fps=getattr(cfg, 'VIDEO_EXPORT_FPS', 10.0)
+            )
         
         # Generate the Size, Deformation, and MSD plots
         df_track = guv_results.get('tracking_dataframe')

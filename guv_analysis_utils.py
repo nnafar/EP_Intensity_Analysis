@@ -487,24 +487,30 @@ def track_guv_across_frames(
 # --- 7. INTENSITY EXTRACTION ---
 # -------------------------------------------------------------------
 
+# guv_analysis_utils.py
+
 def get_intensity_trace_tracked(dye_stack: np.ndarray,
                                 n_frames: int,
-                                per_frame_masks: List[Optional[np.ndarray]]
+                                per_frame_masks: List[Optional[np.ndarray]],
+                                method: str = 'mean'
                                 ) -> np.ndarray:
     """
-    Extract mean intensity inside *per_frame_masks[i]* from *dye_files[i]*.
+    Extract intensity inside *per_frame_masks[i]* from *dye_files[i]*.
     Returns NaN for frames whose mask is None (post-rupture / untracked).
     """
     trace = np.full(n_frames, np.nan)
     for i, mask in enumerate(per_frame_masks):
         if mask is None:
             continue
-        n_px = int(np.sum(mask))
-        if n_px == 0:
+        
+        pixels = dye_stack[i][mask]
+        if len(pixels) == 0:
             continue
             
-        # Read directly from shared memory and apply mask
-        trace[i] = float(np.sum(dye_stack[i][mask])) / n_px
+        if method == 'median':
+            trace[i] = float(np.median(pixels))
+        else:
+            trace[i] = float(np.mean(pixels))
         
     return trace
 
@@ -624,8 +630,8 @@ def process_single_guv(guv_id: str,
         return result, quality_entry
 
     # ── Extract intensity traces ───────────────────────────────────────────
-    intensity_trace  = get_intensity_trace_tracked(dye_stack, n_frames, tracking['inner_masks'])
-    background_trace = get_intensity_trace_tracked(dye_stack, n_frames, tracking['bg_masks'])
+    intensity_trace  = get_intensity_trace_tracked(dye_stack, n_frames, tracking['inner_masks'], method='mean')
+    background_trace = get_intensity_trace_tracked(dye_stack, n_frames, tracking['bg_masks'], method='median')
     trace_for_jump = np.where(np.isnan(intensity_trace), 0.0, intensity_trace)
 
     if np.all(trace_for_jump == 0) or np.all(np.isnan(intensity_trace)):
@@ -836,7 +842,70 @@ def export_track_video(output_folder: str, experiment_name: str, guv_id: str,
         out.write(canvas)
 
     out.release()
+
+def export_full_stack_videos(output_folder: str, experiment_name: str, 
+                             roi_stack: np.ndarray, raw_results: list, 
+                             circles: list[dict], fps: float = 10.0):
+    """
+    Generates two consolidated videos for all GUVs:
+    1. Tracking: Contours and IDs overlaid on ROI frames.
+    2. Masks: Inner, membrane, and background masks overlaid on ROI frames.
+    """
+    h, w = roi_stack[0].shape[:2]
+    n_frames = roi_stack.shape[0]
     
+    track_path = os.path.join(output_folder, f"{experiment_name}_ALL_TRACKING.avi")
+    mask_path = os.path.join(output_folder, f"{experiment_name}_ALL_MASKS.avi")
+    fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+    
+    out_track = cv2.VideoWriter(track_path, fourcc, fps, (w, h))
+    out_mask = cv2.VideoWriter(mask_path, fourcc, fps, (w, h))
+
+    # Wrap frame loop in tqdm for a progress bar in the console
+    for i in range(n_frames):
+        frame = roi_stack[i]
+        if frame is None: continue
+
+        img8 = _convert_to_8bit_gray(frame)
+        canvas_track = cv2.cvtColor(img8, cv2.COLOR_GRAY2BGR)
+        
+        # Prepare Mask Frame
+        canvas_mask = cv2.cvtColor(img8, cv2.COLOR_GRAY2BGR)
+        overlay = np.zeros_like(canvas_mask)
+        
+        for idx, res in enumerate(raw_results):
+            if res is None: continue
+            tr = res.get('tracking', {})
+            gid = circles[idx]['id']
+            
+            # --- Draw Tracking ---
+            center = tr['centers'][i]
+            el = tr['ellipses'][i]
+            if center is not None and el is not None:
+                cv2.ellipse(canvas_track, (int(el['center'][0]), int(el['center'][1])),
+                            (int(el['axes'][0]), int(el['axes'][1])), el['angle'], 
+                            0, 360, (0, 255, 255), 1, cv2.LINE_AA)
+                cv2.putText(canvas_track, f"ID:{gid}", (int(center[0]), int(center[1])),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+
+            # --- Draw Masks ---
+            inner = tr['inner_masks'][i]
+            mem = tr['mem_masks'][i]
+            bg = tr['bg_masks'][i]
+            
+            if inner is not None: overlay[inner] = (201, 87, 188) # Purple
+            if mem is not None:   overlay[mem]   = (82, 0, 249)   # Pink
+            if bg is not None:    overlay[bg]    = (114, 48, 19)  # Dark Blue
+        
+        # Apply mask overlay
+        alpha = getattr(cfg, 'MASK_VIZ_OVERLAY_ALPHA', 0.6)
+        cv2.addWeighted(canvas_mask, alpha, overlay, 1.0 - alpha, 0, canvas_mask)
+        
+        out_track.write(canvas_track)
+        out_mask.write(canvas_mask)
+
+    out_track.release()
+    out_mask.release()
     
 def plot_tracking_metrics(df: pd.DataFrame, time_array: np.ndarray, 
                           output_folder: str, experiment_name: str, 

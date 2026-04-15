@@ -63,8 +63,8 @@ PEAK_FIND_MIN_DISTANCE   = 5
 PEAK_FIND_MIN_PROMINENCE = 0.05
 
 # Background annulus geometry
-BG_BUFFER_PIXELS     = 2     # gap (px) between outer membrane edge and bg ring start
-BG_RING_WIDTH_PIXELS = 10    # width (px) of background sampling ring
+BG_BUFFER_PIXELS     = 1     # gap (px) between outer membrane edge and bg ring start
+BG_RING_WIDTH_PIXELS = 4    # width (px) of background sampling ring
 
 
 # -------------------------------------------------------------------
@@ -99,7 +99,7 @@ OUTPUT_IMAGE_FOLDER      = os.path.join(DATA_FOLDER, "output_images")
 EXPORT_TIME_POINTS_S     = [0, 50, 100, 200, 300]
 EXPORT_DEBUG_PLOTS       = True
 
-MICRONS_PER_PIXEL        = 0.11
+MICRONS_PER_PIXEL        = 0.11 # Plan Apo λ 60x Oil
 SCALE_BAR_LENGTH_MICRONS = 10
 
 EXPORT_MASK_VISUALIZATION     = True
@@ -107,8 +107,9 @@ MASK_VIZ_OVERLAY_ALPHA        = 0.8
 VIZ_MEMBRANE_THICKNESS_PIXELS = None
 
 # Add the video export variables here:
-EXPORT_TRACK_VIDEO       = True
-VIDEO_EXPORT_FPS         = 10.0
+EXPORT_CONSOLIDATED_TRACK_VIDEO = True
+EXPORT_CONSOLIDATED_MASK_VIDEO  = True
+VIDEO_EXPORT_FPS                = 10.0
 
 
 # -------------------------------------------------------------------
