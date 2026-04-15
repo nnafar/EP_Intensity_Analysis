@@ -36,6 +36,13 @@ TIF_SUFFIX            = "-f*.tif"
 # Path where the interactively-drawn circle definitions are saved/loaded.
 CIRCLES_JSON_PATH = os.path.join(DATA_FOLDER, f"{EXPERIMENT_BASE_NAME}_guv_circles.json")
 
+# Variable frame rate schedule: (start_frame_index, end_frame_index, interval_seconds)
+# Set to None to attempt metadata extraction.
+FRAME_INTERVAL_SCHEDULE = [
+    (0,  5,  1.0),   # Pre-pulse: 5 frames, 1 s interval
+    (5,  22, 0.1),   # Pulse: 17 frames, 100 ms (0.1 s) interval
+    (22, None, 5.0)  # Post-pulse: remaining frames, 5 s interval
+]
 
 # -------------------------------------------------------------------
 # --- 2. ANALYSIS & MASKING PARAMETERS ---
