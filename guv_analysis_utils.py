@@ -100,12 +100,19 @@ def create_manual_timestamps(num_frames: int,
 # --- 2. KINETIC MODELS ---
 # -------------------------------------------------------------------
 
-def dyn_model_4param(t, I_offset, A, tau, D):
-    return I_offset + A * (1 - np.exp(-t / tau)) + D * t
+# Dye Influx
+def influx_1exp(t, I0, Iinf, tau, D=0):
+    return I0 + (Iinf - I0) * (1 - np.exp(-t / tau)) + D * t
 
-def dyn_model_5param(t, Af, A1, tau1, A2, tau2):
-    return Af - A1 * np.exp(-t / tau1) - A2 * np.exp(-t / tau2)
+def influx_2exp(t, I0, a1, tau1, a2, tau2, D=0):
+    return I0 + a1 * (1 - np.exp(-t / tau1)) + a2 * (1 - np.exp(-t / tau2)) + D * t
 
+# Dye Efflux
+def efflux_1exp(t, I0, Iinf, tau, D=0):
+    return Iinf + (I0 - Iinf) * np.exp(-t / tau) + D * t
+
+def efflux_2exp(t, Iinf, a1, tau1, a2, tau2, D=0):
+    return Iinf + a1 * np.exp(-t / tau1) + a2 * np.exp(-t / tau2) + D * t
 
 # -------------------------------------------------------------------
 # --- 3. MASK HELPERS ---
@@ -117,47 +124,72 @@ def _convert_to_8bit_gray(image: np.ndarray) -> np.ndarray:
         return cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
     return img
 
-def create_elliptical_mask(shape, center, axes, angle) -> np.ndarray:
-    mask = np.zeros(shape[:2], dtype=np.uint8)
-    c = (int(round(center[0])), int(round(center[1])))
-    a = (int(round(axes[0])), int(round(axes[1])))
-    cv2.ellipse(mask, c, a, angle, 0, 360, 255, -1)
-    return mask > 0
+def generate_vectorized_masks(shape, center, axes, angle, mem_hw, bg_buf, bg_w) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Generates inner, membrane, and background boolean masks simultaneously."""
+    h, w = shape[:2]
+    cx, cy = center
+    a, b = axes
 
-def create_elliptical_annular_mask(shape, center, axes, inner_offset, outer_offset, angle) -> np.ndarray:
-    mask = np.zeros(shape[:2], dtype=np.uint8)
-    c = (int(round(center[0])), int(round(center[1])))
-    a_outer = (max(1, int(round(axes[0] + outer_offset))), max(1, int(round(axes[1] + outer_offset))))
-    a_inner = (max(1, int(round(axes[0] + inner_offset))), max(1, int(round(axes[1] + inner_offset))))
+    # Create coordinate grid
+    y, x = np.ogrid[:h, :w]
+    
+    # Rotate coordinates to align with ellipse angle
+    theta = np.radians(angle)
+    cos_t, sin_t = np.cos(theta), np.sin(theta)
+    
+    x_rot = cos_t * (x - cx) + sin_t * (y - cy)
+    y_rot = -sin_t * (x - cx) + cos_t * (y - cy)
 
-    cv2.ellipse(mask, c, a_outer, angle, 0, 360, 255, -1)
-    cv2.ellipse(mask, c, a_inner, angle, 0, 360, 0, -1)
-    return mask > 0
+    # Compute normalized elliptical distance squared
+    # A value of 1.0 lies exactly on the ellipse contour
+    dist_sq = (x_rot**2) / (a**2) + (y_rot**2) / (b**2)
+    dist = np.sqrt(dist_sq)
+
+    # Calculate fractional thresholds based on semi-major axis
+    mem_inner_frac = max(0.01, (a - mem_hw) / a)
+    mem_outer_frac = (a + mem_hw) / a
+    bg_inner_frac  = (a + mem_hw + bg_buf) / a
+    bg_outer_frac  = (a + mem_hw + bg_buf + bg_w) / a
+
+    inner_mask = dist < mem_inner_frac
+    mem_mask   = (dist >= mem_inner_frac) & (dist <= mem_outer_frac)
+    bg_mask    = (dist >= bg_inner_frac)  & (dist <= bg_outer_frac)
+
+    return inner_mask, mem_mask, bg_mask
 
 
 # -------------------------------------------------------------------
 # --- 4. RADIAL PROFILE ---
 # -------------------------------------------------------------------
 
-def radial_profile_2d(frame: np.ndarray, center: Tuple[float, float],
-                      r_max: int, n_angles: int = 72) -> np.ndarray:
-    """Sub-pixel sampling mapping 360 degrees of radii."""
-    cx, cy   = center
-    img      = frame[:, :, 0] if frame.ndim == 3 else frame
-    thetas   = np.linspace(0, 2 * np.pi, n_angles, endpoint=False)
-    radii    = np.arange(r_max)
+_POLAR_CACHE = {}
 
-    xs = cx + radii[:, None] * np.cos(thetas)[None, :]
-    ys = cy + radii[:, None] * np.sin(thetas)[None, :]
+def get_polar_offsets(r_max: int, n_angles: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Caches trigonometric arrays for radial extraction."""
+    key = (r_max, n_angles)
+    if key not in _POLAR_CACHE:
+        thetas = np.linspace(0, 2 * np.pi, n_angles, endpoint=False)
+        radii  = np.arange(r_max)
+        dx = radii[:, None] * np.cos(thetas)[None, :]
+        dy = radii[:, None] * np.sin(thetas)[None, :]
+        _POLAR_CACHE[key] = (dx, dy)
+    return _POLAR_CACHE[key]
+
+def radial_profile_2d_local(local_crop: np.ndarray, local_center: Tuple[float, float],
+                            r_max: int, n_angles: int = 72) -> np.ndarray:
+    """Sub-pixel sampling operating only on a small bounding box crop."""
+    cx, cy = local_center
+    dx, dy = get_polar_offsets(r_max, n_angles)
+
+    xs = cx + dx
+    ys = cy + dy
 
     coords = np.vstack((ys.flatten(), xs.flatten()))
-    sampled = map_coordinates(img, coords, order=1, mode='nearest').reshape(r_max, n_angles)
-    return sampled
+    return map_coordinates(local_crop, coords, order=1, mode='nearest').reshape(r_max, n_angles)
 
-def radial_profile(frame: np.ndarray, center: Tuple[float, float],
-                   r_max: int, n_angles: int = 72) -> np.ndarray:
-    """1D median array for center evaluation."""
-    return np.median(radial_profile_2d(frame, center, r_max, n_angles), axis=1).astype(float)
+def radial_profile_local(local_crop: np.ndarray, local_center: Tuple[float, float],
+                         r_max: int, n_angles: int = 72) -> np.ndarray:
+    return np.median(radial_profile_2d_local(local_crop, local_center, r_max, n_angles), axis=1).astype(float)
 
 
 # -------------------------------------------------------------------
@@ -208,9 +240,21 @@ def _score_at_center(frame: np.ndarray, cx: int, cy: int,
     """
     r_max = int(expected_r * (1.0 + search_factor) + 5)
     h, w  = frame.shape[:2]
+    
+    x_min = max(0, int(cx - r_max - 2))
+    x_max = min(w, int(cx + r_max + 2))
+    y_min = max(0, int(cy - r_max - 2))
+    y_max = min(h, int(cy + r_max + 2))
+    
+    
     if cx - r_max < 0 or cx + r_max >= w or cy - r_max < 0 or cy + r_max >= h:
         return 0.0
-    prof = radial_profile(frame, (cx, cy), r_max, n_angles)
+    
+    local_frame = frame[y_min:y_max, x_min:x_max]
+    local_cx = cx - x_min
+    local_cy = cy - y_min
+    
+    prof = radial_profile_local(local_frame, (local_cx, local_cy), r_max, n_angles)
     return _ring_score_from_profile(prof, expected_r, search_factor, detect_bright)
 
 
@@ -231,11 +275,6 @@ def find_best_guv_center(
     Evaluate the ring-score at every grid point inside a circle of radius
     `prev_radius × search_window_factor` around `prev_center`.  Return the
     highest-scoring candidate.
-
-    This approach is invariant to:
-    • Translation  – handled by searching a spatial grid
-    • Size changes – the radius estimate is updated separately each frame
-    • Appearance   – we only measure the ring contrast, not pixel values
     """
     cx, cy  = prev_center
     r       = prev_radius
@@ -243,20 +282,37 @@ def find_best_guv_center(
 
     search_r = max(8, int(r * search_window_factor))
     step     = max(2, int(r * grid_step_factor))
+    r_max    = int(r * (1.0 + search_factor) + 5)
+    
+    # 1. Define bounding box for the entire search space
+    bound = search_r + step + r_max + 2
+    x_min = max(0, int(cx - bound))
+    x_max = min(w, int(cx + bound))
+    y_min = max(0, int(cy - bound))
+    y_max = min(h, int(cy + bound))
+    
+    local_frame = frame[y_min:y_max, x_min:x_max]
 
     best_score  = -1.0
     best_center = prev_center
-
+    
+    # 2. Grid search over the local crop
     for dx in range(-search_r, search_r + step, step):
         for dy in range(-search_r, search_r + step, step):
             if dx * dx + dy * dy > search_r * search_r:
                 continue
             ncx, ncy = cx + dx, cy + dy
-            if ncx < 0 or ncx >= w or ncy < 0 or ncy >= h:
+            # Calculate coordinates relative to the local crop
+            local_cx = ncx - x_min
+            local_cy = ncy - y_min
+            
+            if local_cx - r_max < 0 or local_cx + r_max >= local_frame.shape[1] or \
+               local_cy - r_max < 0 or local_cy + r_max >= local_frame.shape[0]:
                 continue
-            score = _score_at_center(frame, ncx, ncy, r,
-                                     search_factor, detect_bright,
-                                     n_angles=72)
+                
+            prof = radial_profile_local(local_frame, (local_cx, local_cy), r_max, 72)
+            score = _ring_score_from_profile(prof, r, search_factor, detect_bright)
+            
             if score > best_score:
                 best_score  = score
                 best_center = (ncx, ncy)
@@ -276,8 +332,16 @@ def detect_membrane_ellipse(frame: np.ndarray, center: Tuple[float, float],
 
     if cx - r_max < 0 or cx + r_max >= w or cy - r_max < 0 or cy + r_max >= h:
         return center, expected_axes, 0.0, False
+    
+    x_min = max(0, int(cx - r_max - 2))
+    x_max = min(w, int(cx + r_max + 2))
+    y_min = max(0, int(cy - r_max - 2))
+    y_max = min(h, int(cy + r_max + 2))
 
-    sampled_2d = radial_profile_2d(frame, center, r_max, n_angles=72)
+    local_frame = frame[y_min:y_max, x_min:x_max]
+    local_cx, local_cy = cx - x_min, cy - y_min
+    
+    sampled_2d = radial_profile_2d_local(local_frame, (local_cx, local_cy), r_max, n_angles=72)
     smooth_2d = gaussian_filter1d(sampled_2d, sigma=1.0, axis=0)
 
     lo = max(2, int(expected_r * (1.0 - search_factor)))
@@ -316,7 +380,8 @@ def detect_membrane_ellipse(frame: np.ndarray, center: Tuple[float, float],
 # -------------------------------------------------------------------
 
 def track_guv_across_frames(
-        roi_files: List[str],
+        roi_stack: np.ndarray,
+        n_frames: int,
         initial_center: Tuple[int, int],
         initial_radius: int,
         search_window_factor: float,
@@ -331,14 +396,13 @@ def track_guv_across_frames(
         rupture_consecutive_fails: int  = 3,
 ) -> Dict[str, Any]:
 
-    n = len(roi_files)
-    inner_masks: List[Optional[np.ndarray]] = [None] * n
-    mem_masks:   List[Optional[np.ndarray]] = [None] * n
-    bg_masks:    List[Optional[np.ndarray]] = [None] * n
-    centers:     List[Optional[Tuple]]      = [None] * n
-    radii:       List[Optional[int]]        = [None] * n
-    ellipses:    List[Optional[Dict]]       = [None] * n 
-    ring_scores: List[float]                = [0.0]  * n
+    inner_masks: List[Optional[np.ndarray]] = [None] * n_frames
+    mem_masks:   List[Optional[np.ndarray]] = [None] * n_frames
+    bg_masks:    List[Optional[np.ndarray]] = [None] * n_frames
+    centers:     List[Optional[Tuple]]      = [None] * n_frames
+    radii:       List[Optional[int]]        = [None] * n_frames
+    ellipses:    List[Optional[Dict]]       = [None] * n_frames 
+    ring_scores: List[float]                = [0.0]  * n_frames
 
     cx, cy = float(initial_center[0]), float(initial_center[1])
     axes   = (float(initial_radius), float(initial_radius))
@@ -349,8 +413,8 @@ def track_guv_across_frames(
     ruptured_at     = None
     n_valid         = 0
 
-    for i, fp in enumerate(roi_files):
-        frame = cv2.imread(fp, cv2.IMREAD_ANYDEPTH | cv2.IMREAD_GRAYSCALE)
+    for i in range(n_frames):
+        frame = roi_stack[i]
         if frame is None:
             consecutive_low += 1
             if consecutive_low >= rupture_consecutive_fails:
@@ -390,12 +454,11 @@ def track_guv_across_frames(
         new_avg_r = int((new_a + new_b) / 2.0)
 
         img_shape = frame.shape[:2]
-        inner_masks[i] = create_elliptical_mask(img_shape, det_center, 
-                            (max(1, new_a - membrane_half_width), max(1, new_b - membrane_half_width)), det_angle)
-        mem_masks[i]   = create_elliptical_annular_mask(img_shape, det_center, new_axes,
-                            -membrane_half_width, membrane_half_width, det_angle)
-        bg_masks[i]    = create_elliptical_annular_mask(img_shape, det_center, new_axes,
-                            bg_buffer, bg_buffer + bg_width, det_angle)
+        
+        inner_masks[i], mem_masks[i], bg_masks[i] = generate_vectorized_masks(
+            img_shape, det_center, new_axes, det_angle,
+            membrane_half_width, bg_buffer, bg_width
+        )
         
         centers[i]  = det_center
         radii[i]    = new_avg_r
@@ -424,23 +487,25 @@ def track_guv_across_frames(
 # --- 7. INTENSITY EXTRACTION ---
 # -------------------------------------------------------------------
 
-def get_intensity_trace_tracked(dye_files: List[str],
-                                 per_frame_masks: List[Optional[np.ndarray]]
-                                 ) -> np.ndarray:
+def get_intensity_trace_tracked(dye_stack: np.ndarray,
+                                n_frames: int,
+                                per_frame_masks: List[Optional[np.ndarray]]
+                                ) -> np.ndarray:
     """
     Extract mean intensity inside *per_frame_masks[i]* from *dye_files[i]*.
     Returns NaN for frames whose mask is None (post-rupture / untracked).
     """
-    trace = np.full(len(dye_files), np.nan)
-    for i, (fp, mask) in enumerate(zip(dye_files, per_frame_masks)):
+    trace = np.full(n_frames, np.nan)
+    for i, mask in enumerate(per_frame_masks):
         if mask is None:
             continue
         n_px = int(np.sum(mask))
         if n_px == 0:
             continue
-        frame = cv2.imread(fp, cv2.IMREAD_ANYDEPTH | cv2.IMREAD_GRAYSCALE)
-        if frame is not None:
-            trace[i] = float(np.sum(frame[mask])) / n_px
+            
+        # Read directly from shared memory and apply mask
+        trace[i] = float(np.sum(dye_stack[i][mask])) / n_px
+        
     return trace
 
 
@@ -452,25 +517,28 @@ def process_single_guv(guv_id: str,
                         initial_center: Tuple[int, int],
                         initial_radius: int,
                         is_first_guv: bool,
-                        roi_files: List[str],
-                        dye_files: List[str]) -> Tuple:
+                        roi_mmap_info: Tuple,
+                        dye_mmap_info: Tuple,
+                        n_frames: int) -> Tuple:
     """
     Full analysis pipeline for a single GUV using frame-by-frame tracking.
-
-    Parameters
-    ----------
-    guv_id         : string identifier (from circle selector)
-    initial_center : (x, y) in original image coords (from circle selector)
-    initial_radius : radius in pixels (from circle selector)
-    is_first_guv   : if True, force mask-visualisation export
-    roi_files      : all ROI (guide) frames — used for tracking
-    dye_files      : all dye (measurement) frames
     """
     detect_bright = (getattr(cfg, 'MEMBRANE_DETECTION_MODE', 'LABELED').upper() != 'UNLABELED')
 
+    # Reconstruct the memmaps in read-only mode for this specific worker process
+    roi_path, roi_shape, roi_dtype = roi_mmap_info
+    roi_stack = np.memmap(roi_path, dtype=roi_dtype, mode='r', shape=roi_shape)
+    
+    if dye_mmap_info[0] is not None:
+        dye_path, dye_shape, dye_dtype = dye_mmap_info
+        dye_stack = np.memmap(dye_path, dtype=dye_dtype, mode='r', shape=dye_shape)
+    else:
+        dye_stack = None
+
     # ── Track GUV across all frames ────────────────────────────────────────
     tracking = track_guv_across_frames(
-        roi_files        = roi_files,
+        roi_stack        = roi_stack,
+        n_frames         = n_frames,
         initial_center   = initial_center,
         initial_radius   = initial_radius,
         search_window_factor    = getattr(cfg, 'TRACKING_SEARCH_WINDOW_FACTOR', 0.7),
@@ -501,7 +569,7 @@ def process_single_guv(guv_id: str,
     # ── Export first-frame mask visualisation ──────────────────────────────
     if cfg.EXPORT_MASK_VISUALIZATION and (quality_entry['failed'] or is_first_guv):
         if tracking['inner_masks'][0] is not None:
-            roi_f0 = cv2.imread(roi_files[0], cv2.IMREAD_ANYDEPTH | cv2.IMREAD_GRAYSCALE)
+            roi_f0 = roi_stack[0].copy()
             if roi_f0 is not None:
                 mem_m = tracking['mem_masks'][0]
                 if mem_m is None:
@@ -509,11 +577,12 @@ def process_single_guv(guv_id: str,
                     el0 = tracking['ellipses'][0]
                     ax0 = el0['axes'] if el0 is not None else (initial_radius, initial_radius)
                     ang0 = el0['angle'] if el0 is not None else 0.0
-                    mem_m = create_elliptical_annular_mask(
-                        roi_f0.shape, c0, ax0,
-                        -cfg.MEMBRANE_FIXED_HALF_WIDTH,
+                    
+                    _, mem_m, _ = generate_vectorized_masks(
+                        roi_f0.shape, c0, ax0, ang0,
                         cfg.MEMBRANE_FIXED_HALF_WIDTH,
-                        ang0
+                        cfg.BG_BUFFER_PIXELS,
+                        cfg.BG_RING_WIDTH_PIXELS
                     )
                 viz = create_mask_visualization(roi_f0, tracking['inner_masks'][0],
                                                 mem_m, tracking['bg_masks'][0],
@@ -529,7 +598,7 @@ def process_single_guv(guv_id: str,
         try:
             export_track_visualization(
                 cfg.OUTPUT_IMAGE_FOLDER, cfg.EXPERIMENT_BASE_NAME, guv_id,
-                roi_files, tracking['centers'], tracking['ellipses'],
+                roi_stack, tracking['centers'], tracking['ellipses'],
                 tracking['ring_scores'], ruptured_at
             )
         except Exception:
@@ -539,7 +608,7 @@ def process_single_guv(guv_id: str,
         try:
             export_track_video(
                 cfg.OUTPUT_IMAGE_FOLDER, cfg.EXPERIMENT_BASE_NAME, guv_id,
-                roi_files, tracking['centers'], tracking['ellipses'],
+                roi_stack, tracking['centers'], tracking['ellipses'],
                 fps=getattr(cfg, 'VIDEO_EXPORT_FPS', 10.0)
             )
         except Exception as e:
@@ -555,8 +624,8 @@ def process_single_guv(guv_id: str,
         return result, quality_entry
 
     # ── Extract intensity traces ───────────────────────────────────────────
-    intensity_trace  = get_intensity_trace_tracked(dye_files, tracking['inner_masks'])
-    background_trace = get_intensity_trace_tracked(dye_files, tracking['bg_masks'])
+    intensity_trace  = get_intensity_trace_tracked(dye_stack, n_frames, tracking['inner_masks'])
+    background_trace = get_intensity_trace_tracked(dye_stack, n_frames, tracking['bg_masks'])
     trace_for_jump = np.where(np.isnan(intensity_trace), 0.0, intensity_trace)
 
     if np.all(trace_for_jump == 0) or np.all(np.isnan(intensity_trace)):
@@ -633,7 +702,7 @@ def create_mask_visualization(base_image, inner_mask, membrane_mask,
 
 
 def export_track_visualization(output_folder, experiment_name, guv_id,
-                                roi_files, centers, ellipses, ring_scores,
+                                roi_stack, centers, ellipses, ring_scores,
                                 ruptured_at):
     """
     Saves a diagnostic PNG showing the GUV trajectory and ring scores.
@@ -643,9 +712,9 @@ def export_track_visualization(output_folder, experiment_name, guv_id,
     valid_pairs = [(i, c) for i, c in enumerate(centers) if c is not None]
     if not valid_pairs:
         return
-
+    
     last_i, _ = valid_pairs[-1]
-    frame = cv2.imread(roi_files[last_i], cv2.IMREAD_ANYDEPTH | cv2.IMREAD_GRAYSCALE)
+    frame = roi_stack[last_i]
     if frame is None:
         return
 
@@ -716,7 +785,7 @@ def style_image(frame, time_label, microns_per_pixel, scale_bar_microns):
 
 
 def export_track_video(output_folder: str, experiment_name: str, guv_id: str,
-                       roi_files: List[str], centers: List[Optional[Tuple]],
+                       roi_stack: np.ndarray, centers: List[Optional[Tuple]],
                        ellipses: List[Optional[Dict]], fps: float = 10.0):
     """
     Generates an AVI video of the tracking process.
@@ -728,7 +797,7 @@ def export_track_video(output_folder: str, experiment_name: str, guv_id: str,
 
     # Extract dimensions from the first valid frame
     first_i = valid_pairs[0][0]
-    frame = cv2.imread(roi_files[first_i], cv2.IMREAD_ANYDEPTH | cv2.IMREAD_GRAYSCALE)
+    frame = roi_stack[first_i]
     if frame is None:
         return
 
@@ -741,8 +810,8 @@ def export_track_video(output_folder: str, experiment_name: str, guv_id: str,
 
     valid_pts = []
 
-    for i, (fp, center, el) in enumerate(zip(roi_files, centers, ellipses)):
-        img = cv2.imread(fp, cv2.IMREAD_ANYDEPTH | cv2.IMREAD_GRAYSCALE)
+    for i, (center, el) in enumerate(zip(centers, ellipses)):
+        img = roi_stack[i]
         if img is None:
             continue
 
@@ -767,3 +836,69 @@ def export_track_video(output_folder: str, experiment_name: str, guv_id: str,
         out.write(canvas)
 
     out.release()
+    
+    
+def plot_tracking_metrics(df: pd.DataFrame, time_array: np.ndarray, 
+                          output_folder: str, experiment_name: str, 
+                          um_per_px: float = 1.0):
+    """
+    Generates a 3-panel figure plotting Size (Radius), Deformation (Eccentricity),
+    and Mean Square Displacement (MSD) for each tracked GUV.
+    """
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    guv_ids = df['guv_id'].unique()
+    
+    for gid in guv_ids:
+        guv_data = df[df['guv_id'] == gid].sort_values('frame')
+        frames = guv_data['frame'].values
+        
+        valid_t_idx = [f for f in frames if f < len(time_array)]
+        if not valid_t_idx:
+            continue
+        
+        t_vals = time_array[valid_t_idx]
+        
+        # 1. Size Plot
+        r_um = guv_data['radius'].values[:len(valid_t_idx)] * um_per_px
+        axes[0].plot(t_vals, r_um, label=f'GUV {gid}', alpha=0.8)
+        
+        # 2. Deformation Plot
+        if 'eccentricity' in guv_data.columns:
+            ecc = guv_data['eccentricity'].values[:len(valid_t_idx)]
+            axes[1].plot(t_vals, ecc, label=f'GUV {gid}', alpha=0.8)
+        
+        # 3. MSD Plot
+        x = guv_data['x'].values * um_per_px
+        y = guv_data['y'].values * um_per_px
+        
+        max_lag = len(x) // 4
+        if max_lag > 1:
+            msd = []
+            for lag in range(1, max_lag + 1):
+                dx = x[lag:] - x[:-lag]
+                dy = y[lag:] - y[:-lag]
+                msd.append(np.nanmean(dx**2 + dy**2))
+            
+            axes[2].plot(range(1, max_lag + 1), msd, label=f'GUV {gid}', alpha=0.8)
+
+    axes[0].set_title('GUV Size over Time')
+    axes[0].set_xlabel('Time (s)')
+    axes[0].set_ylabel(r'Radius ($\mu$m)')
+    
+    axes[1].set_title('Deformation (Eccentricity)')
+    axes[1].set_xlabel('Time (s)')
+    axes[1].set_ylabel('Eccentricity (0=Circle)')
+    axes[1].set_ylim(-0.05, 1.05)
+    
+    axes[2].set_title('Mean Square Displacement')
+    axes[2].set_xlabel('Frame Lag (frames)')
+    axes[2].set_ylabel(r'MSD ($\mu$m$^2$)')
+    
+    for ax in axes:
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=8)
+        
+    plt.tight_layout()
+    out_path = os.path.join(output_folder, f"{experiment_name}_tracking_metrics.png")
+    fig.savefig(out_path, dpi=300)
+    plt.close(fig)

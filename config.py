@@ -37,7 +37,7 @@ TIF_SUFFIX            = "-f*.tif"
 CIRCLES_JSON_PATH = os.path.join(DATA_FOLDER, f"{EXPERIMENT_BASE_NAME}_guv_circles.json")
 
 # Variable frame rate schedule: (start_frame_index, end_frame_index, interval_seconds)
-# Set to None to attempt metadata extraction.
+# Set to `None` to attempt metadata extraction.
 FRAME_INTERVAL_SCHEDULE = [
     (0,  5,  1.0),   # Pre-pulse: 5 frames, 1 s interval
     (5,  22, 0.1),   # Pulse: 17 frames, 100 ms (0.1 s) interval
@@ -83,9 +83,8 @@ MIN_BASELINE_FRAMES = 3
 # --- 4. FITTING & MODELING ---
 # -------------------------------------------------------------------
 
-# '4-PARAM' : I = I_off + A(1−e^(−t/τ)) + D·t
-# '5-PARAM' : I = Af − A1·e^(−t/τ1) − A2·e^(−t/τ2)
-MODEL_TO_USE        = '4-PARAM'
+# ['EFFLUX-1EXP' or 'EFFLUX-2EXP'] ['INFLUX-1EXP' or 'INFLUX-2EXP']
+MODEL_TO_USE        = 'EFFLUX-1EXP' 
 FIT_DATA_PERCENTAGE = 0.9
 
 FIT_INITIAL_GUESS_5PARAM = (1.0,  0.5,  10.0, 0.5, 100.0)
@@ -100,7 +99,7 @@ OUTPUT_IMAGE_FOLDER      = os.path.join(DATA_FOLDER, "output_images")
 EXPORT_TIME_POINTS_S     = [0, 50, 100, 200, 300]
 EXPORT_DEBUG_PLOTS       = True
 
-MICRONS_PER_PIXEL        = 0.108
+MICRONS_PER_PIXEL        = 0.11
 SCALE_BAR_LENGTH_MICRONS = 10
 
 EXPORT_MASK_VISUALIZATION     = True
@@ -115,30 +114,18 @@ VIDEO_EXPORT_FPS         = 10.0
 # -------------------------------------------------------------------
 # --- 6. TRACKING PARAMETERS ---
 # -------------------------------------------------------------------
-#
-# Tracking strategy (no template matching):
-#
-#   1. Grid search  →  finds the new centre by maximising a "ring quality
-#      score" (dark-valley or bright-peak depth in the radial profile)
-#      at each grid point around the previous centre.
-#   2. Radius detection  →  full radial profile at the best centre;
-#      valley/peak position gives the current membrane radius.
-#   3. Change clamps  →  prevent single-frame artefacts.
-#   4. Rupture detection  →  consecutive low-score frames trigger rupture.
-# -------------------------------------------------------------------
-# -------------------------------------------------------------------
 
 # Add this flag to disable dye analysis
-TRACKING_ONLY_MODE = True
+TRACKING_ONLY_MODE = False
 
 # ── Centre grid search ──────────────────────────────────────────────
 # Search radius = previous_radius × TRACKING_SEARCH_WINDOW_FACTOR.
 # Increase if GUVs move more than ~70 % of their radius between frames.
-TRACKING_SEARCH_WINDOW_FACTOR = 0.7 # was  0.7
+TRACKING_SEARCH_WINDOW_FACTOR = 0.7 
 
 # Grid step = previous_radius × TRACKING_GRID_STEP_FACTOR.
 # Smaller = finer / slower. 0.12–0.20 is a good balance.
-TRACKING_GRID_STEP_FACTOR = 0.20 # was 0.5
+TRACKING_GRID_STEP_FACTOR = 0.20 
 
 # ── Radius change clamp ─────────────────────────────────────────────
 # Maximum fractional radius change allowed per frame.
@@ -170,4 +157,4 @@ EXPORT_TRACK_VISUALIZATION = True
 # -------------------------------------------------------------------
 
 N_WORKERS    = 3 #os.cpu_count() - 1 if os.cpu_count() > 1 else 1
-FALLBACK_FPS = 1.0
+FALLBACK_FPS = 1.0 # second(s)

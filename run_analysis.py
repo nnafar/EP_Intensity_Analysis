@@ -15,10 +15,9 @@ Pipeline
    - Track centre + radius frame-by-frame using ring-score grid search.
    - Detect rupture events.
    - Extract per-frame intensity traces.
-   - Detect dye-entry jump.
-4. Normalise & align curves (t = 0 at jump).
-5. Fit kinetic model to the population average.
-6. Export plots, tracking data, and per-GUV CSVs.
+4. Normalise & align curves (t = 0 at pulse frame extracted from filename).
+5. Fit kinetic model to individual GUV trajectories.
+6. Export plots, tracking data, per-GUV CSVs, and parameter boxplots grouped by size.
 """
 
 import glob
@@ -27,21 +26,25 @@ import json
 import logging
 import multiprocessing
 import sys
+import re
 from functools import partial
 from natsort import natsorted
 
 import numpy as np
 import matplotlib.pyplot as plt
+import seaborn as sns
 import cv2
 import scipy.optimize as sc
 import pandas as pd
+import tempfile
+from tqdm import tqdm
 
 import config as cfg
 import guv_analysis_utils as utils
 
 
 # -------------------------------------------------------------------
-# --- 1. GUV CIRCLE DEFINITIONS  (replaces CSV loading)
+# --- 1. GUV CIRCLE DEFINITIONS
 # -------------------------------------------------------------------
 
 def get_guv_circles(logger: logging.Logger) -> list[dict]:
@@ -95,6 +98,24 @@ def get_guv_circles(logger: logging.Logger) -> list[dict]:
 # --- 2. DATA LOADING ---
 # -------------------------------------------------------------------
 
+def create_memmap_stack(files: list, mmap_path: str, desc: str = "Processing") -> tuple:
+    """Reads individual TIFFs and writes them to a contiguous binary memmap file."""
+    if not files:
+        return None, None, None
+    
+    first_frame = cv2.imread(files[0], cv2.IMREAD_ANYDEPTH | cv2.IMREAD_GRAYSCALE)
+    dtype = first_frame.dtype
+    shape = (len(files), first_frame.shape[0], first_frame.shape[1])
+    
+    mmap_arr = np.memmap(mmap_path, dtype=dtype, mode='w+', shape=shape)
+    
+    # Wrap the enumerator in tqdm for the progress bar
+    for i, f in enumerate(tqdm(files, desc=desc, unit="frame")):
+        mmap_arr[i] = cv2.imread(f, cv2.IMREAD_ANYDEPTH | cv2.IMREAD_GRAYSCALE)
+    mmap_arr.flush()
+    
+    return mmap_path, shape, str(dtype)
+
 def load_input_data(circles: list[dict], logger: logging.Logger) -> dict | None:
     """
     Loads ROI frames, dye frames, and timestamps.
@@ -135,37 +156,60 @@ def load_input_data(circles: list[dict], logger: logging.Logger) -> dict | None:
             len(dye_files), getattr(cfg, 'FALLBACK_FPS', 1.0)
         )
     logger.info(f"Frame interval: {frame_interval:.3f} s  ({len(time_array)} frames)")
+    
+    
+    # Reroute the memory maps to the local machine's fast temporary storage
+    local_temp_dir = tempfile.gettempdir()
+    roi_mmap_path = os.path.join(local_temp_dir, f"roi_stack_{cfg.EXPERIMENT_BASE_NAME}.dat")
+    dye_mmap_path = os.path.join(local_temp_dir, f"dye_stack_{cfg.EXPERIMENT_BASE_NAME}.dat")
+    
+    tracking_only = getattr(cfg, 'TRACKING_ONLY_MODE', False)
+    
+    logger.info(f"Compiling TIFFs into local memory-mapped stacks at {local_temp_dir}...")
+    roi_mmap_info = create_memmap_stack(roi_files, roi_mmap_path, desc="ROI Stack")
+    
+    if tracking_only:
+        logger.info("TRACKING_ONLY_MODE is True. Skipping Dye Stack compilation.")
+        dye_mmap_info = (None, None, None)
+    else:
+        dye_mmap_info = create_memmap_stack(dye_files, dye_mmap_path, desc="Dye Stack")
 
     return {
         'dye_files':      dye_files,
-        'roi_files':      roi_files,
+        'roi_mmap_info':  roi_mmap_info,
+        'dye_mmap_info':  dye_mmap_info,
+        'roi_mmap_path':  roi_mmap_path,  
+        'dye_mmap_path':  dye_mmap_path,  
         'time_array':     time_array,
         'frame_interval': frame_interval,
         'circles':        circles,
     }
-
 
 # -------------------------------------------------------------------
 # --- 3. PARALLEL GUV PROCESSING ---
 # -------------------------------------------------------------------
 
 def process_all_guvs(circles: list[dict],
-                     dye_files: list,
-                     roi_files: list,
+                     roi_mmap_info: tuple,
+                     dye_mmap_info: tuple,
                      logger: logging.Logger) -> dict:
     """
     Runs process_single_guv for each circle using multiprocessing.
     """
+    # Extract the total number of frames from the shape tuple
+    n_frames = roi_mmap_info[1][0]
+
     process_func = partial(
         utils.process_single_guv,
-        roi_files=roi_files,
-        dye_files=dye_files,
+        roi_mmap_info=roi_mmap_info,
+        dye_mmap_info=dye_mmap_info,
+        n_frames=n_frames
     )
 
     tasks = [
-        (str(c['id']),          # guv_id
-         (c['x'], c['y']),      # initial_center
-         c['r'],                 # initial_radius  (already in pixels, no /2)
+        (str(c['id']),           # guv_id
+         (c['x'], c['y']),       # initial_center
+         c['r'],                 # initial_radius
          (i == 0))               # is_first_guv
         for i, c in enumerate(circles)
     ]
@@ -184,7 +228,6 @@ def process_all_guvs(circles: list[dict],
     # ── Unpack ────────────────────────────────────────────────────────────
     all_intensity  = []
     all_background = []
-    all_jumps      = []
     quality_log    = []
     valid_indices  = []
     tracking_rows  = []
@@ -212,19 +255,28 @@ def process_all_guvs(circles: list[dict],
         if result is not None:
             all_intensity .append(result['intensity_trace'])
             all_background.append(result['background_trace'])
-            all_jumps     .append(result['jump_frame'])
             valid_indices .append(i)
 
             tr = result.get('tracking', {})
-            for fi, (c, r, s) in enumerate(zip(
+            for fi, (c, r, s, el) in enumerate(zip(
                     tr.get('centers', []),
                     tr.get('radii', []),
-                    tr.get('ring_scores', []))):
-                if c is not None and r is not None:
+                    tr.get('ring_scores', []),
+                    tr.get('ellipses', []))):
+                if c is not None and r is not None and el is not None:
+                    a, b = el['axes']
+                    major = max(a, b)
+                    minor = min(a, b)
+                    eccentricity = np.sqrt(1.0 - (minor / major)**2)
+                    
                     tracking_rows.append({
                         'guv_id': gid, 'frame': fi,
                         'x': c[0], 'y': c[1],
-                        'radius': r, 'ring_score': round(s, 2)
+                        'radius': r, 
+                        'semi_major': round(major, 2), 
+                        'semi_minor': round(minor, 2),
+                        'eccentricity': round(eccentricity, 4),
+                        'ring_score': round(s, 2)
                     })
         else:
             logger.warning(f"  GUV {gid}: no data returned.")
@@ -241,8 +293,10 @@ def process_all_guvs(circles: list[dict],
     )
 
     # Save tracking data
+    df_track = None
     if tracking_rows and getattr(cfg, 'EXPORT_TRACKING_DATA', True):
-        pd.DataFrame(tracking_rows).to_csv(
+        df_track = pd.DataFrame(tracking_rows)
+        df_track.to_csv(
             os.path.join(cfg.OUTPUT_IMAGE_FOLDER,
                          f"{cfg.EXPERIMENT_BASE_NAME}_tracking_data.csv"),
             index=False
@@ -252,8 +306,8 @@ def process_all_guvs(circles: list[dict],
     return {
         'all_intensity_curves':  all_intensity,
         'all_background_curves': all_background,
-        'all_jump_frames':       all_jumps,
         'valid_guv_indices':     valid_indices,
+        'tracking_dataframe':    df_track,
     }
 
 
@@ -266,38 +320,39 @@ def normalize_and_align_curves(guv_results: dict,
                                 circles: list[dict],
                                 logger: logging.Logger) -> dict | None:
     """
-    Normalises: I_uptake = (I_dye − I₀) / (I_bg − I₀)
-    Aligns:     t = 0 at the median jump frame.
-    Uses nanmean/nanmedian so post-rupture NaN frames are excluded.
+    Normalises: Fractional Retention = (I_dye - I_bg) / (I0 - bg0)
+    Aligns:     t = 0 at the pulse frame.
     """
-    logger.info("Normalising intensity curves ...")
-
+    logger.info("Normalising intensity curves for dye efflux...")
+    
+    match = re.search(r'frame(\d+)', cfg.EXPERIMENT_BASE_NAME)
+    PULSE_FRAME = int(match.group(1)) if match else 7
     normalised = []
-    for dye, bg, jf in zip(guv_results['all_intensity_curves'],
-                            guv_results['all_background_curves'],
-                            guv_results['all_jump_frames']):
-        baseline_end = max(cfg.MIN_BASELINE_FRAMES, jf)
-        if baseline_end >= len(dye):
+
+    for dye, bg in zip(guv_results['all_intensity_curves'],
+                       guv_results['all_background_curves']):
+        if PULSE_FRAME >= len(dye):
             continue
-        I0   = float(np.nanmean(dye[:baseline_end]))
-        num  = dye - I0
-        den  = bg  - I0
+
+        I0  = float(np.nanmean(dye[:PULSE_FRAME]))
+        bg0 = float(np.nanmean(bg[:PULSE_FRAME]))
+        
+        den = I0 - bg0
+        
         with np.errstate(divide='ignore', invalid='ignore'):
-            norm = np.where(np.isfinite(den) & (den != 0), num / den, np.nan)
+            if den == 0 or np.isnan(den):
+                norm = np.full_like(dye, np.nan)
+            else:
+                norm = (dye - bg) / den
+                
         normalised.append(norm)
 
     if not normalised:
         logger.error("Normalisation failed for all GUVs.")
         return None
 
-    jumps = np.array(guv_results['all_jump_frames'])
-    nz    = jumps[jumps > 0]
-    med_j = int(np.median(nz)) if len(nz) > 0 else 0
-    med_j = min(med_j, len(time_array) - 1)
-    logger.info(f"Median jump frame: {med_j}")
-
-    arr   = np.array(normalised)[:, med_j:]
-    t_al  = time_array[med_j:] - time_array[med_j]
+    arr   = np.array(normalised)[:, PULSE_FRAME:]
+    t_al  = time_array[PULSE_FRAME:] - time_array[PULSE_FRAME]
     avg   = np.nanmean(arr, axis=0)
 
     valid_ids = [str(circles[i]['id']) for i in guv_results['valid_guv_indices']]
@@ -307,7 +362,7 @@ def normalize_and_align_curves(guv_results: dict,
         'average_curve':      avg,
         'all_curves_aligned': arr,
         'valid_guv_ids':      valid_ids,
-        'median_jump_frame':  med_j,
+        'median_jump_frame':  PULSE_FRAME,
     }
 
 
@@ -315,83 +370,125 @@ def normalize_and_align_curves(guv_results: dict,
 # --- 5. FITTING ---
 # -------------------------------------------------------------------
 
-def fit_average_curve(t: np.ndarray, avg: np.ndarray,
-                      logger: logging.Logger) -> dict:
+def fit_individual_curves(aligned: dict, guv_results: dict, t: np.ndarray, logger: logging.Logger) -> pd.DataFrame:
+    arr = aligned['all_curves_aligned']
+    ids = aligned['valid_guv_ids']
+    df_track = guv_results['tracking_dataframe']
+    
+    fit_records = []
+    
+    for i, curve in enumerate(arr):
+        guv_id = ids[i]
+        
+        guv_data = df_track[df_track['guv_id'] == guv_id]
+        if guv_data.empty: continue
+        r_px = guv_data['radius'].iloc[0]
+        r_um = r_px * getattr(cfg, 'MICRONS_PER_PIXEL', 1.0)
+        
+        ok = np.isfinite(curve)
+        t_c, y_c = t[ok], curve[ok]
+        
+        if len(t_c) < 5:
+            continue
+            
+        y_start, y_end = y_c[0], y_c[-1]
+        A_est = abs(y_end - y_start)
+        
+        try:
+            target_y = y_start - 0.63 * A_est if cfg.MODEL_TO_USE.startswith('EFFLUX') else y_start + 0.63 * A_est
+            idx63 = np.argmax(y_c < target_y) if cfg.MODEL_TO_USE.startswith('EFFLUX') else np.argmax(y_c > target_y)
+            tau_e = t_c[idx63] if idx63 > 0 else t_c[-1] / 3.0
+        except Exception:
+            tau_e = t_c[-1] / 3.0
+            
+        tau_e = max(tau_e, 1.0)
+        
+        if cfg.MODEL_TO_USE == 'EFFLUX-1EXP':
+            fn = utils.efflux_1exp
+            p0 = (y_start, y_end, tau_e, 0.0)
+            bnds = ((0, -2, 0.01, -0.1), (2, 2, 5000, 0.1))
+            names = ['I0', 'Iinf', 'tau', 'D']
+        elif cfg.MODEL_TO_USE == 'INFLUX-1EXP':
+            fn = utils.influx_1exp
+            p0 = (y_start, y_end, tau_e, 0.0)
+            bnds = ((-2, 0, 0.01, -0.1), (2, 2, 5000, 0.1))
+            names = ['I0', 'Iinf', 'tau', 'D']
+        elif cfg.MODEL_TO_USE == 'EFFLUX-2EXP':
+            fn = utils.efflux_2exp
+            p0 = (y_end, A_est * 0.5, tau_e * 0.5, A_est * 0.5, tau_e * 2.0, 0.0)
+            bnds = ((-2, 0, 0.01, 0, 0.01, -0.1), (2, 2, 5000, 2, 5000, 0.1))
+            names = ['Iinf', 'a1', 'tau1', 'a2', 'tau2', 'D']
+        elif cfg.MODEL_TO_USE == 'INFLUX-2EXP':
+            fn = utils.influx_2exp
+            p0 = (y_start, A_est * 0.5, tau_e * 0.5, A_est * 0.5, tau_e * 2.0, 0.0)
+            bnds = ((-2, 0, 0.01, 0, 0.01, -0.1), (2, 2, 5000, 2, 5000, 0.1))
+            names = ['I0', 'a1', 'tau1', 'a2', 'tau2', 'D']
+        else:
+            logger.error("Unknown model selected.")
+            continue
+        
+        try:
+            params, _ = sc.curve_fit(fn, t_c, y_c, p0=p0, bounds=bnds, maxfev=10000)
+            res = {'guv_id': guv_id, 'radius_um': r_um}
+            res.update(dict(zip(names, params)))
+            fit_records.append(res)
+            
+            fig, ax = plt.subplots()
+            ax.plot(t_c, y_c, 'k.', alpha=0.5, label='Data')
+            ax.plot(t_c, fn(t_c, *params), 'r-', label='Fit')
+            if 'tau2' in names:
+                ax.set_title(f"GUV {guv_id} (R={r_um:.1f} $\mu$m)\nTau1: {params[2]:.2f} s, Tau2: {params[4]:.2f} s")
+            else:
+                ax.set_title(f"GUV {guv_id} (R={r_um:.1f} $\mu$m)\nTau: {params[2]:.2f} s")
+            ax.set_xlabel("Time (s)")
+            ax.set_ylabel("Normalized Intensity")
+            ax.legend()
+            fig.savefig(os.path.join(cfg.OUTPUT_IMAGE_FOLDER, f"{cfg.EXPERIMENT_BASE_NAME}_fit_GUV_{guv_id}.png"))
+            plt.close(fig)
+            
+        except RuntimeError:
+            logger.warning(f"Fitting failed for GUV {guv_id}")
+            
+    df_fits = pd.DataFrame(fit_records)
+    return df_fits
 
-    logger.info(f"Fitting model: {cfg.MODEL_TO_USE}")
-
-    end = min(int(round(len(t) * cfg.FIT_DATA_PERCENTAGE)), len(t))
-    t_f = t[:end]
-    y_f = avg[:end]
-
-    ok = np.isfinite(y_f)
-    t_c, y_c = t_f[ok], y_f[ok]
-
-    if len(t_c) < 5:
-        logger.error("Too few valid points for fitting.")
-        p0  = (cfg.FIT_INITIAL_GUESS_4PARAM if cfg.MODEL_TO_USE == '4-PARAM'
-               else cfg.FIT_INITIAL_GUESS_5PARAM)
-        fc  = (utils.dyn_model_4param(t, *p0) if cfg.MODEL_TO_USE == '4-PARAM'
-               else utils.dyn_model_5param(t, *p0))
-        names = (['I_offset','A','tau','D'] if cfg.MODEL_TO_USE == '4-PARAM'
-                 else ['Af','A1','tau1','A2','tau2'])
-        return {'params': dict(zip(names, p0)), 'fit_curve': fc,
-                'fit_failed': True, 'fit_slice_index': end}
-
-    mn, mx = y_c.min(), y_c.max()
-    A_est  = mx - mn
-    try:
-        idx63 = np.argmax(y_c > mn + 0.63 * A_est)
-        tau_e = t_c[idx63] if idx63 > 0 else t_c[-1] / 2
-    except Exception:
-        tau_e = t_c[-1] / 5
-    tau_e = max(tau_e, 1.0)
-
-    if cfg.MODEL_TO_USE == '5-PARAM':
-        fn   = utils.dyn_model_5param
-        p0   = (mx, A_est*0.5, tau_e*0.5, A_est*0.5, tau_e*2)
-        bnds = ((-1,-10,0.01,-10,0.01),(10,10,5000,10,5000))
-        names = ['Af','A1','tau1','A2','tau2']
-    else:
-        fn   = utils.dyn_model_4param
-        p0   = (mn, A_est, tau_e, 0.0)
-        bnds = ((-2,-0.2,0.01,-0.1),(2,10,5000,0.1))
-        names = ['I_offset','A','tau','D']
-
-    try:
-        params, _ = sc.curve_fit(fn, t_c, y_c, p0=p0, bounds=bnds, maxfev=10000)
-        failed = False
-    except RuntimeError as e:
-        logger.error(f"Fitting failed: {e}")
-        params = np.array(p0); failed = True
-
-    fc = fn(t, *params)
-    logger.info(f"Fit: " + ", ".join(f"{n}={v:.3f}" for n, v in zip(names, params)))
-
-    return {'params': dict(zip(names, params)), 'fit_curve': fc,
-            'fit_failed': failed, 'fit_slice_index': end}
-
+def generate_parameter_boxplots(df_fits: pd.DataFrame, logger: logging.Logger):
+    if df_fits.empty: return
+    
+    bins = [0, 5.0, 8.0, 11.0, 100.0]
+    labels = ['<5.0', '5.0-8.0', '8.0-11.0', '>11.0']
+    df_fits['size_group'] = pd.cut(df_fits['radius_um'], bins=bins, labels=labels)
+    
+    df_fits.to_csv(os.path.join(cfg.OUTPUT_IMAGE_FOLDER, f"{cfg.EXPERIMENT_BASE_NAME}_fit_parameters.csv"), index=False)
+    
+    params_to_plot = [col for col in df_fits.columns if col not in ['guv_id', 'radius_um', 'size_group']]
+    
+    fig, axes = plt.subplots(1, len(params_to_plot), figsize=(5 * len(params_to_plot), 5))
+    if len(params_to_plot) == 1: axes = [axes]
+    
+    for ax, param in zip(axes, params_to_plot):
+        sns.boxplot(data=df_fits, x='size_group', y=param, ax=ax)
+        sns.stripplot(data=df_fits, x='size_group', y=param, ax=ax, color='black', alpha=0.5)
+        ax.set_title(param)
+        ax.set_xlabel('Radius ($\mu$m)')
+        
+    plt.tight_layout()
+    fig.savefig(os.path.join(cfg.OUTPUT_IMAGE_FOLDER, f"{cfg.EXPERIMENT_BASE_NAME}_parameter_boxplots.png"), dpi=300)
+    plt.close(fig)
 
 # -------------------------------------------------------------------
 # --- 6. EXPORT ---
 # -------------------------------------------------------------------
 
-def export_results(aligned: dict, fit: dict,
-                   dye_files: list, logger: logging.Logger):
-
+def export_results(aligned: dict, dye_files: list, logger: logging.Logger):
     t    = aligned['t_aligned']
     avg  = aligned['average_curve']
     arr  = aligned['all_curves_aligned']
     ids  = aligned['valid_guv_ids']
     mjf  = aligned['median_jump_frame']
-    fc   = fit['fit_curve']
-    fp   = fit['fit_params'] if 'fit_params' in fit else fit['params']
-    fsi  = fit['fit_slice_index']
-    fail = fit['fit_failed']
 
     dye_al = dye_files[mjf:]
 
-    # Snapshot frames
     for i, tp in enumerate(cfg.EXPORT_TIME_POINTS_S):
         fi, _ = utils.find_closest_frame(t, tp)
         if fi >= len(dye_al): continue
@@ -402,34 +499,6 @@ def export_results(aligned: dict, fit: dict,
         cv2.imwrite(os.path.join(cfg.OUTPUT_IMAGE_FOLDER,
                     f"frame_{i+1}_at_{int(round(tp))}s.png"), styled)
 
-    # Kinetic plot
-    fig, ax = plt.subplots(figsize=(10, 6))
-    for curve in arr:
-        ax.plot(t[:len(curve)], np.where(np.isfinite(curve), curve, np.nan),
-                color='gray', alpha=0.2, lw=0.8)
-    ax.plot(t, avg, 'r.', ms=3, label=f'Average (n={len(arr)})')
-    ax.plot(t, fc,  'k-', lw=2, label='Fit')
-    if 0 < fsi <= len(t):
-        ax.plot(t[fsi-1], avg[fsi-1], 'b*', ms=10, label='End of fit')
-
-    if cfg.MODEL_TO_USE == '5-PARAM':
-        title = (f"$A_f={fp['Af']:.2f}$  $A_1={fp['A1']:.2f}$  "
-                 f"$\\tau_1={fp['tau1']:.1f}$ s  $A_2={fp['A2']:.2f}$  "
-                 f"$\\tau_2={fp['tau2']:.1f}$ s")
-    else:
-        title = (f"$I_{{off}}={fp['I_offset']:.2f}$  $A={fp['A']:.2f}$  "
-                 f"$\\tau={fp['tau']:.1f}$ s  $D={fp['D']:.4f}$")
-    if fail: title = "FIT FAILED — Initial Guess\n" + title
-
-    ax.set_title(title); ax.set_xlabel("Time (s) from pulse")
-    ax.set_ylabel(r"$I_{uptake}$"); ax.legend(loc='lower right')
-    plt.grid(True, alpha=0.4)
-    fig.savefig(os.path.join(cfg.OUTPUT_IMAGE_FOLDER,
-                f"{cfg.EXPERIMENT_BASE_NAME}_kinetic_fit.png"),
-                dpi=300, bbox_inches='tight')
-    plt.close(fig)
-
-    # Normalised curve CSV
     try:
         hdrs  = ['Time (s)'] + [f'GUV_{g}_I_uptake' for g in ids] + ['Average_I_uptake']
         data  = np.hstack([t.reshape(-1,1), arr.T, avg.reshape(-1,1)])
@@ -441,7 +510,7 @@ def export_results(aligned: dict, fit: dict,
         logger.warning(f"Could not save normalised CSV: {e}")
 
     logger.info("Export complete.")
-
+    
 
 # -------------------------------------------------------------------
 # --- 7. VALIDATION ---
@@ -451,8 +520,8 @@ def validate_config(logger: logging.Logger) -> bool:
     ok = True
     checks = [
         (os.path.exists(cfg.DATA_FOLDER), f"DATA_FOLDER not found: {cfg.DATA_FOLDER}"),
-        (cfg.MODEL_TO_USE in ('4-PARAM','5-PARAM'),  "MODEL_TO_USE must be '4-PARAM' or '5-PARAM'"),
-        (0.05 <= cfg.JUMP_THRESHOLD_PERCENT <= 0.90, "JUMP_THRESHOLD_PERCENT out of range"),
+        (cfg.MODEL_TO_USE in ('EFFLUX-1EXP', 'INFLUX-1EXP', 'EFFLUX-2EXP', 'INFLUX-2EXP'),  
+         "MODEL_TO_USE must be an EFFLUX or INFLUX exponential model"),
         (0.1 <= getattr(cfg,'TRACKING_SEARCH_WINDOW_FACTOR',0.7) <= 3.0,
          "TRACKING_SEARCH_WINDOW_FACTOR should be 0.1–3.0"),
         (0.05 <= getattr(cfg,'TRACKING_MAX_RADIUS_CHANGE_FACTOR',0.2) <= 1.0,
@@ -467,7 +536,6 @@ def validate_config(logger: logging.Logger) -> bool:
         logger.critical("Configuration validation failed.")
     return ok
 
-
 # -------------------------------------------------------------------
 # --- 8. MAIN ---
 # -------------------------------------------------------------------
@@ -475,10 +543,13 @@ def validate_config(logger: logging.Logger) -> bool:
 def main():
     os.makedirs(cfg.OUTPUT_IMAGE_FOLDER, exist_ok=True)
     logger = utils.setup_logging(cfg.OUTPUT_IMAGE_FOLDER, cfg.EXPERIMENT_BASE_NAME)
-    logger.info("=== GUV Analysis Pipeline (ring-score tracking, no CSV) ===")
+    logger.info("=== GUV Analysis Pipeline ===")
 
     if not validate_config(logger):
         return
+    
+    # Initialize data as None so the finally block can safely check it
+    data = None
 
     try:
         # Step 1 – get GUV starting circles (launches GUI if JSON missing)
@@ -493,8 +564,23 @@ def main():
 
         # Step 3 – track & extract intensities
         guv_results = process_all_guvs(
-            data['circles'], data['dye_files'], data['roi_files'], logger
+            data['circles'], data['roi_mmap_info'], data['dye_mmap_info'], logger
         )
+        
+        # Generate the Size, Deformation, and MSD plots
+        df_track = guv_results.get('tracking_dataframe')
+        if df_track is not None:
+            try:
+                utils.plot_tracking_metrics(
+                    df_track, 
+                    data['time_array'], 
+                    cfg.OUTPUT_IMAGE_FOLDER, 
+                    cfg.EXPERIMENT_BASE_NAME, 
+                    getattr(cfg, 'MICRONS_PER_PIXEL', 1.0)
+                )
+                logger.info("Saved size, deformation, and MSD tracking plots.")
+            except Exception as e:
+                logger.warning(f"Failed to generate tracking metrics plots: {e}")
         
         if getattr(cfg, 'TRACKING_ONLY_MODE', False):
             logger.info("=== TRACKING_ONLY_MODE Active: Halting before intensity analysis ===")
@@ -511,16 +597,28 @@ def main():
             return
 
         # Step 5 – fit
-        fit = fit_average_curve(aligned['t_aligned'], aligned['average_curve'], logger)
-
+        df_fits = fit_individual_curves(aligned, guv_results, aligned['t_aligned'], logger)
+        generate_parameter_boxplots(df_fits, logger)
+        
         # Step 6 – export
-        export_results(aligned, fit, data['dye_files'], logger)
+        export_results(aligned, data['dye_files'], logger)
 
         logger.info("=== Pipeline finished successfully ===")
 
     except Exception as e:
         logger.critical(f"Unhandled exception: {e}", exc_info=True)
-
+        
+    finally:
+        # Guarantee removal of memory-mapped files from local disk
+        if data is not None:
+            for path_key in ('roi_mmap_path', 'dye_mmap_path'):
+                mmap_path = data.get(path_key)
+                if mmap_path and os.path.exists(mmap_path):
+                    try:
+                        os.remove(mmap_path)
+                        logger.info(f"Cleaned up temporary file: {mmap_path}")
+                    except Exception as e:
+                        logger.warning(f"Failed to delete temporary file {mmap_path}: {e}")
 
 if __name__ == "__main__":
     main()
