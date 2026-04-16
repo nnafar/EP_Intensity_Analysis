@@ -612,6 +612,7 @@ def main():
         
         # Generate the Size, Deformation, and MSD plots
         df_track = guv_results.get('tracking_dataframe')
+        
         if df_track is not None:
             try:
                 utils.plot_tracking_metrics(

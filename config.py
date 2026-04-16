@@ -1,8 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-======================================================
---- GUV ANALYSIS CONFIGURATION ---
-======================================================
+GUV ANALYSIS CONFIGURATION
 
 Workflow
 --------
@@ -15,9 +13,9 @@ Workflow
 import numpy as np
 import os
 
-# -------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # --- 1. FILE & EXPERIMENT IDENTIFICATION ---
-# -------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 # Set this to the specific folder for the current run
 DATA_FOLDER           = r"M:\tnw\bn\gk\NN\2_Data-Analysis\BulkElectroporation\260331_DOPC_BranchedCortex_Experiment1-400V-500us-frame7"
@@ -44,9 +42,9 @@ FRAME_INTERVAL_SCHEDULE = [
     (22, None, 5.0)  # Post-pulse: remaining frames, 5 s interval
 ]
 
-# -------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # --- 2. ANALYSIS & MASKING PARAMETERS ---
-# -------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 # 'LABELED'   – bright ring (fluorescent membrane)
 # 'UNLABELED' – dark ring  (brightfield / phase contrast)
@@ -66,21 +64,18 @@ PEAK_FIND_MIN_PROMINENCE = 0.05
 BG_BUFFER_PIXELS     = 1    # gap (px) between outer membrane edge and bg ring start
 BG_RING_WIDTH_PIXELS = 4    # width (px) of background sampling ring
 
-# -------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # --- 3. FITTING & MODELING ---
-# -------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
-# ['EFFLUX-1EXP' or 'EFFLUX-2EXP'] ['INFLUX-1EXP' or 'INFLUX-2EXP']
+# Dye Efflux: ['EFFLUX-1EXP' or 'EFFLUX-2EXP'] 
+# Dye Influx: ['INFLUX-1EXP' or 'INFLUX-2EXP']
 MODEL_TO_USE        = 'EFFLUX-1EXP' 
 FIT_DATA_PERCENTAGE = 0.9
 
-FIT_INITIAL_GUESS_5PARAM = (1.0,  0.5,  10.0, 0.5, 100.0)
-FIT_INITIAL_GUESS_4PARAM = (0.0,  1.0,  50.0, 0.001)
-
-
-# -------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # --- 4. OUTPUT & VISUALIZATION ---
-# -------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 OUTPUT_IMAGE_FOLDER      = os.path.join(DATA_FOLDER, "output_images")
 EXPORT_TIME_POINTS_S     = [0, 50, 100, 200, 300]
@@ -94,23 +89,23 @@ CONTRAST_P_LOW  = 0.5  # Ignore bottom 0.5% of pixels
 CONTRAST_P_HIGH = 98.0 # Ignore top 2.0% of pixels
 
 EXPORT_MASK_VISUALIZATION     = False
-MASK_VIZ_OVERLAY_ALPHA        = 0.8
+MASK_VIZ_OVERLAY_ALPHA        = 0.7
 VIZ_MEMBRANE_THICKNESS_PIXELS = None
 
-# Add the video export variables here:
+# Consolidated video export:
 EXPORT_CONSOLIDATED_TRACK_VIDEO = True
 EXPORT_CONSOLIDATED_MASK_VIDEO  = True
 VIDEO_EXPORT_FPS                = 10.0
 
 
-# -------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # --- 5. TRACKING PARAMETERS ---
-# -------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 # Add this flag to disable dye analysis
 TRACKING_ONLY_MODE = False
 
-# ── Centre grid search ──────────────────────────────────────────────
+# Centre grid search
 # Search radius = previous_radius × TRACKING_SEARCH_WINDOW_FACTOR.
 # Increase if GUVs move more than ~70 % of their radius between frames.
 TRACKING_SEARCH_WINDOW_FACTOR = 0.7 
@@ -119,24 +114,21 @@ TRACKING_SEARCH_WINDOW_FACTOR = 0.7
 # Smaller = finer / slower. 0.12–0.20 is a good balance.
 TRACKING_GRID_STEP_FACTOR = 0.20 
 
-# ── Radius change clamp ─────────────────────────────────────────────
+# Radius change clamp 
 # Maximum fractional radius change allowed per frame.
 # 0.20 = up to 20 % shrink or grow per frame.
 TRACKING_MAX_RADIUS_CHANGE_FACTOR = 0.20
 
-# ── Rupture detection ───────────────────────────────────────────────
-# GUV is declared ruptured when its ring-quality score (arbitrary
-# intensity units) falls below this threshold.
+# Rupture detection
+# GUV is declared ruptured when its ring-quality score < this threshold.
 # Typical good-frame scores are 10–30; set this to ~20–30 % of that.
-# Run with EXPORT_DEBUG_PLOTS=True on a representative experiment first
-# to calibrate.
 RUPTURE_SCORE_THRESHOLD = 4.0
 
 # Number of consecutive frames below RUPTURE_SCORE_THRESHOLD required
 # to declare rupture (reduces false positives from single bad frames).
 RUPTURE_DETECTION_CONSECUTIVE_FAILS = 3
 
-# ── Tracking outputs ────────────────────────────────────────────────
+# Tracking outputs
 # CSV: per-frame (guv_id, frame, x, y, radius, ring_score)
 EXPORT_TRACKING_DATA = True
 
