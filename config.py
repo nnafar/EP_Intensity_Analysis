@@ -73,11 +73,27 @@ BG_RING_WIDTH_PIXELS = 4    # width (px) of background sampling ring
 MODEL_TO_USE        = 'EFFLUX-1EXP' 
 FIT_DATA_PERCENTAGE = 0.9
 
+# Pulse-frame detection
+# Set to an integer to hard-pin the pulse frame and skip auto-detection.
+# Set to None to let the pipeline detect it from the dye signal drop/rise.
+PULSE_FRAME_OVERRIDE = None
+
+# Gaussian σ (frames) used to smooth the mean trace before differentiation.
+# Increase if the signal is noisy; decrease if pulses are very abrupt.
+PULSE_DETECT_SMOOTH_SIGMA = 2.0
+
 # -----------------------------------------------------------------------------
 # --- 4. OUTPUT & VISUALIZATION ---
 # -----------------------------------------------------------------------------
 
 OUTPUT_IMAGE_FOLDER      = os.path.join(DATA_FOLDER, "output_images")
+
+# Output sub-folders (created automatically at runtime)
+FOLDER_TRACKING = os.path.join(OUTPUT_IMAGE_FOLDER, "tracking")   # track PNGs/AVIs, metrics, CSVs
+FOLDER_MASKS    = os.path.join(OUTPUT_IMAGE_FOLDER, "masks")      # mask overlay AVI
+FOLDER_DYE      = os.path.join(OUTPUT_IMAGE_FOLDER, "dye")        # fit plots, frame exports, CSVs
+FOLDER_SCORES   = os.path.join(OUTPUT_IMAGE_FOLDER, "scores")     # per-GUV ring-score plots
+
 EXPORT_TIME_POINTS_S     = [0, 50, 100, 200, 300]
 EXPORT_DEBUG_PLOTS       = True
 
@@ -136,9 +152,32 @@ EXPORT_TRACKING_DATA = True
 EXPORT_TRACK_VISUALIZATION = True
 
 
-# -------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# --- 7. ACTIN CORTEX ANALYSIS ---
+# -----------------------------------------------------------------------------
+
+# Enable actin cortex analysis on the C2 channel
+ANALYZE_ACTIN_CHANNEL = True
+
+# Which mask to use for the cortex signal.
+# 'membrane' = the ring mask (peak ± MEMBRANE_FIXED_HALF_WIDTH).
+# 'inner'    = the inner lumen mask (gives lumenal actin only).
+# Both are always extracted; this controls the *cortex* definition.
+ACTIN_CORTEX_MASK = 'membrane'
+
+# Half-width (pixels) for the cortex ring mask in C2.
+# Increase slightly if the cortex ring is thicker than the membrane label.
+ACTIN_CORTEX_HALF_WIDTH = 4   # px  (~0.44 µm at 0.11 µm/px)
+
+# Export a per-GUV CSV and plot of cortex / lumen actin over time
+EXPORT_ACTIN_TRACES = True
+
+# Smoothing sigma (frames) for the actin ratio plot; set 0 to disable
+ACTIN_PLOT_SMOOTH_SIGMA = 1.5
+
+# -----------------------------------------------------------------------------
 # --- 6. ADVANCED ---
-# -------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 N_WORKERS    = 3 #os.cpu_count() - 1 if os.cpu_count() > 1 else 1
 FALLBACK_FPS = 1.0 # second(s)

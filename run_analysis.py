@@ -132,6 +132,10 @@ def load_input_data(circles: list[dict], logger: logging.Logger) -> dict | None:
         cfg.DATA_FOLDER,
         cfg.ROI_CHANNEL_PREFIX + cfg.EXPERIMENT_BASE_NAME + cfg.TIF_SUFFIX
     )))
+    actin_files = natsorted(glob.glob(os.path.join(
+        cfg.DATA_FOLDER,
+        cfg.ACTIN_CHANNEL_PREFIX + cfg.EXPERIMENT_BASE_NAME + cfg.TIF_SUFFIX
+    ))) if getattr(cfg, 'ANALYZE_ACTIN_CHANNEL', False) else []
 
     if not dye_files:
         logger.error("No dye files found.")
@@ -139,6 +143,11 @@ def load_input_data(circles: list[dict], logger: logging.Logger) -> dict | None:
     if not roi_files:
         logger.error("No ROI files found.")
         return None
+
+    if actin_files and len(actin_files) != len(roi_files):
+        n = min(len(actin_files), len(roi_files))
+        logger.warning(f"Actin frame count mismatch — trimming to {n} frames.")
+        actin_files = actin_files[:n]
 
     if len(dye_files) != len(roi_files):
         n = min(len(dye_files), len(roi_files))
@@ -168,8 +177,9 @@ def load_input_data(circles: list[dict], logger: logging.Logger) -> dict | None:
             mmap_dir = cfg.DATA_FOLDER
    
     # Use a generic name to keep the path length short
-    roi_mmap_path = os.path.join(mmap_dir, "roi_temp.dat")
-    dye_mmap_path = os.path.join(mmap_dir, "dye_temp.dat")
+    roi_mmap_path   = os.path.join(mmap_dir, "roi_temp.dat")
+    dye_mmap_path   = os.path.join(mmap_dir, "dye_temp.dat")
+    actin_mmap_path = os.path.join(mmap_dir, "actin_temp.dat")
     
     tracking_only = getattr(cfg, 'TRACKING_ONLY_MODE', False)
     
@@ -182,15 +192,26 @@ def load_input_data(circles: list[dict], logger: logging.Logger) -> dict | None:
     else:
         dye_mmap_info = create_memmap_stack(dye_files, dye_mmap_path, desc="Dye Stack")
 
+    # Actin (C2) stack — only if analysis is enabled and files were found
+    if actin_files and getattr(cfg, 'ANALYZE_ACTIN_CHANNEL', False):
+        actin_mmap_info = create_memmap_stack(actin_files, actin_mmap_path, desc="Actin Stack")
+        logger.info(f"Loaded {len(actin_files)} actin (C2) frame(s).")
+    else:
+        actin_mmap_info = (None, None, None)
+        if getattr(cfg, 'ANALYZE_ACTIN_CHANNEL', False):
+            logger.warning("ANALYZE_ACTIN_CHANNEL=True but no C2 files found — skipping actin analysis.")
+
     return {
-        'dye_files':      dye_files,
-        'roi_mmap_info':  roi_mmap_info,
-        'dye_mmap_info':  dye_mmap_info,
-        'roi_mmap_path':  roi_mmap_path,  
-        'dye_mmap_path':  dye_mmap_path,  
-        'time_array':     time_array,
-        'frame_interval': frame_interval,
-        'circles':        circles,
+        'dye_files':        dye_files,
+        'roi_mmap_info':    roi_mmap_info,
+        'dye_mmap_info':    dye_mmap_info,
+        'actin_mmap_info':  actin_mmap_info,
+        'roi_mmap_path':    roi_mmap_path,
+        'dye_mmap_path':    dye_mmap_path,
+        'actin_mmap_path':  actin_mmap_path,
+        'time_array':       time_array,
+        'frame_interval':   frame_interval,
+        'circles':          circles,
     }
 
 # -------------------------------------------------------------------
@@ -200,7 +221,8 @@ def load_input_data(circles: list[dict], logger: logging.Logger) -> dict | None:
 def process_all_guvs(circles: list[dict],
                      roi_mmap_info: tuple,
                      dye_mmap_info: tuple,
-                     logger: logging.Logger) -> dict:
+                     logger: logging.Logger,
+                     actin_mmap_info: tuple = (None, None, None)) -> dict:
     """
     Runs process_single_guv for each circle using multiprocessing.
     """
@@ -211,7 +233,8 @@ def process_all_guvs(circles: list[dict],
         utils.process_single_guv,
         roi_mmap_info=roi_mmap_info,
         dye_mmap_info=dye_mmap_info,
-        n_frames=n_frames
+        n_frames=n_frames,
+        actin_mmap_info=actin_mmap_info,
     )
 
     tasks = [
@@ -236,6 +259,7 @@ def process_all_guvs(circles: list[dict],
     # ── Unpack ────────────────────────────────────────────────────────────
     all_intensity  = []
     all_background = []
+    all_actin_data = []     # ← new: per-GUV actin traces
     quality_log    = []
     valid_indices  = []
     tracking_rows  = []
@@ -263,6 +287,7 @@ def process_all_guvs(circles: list[dict],
         if result is not None:
             all_intensity .append(result['intensity_trace'])
             all_background.append(result['background_trace'])
+            all_actin_data.append(result.get('actin_data'))   # None if not analysed
             valid_indices .append(i)
 
             tr = result.get('tracking', {})
@@ -295,7 +320,7 @@ def process_all_guvs(circles: list[dict],
 
     # Save quality log
     pd.DataFrame(quality_log).to_csv(
-        os.path.join(cfg.OUTPUT_IMAGE_FOLDER,
+        os.path.join(cfg.FOLDER_TRACKING,
                      f"{cfg.EXPERIMENT_BASE_NAME}_detection_quality.csv"),
         index=False
     )
@@ -305,7 +330,7 @@ def process_all_guvs(circles: list[dict],
     if tracking_rows and getattr(cfg, 'EXPORT_TRACKING_DATA', True):
         df_track = pd.DataFrame(tracking_rows)
         df_track.to_csv(
-            os.path.join(cfg.OUTPUT_IMAGE_FOLDER,
+            os.path.join(cfg.FOLDER_TRACKING,
                          f"{cfg.EXPERIMENT_BASE_NAME}_tracking_data.csv"),
             index=False
         )
@@ -315,6 +340,7 @@ def process_all_guvs(circles: list[dict],
         'raw_results':           results, 
         'all_intensity_curves':  all_intensity,
         'all_background_curves': all_background,
+        'all_actin_data':        all_actin_data,   # ← new
         'valid_guv_indices':     valid_indices,
         'tracking_dataframe':    df_track,
     }
@@ -324,31 +350,27 @@ def process_all_guvs(circles: list[dict],
 # --- 4. NORMALISATION & ALIGNMENT ---
 # -------------------------------------------------------------------
 
-# run_analysis.py
-
 def normalize_and_align_curves(guv_results: dict,
                                 time_array: np.ndarray,
                                 circles: list[dict],
+                                pulse_frame: int,
                                 logger: logging.Logger) -> dict | None:
     """
     Normalises: Fractional Retention = (I_dye - I_bg) / (I0 - bg0)
-    Aligns:     t = 0 at the pulse frame extracted from filename.
+    Aligns:     t = 0 at *pulse_frame* (auto-detected or overridden in config).
     """
-    logger.info("Normalising intensity curves for dye efflux...")
-    
-    # Extract pulse frame from experiment name (e.g., frame7)
-    match = re.search(r'frame(\d+)', cfg.EXPERIMENT_BASE_NAME)
-    PULSE_FRAME = int(match.group(1)) if match else 0
+    logger.info(f"Normalising intensity curves (pulse frame = {pulse_frame}) ...")
     
     normalised = []
     for dye, bg in zip(guv_results['all_intensity_curves'],
                        guv_results['all_background_curves']):
-        if PULSE_FRAME >= len(dye):
+        if pulse_frame >= len(dye):
             continue
 
-        # Baseline is everything before the pulse
-        I0  = float(np.nanmean(dye[:PULSE_FRAME]))
-        bg0 = float(np.nanmean(bg[:PULSE_FRAME]))
+        # Strictly use the first 5 frames for a clean pre-pulse baseline
+        safe_baseline_frames = min(5, len(dye))
+        I0  = float(np.nanmean(dye[:safe_baseline_frames]))
+        bg0 = float(np.nanmean(bg[:safe_baseline_frames]))
         den = I0 - bg0
         
         with np.errstate(divide='ignore', invalid='ignore'):
@@ -363,8 +385,8 @@ def normalize_and_align_curves(guv_results: dict,
         return None
 
     # Align curves to start at t=0 on the pulse frame
-    arr   = np.array(normalised)[:, PULSE_FRAME:]
-    t_al  = time_array[PULSE_FRAME:] - time_array[PULSE_FRAME]
+    arr   = np.array(normalised)[:, pulse_frame:]
+    t_al  = time_array[pulse_frame:] - time_array[pulse_frame]
     avg   = np.nanmean(arr, axis=0)
 
     valid_ids = [str(circles[i]['id']) for i in guv_results['valid_guv_indices']]
@@ -374,7 +396,7 @@ def normalize_and_align_curves(guv_results: dict,
         'average_curve':      avg,
         'all_curves_aligned': arr,
         'valid_guv_ids':      valid_ids,
-        'median_jump_frame':  PULSE_FRAME,
+        'median_jump_frame':  pulse_frame,
     }
 
 
@@ -417,12 +439,20 @@ def fit_individual_curves(aligned: dict, guv_results: dict, t: np.ndarray, logge
         
         if cfg.MODEL_TO_USE == 'EFFLUX-1EXP':
             fn = utils.efflux_1exp
-            p0 = (y_start, y_end, tau_e, 0.0)
+            # Clip guesses to fit within ((0, -2, 0.01, -0.1), (2, 2, 5000, 0.1))
+            p0 = (np.clip(y_start, 0.01, 1.99),
+                  np.clip(y_end, -1.99, 1.99),
+                  np.clip(tau_e, 0.02, 4999.0),
+                  0.0)
             bnds = ((0, -2, 0.01, -0.1), (2, 2, 5000, 0.1))
             names = ['I0', 'Iinf', 'tau', 'D']
         elif cfg.MODEL_TO_USE == 'INFLUX-1EXP':
             fn = utils.influx_1exp
-            p0 = (y_start, y_end, tau_e, 0.0)
+            # Clip guesses to fit within ((-2, 0, 0.01, -0.1), (2, 2, 5000, 0.1))
+            p0 = (np.clip(y_start, -1.99, 1.99),
+                  np.clip(y_end, 0.01, 1.99),
+                  np.clip(tau_e, 0.02, 4999.0),
+                  0.0)
             bnds = ((-2, 0, 0.01, -0.1), (2, 2, 5000, 0.1))
             names = ['I0', 'Iinf', 'tau', 'D']
         elif cfg.MODEL_TO_USE == 'EFFLUX-2EXP':
@@ -458,7 +488,7 @@ def fit_individual_curves(aligned: dict, guv_results: dict, t: np.ndarray, logge
             ax.set_xlabel("Time (s)")
             ax.set_ylabel("Normalized Intensity")
             ax.legend()
-            fig.savefig(os.path.join(cfg.OUTPUT_IMAGE_FOLDER, f"{cfg.EXPERIMENT_BASE_NAME}_fit_GUV_{guv_id}.png"))
+            fig.savefig(os.path.join(cfg.FOLDER_DYE, f"{cfg.EXPERIMENT_BASE_NAME}_fit_GUV_{guv_id}.png"))
             plt.close(fig)
             
         except RuntimeError:
@@ -474,7 +504,7 @@ def generate_parameter_boxplots(df_fits: pd.DataFrame, logger: logging.Logger):
     labels = ['<5.0', '5.0-8.0', '8.0-11.0', '>11.0']
     df_fits['size_group'] = pd.cut(df_fits['radius_um'], bins=bins, labels=labels)
     
-    df_fits.to_csv(os.path.join(cfg.OUTPUT_IMAGE_FOLDER, f"{cfg.EXPERIMENT_BASE_NAME}_fit_parameters.csv"), index=False)
+    df_fits.to_csv(os.path.join(cfg.FOLDER_DYE, f"{cfg.EXPERIMENT_BASE_NAME}_fit_parameters.csv"), index=False)
     
     params_to_plot = [col for col in df_fits.columns if col not in ['guv_id', 'radius_um', 'size_group']]
     
@@ -488,7 +518,7 @@ def generate_parameter_boxplots(df_fits: pd.DataFrame, logger: logging.Logger):
         ax.set_xlabel(r'Radius ($\mu$m)')
         
     plt.tight_layout()
-    fig.savefig(os.path.join(cfg.OUTPUT_IMAGE_FOLDER, f"{cfg.EXPERIMENT_BASE_NAME}_parameter_boxplots.png"), dpi=300)
+    fig.savefig(os.path.join(cfg.FOLDER_DYE, f"{cfg.EXPERIMENT_BASE_NAME}_parameter_boxplots.png"), dpi=300)
     plt.close(fig)
 
 # -------------------------------------------------------------------
@@ -514,14 +544,14 @@ def export_results(aligned: dict, dye_files: list, logger: logging.Logger):
         
         styled = utils.style_image(img_bright, f"{int(round(tp))} S",
                                    cfg.MICRONS_PER_PIXEL, cfg.SCALE_BAR_LENGTH_MICRONS)
-        cv2.imwrite(os.path.join(cfg.OUTPUT_IMAGE_FOLDER,
+        cv2.imwrite(os.path.join(cfg.FOLDER_DYE,
                     f"frame_{i+1}_at_{int(round(tp))}s.png"), styled)
 
     try:
         hdrs  = ['Time (s)'] + [f'GUV_{g}_I_uptake' for g in ids] + ['Average_I_uptake']
         data  = np.hstack([t.reshape(-1,1), arr.T, avg.reshape(-1,1)])
         pd.DataFrame(data, columns=hdrs).to_csv(
-            os.path.join(cfg.OUTPUT_IMAGE_FOLDER,
+            os.path.join(cfg.FOLDER_DYE,
                          f"{cfg.EXPERIMENT_BASE_NAME}_normalized_curves.csv"),
             index=False, float_format='%.6f', na_rep='NaN')
     except Exception as e:
@@ -559,7 +589,14 @@ def validate_config(logger: logging.Logger) -> bool:
 # -------------------------------------------------------------------
 
 def main():
-    os.makedirs(cfg.OUTPUT_IMAGE_FOLDER, exist_ok=True)
+    for _folder in (
+        cfg.OUTPUT_IMAGE_FOLDER,
+        cfg.FOLDER_TRACKING,
+        cfg.FOLDER_MASKS,
+        cfg.FOLDER_DYE,
+        cfg.FOLDER_SCORES,
+    ):
+        os.makedirs(_folder, exist_ok=True)
     logger = utils.setup_logging(cfg.OUTPUT_IMAGE_FOLDER, cfg.EXPERIMENT_BASE_NAME)
     logger.info("=== GUV Analysis Pipeline ===")
 
@@ -582,7 +619,8 @@ def main():
 
         # Step 3 – track & extract intensities
         guv_results = process_all_guvs(
-            data['circles'], data['roi_mmap_info'], data['dye_mmap_info'], logger
+            data['circles'], data['roi_mmap_info'], data['dye_mmap_info'], logger,
+            actin_mmap_info=data.get('actin_mmap_info', (None, None, None))
         )
         
         
@@ -594,7 +632,8 @@ def main():
             roi_stack = np.memmap(roi_path, dtype=roi_dtype, mode='r', shape=roi_shape)
             
             utils.export_full_stack_videos(
-                cfg.OUTPUT_IMAGE_FOLDER, 
+                cfg.FOLDER_TRACKING,
+                cfg.FOLDER_MASKS,
                 cfg.EXPERIMENT_BASE_NAME,
                 roi_stack,
                 [r[0] for r in guv_results['raw_results']], # List of 'result' dicts
@@ -605,11 +644,57 @@ def main():
             # free the file handle
             del roi_stack
         
-        # Calculate pulse time for the absolute-time tracking plots
-        match = re.search(r'frame(\d+)', cfg.EXPERIMENT_BASE_NAME)
-        PULSE_FRAME = int(match.group(1)) if match else 7
+        # ── Detect (or override) the pulse frame ──────────────────────────
+        override = getattr(cfg, 'PULSE_FRAME_OVERRIDE', None)
+        if override is not None:
+            PULSE_FRAME = int(override)
+            logger.info(f"Pulse frame: {PULSE_FRAME}  (manual override from config)")
+        elif not getattr(cfg, 'TRACKING_ONLY_MODE', False) and guv_results['all_intensity_curves']:
+            sigma = getattr(cfg, 'PULSE_DETECT_SMOOTH_SIGMA', 2.0)
+            PULSE_FRAME = utils.detect_pulse_frame_efflux(
+                guv_results['all_intensity_curves'],
+                guv_results['all_background_curves'],
+                smooth_sigma=sigma,
+                output_folder=cfg.FOLDER_DYE,
+                experiment_name=cfg.EXPERIMENT_BASE_NAME,
+                time_array=data['time_array'],
+            )
+            # Cross-check against the filename tag if present
+            fn_match = re.search(r'frame(\d+)', cfg.EXPERIMENT_BASE_NAME)
+            if fn_match:
+                fn_frame = int(fn_match.group(1))
+                delta = abs(PULSE_FRAME - fn_frame)
+                if delta > 2:
+                    logger.warning(
+                        f"Auto-detected pulse frame ({PULSE_FRAME}) differs from "
+                        f"filename tag ({fn_frame}) by {delta} frames — "
+                        f"check *_pulse_frame_detection.png or set PULSE_FRAME_OVERRIDE."
+                    )
+                else:
+                    logger.info(
+                        f"Pulse frame: {PULSE_FRAME}  "
+                        f"(auto-detected; filename tag = {fn_frame} ✓)"
+                    )
+            else:
+                logger.info(f"Pulse frame: {PULSE_FRAME}  (auto-detected)")
+        else:
+            # Fallback: filename tag or 0
+            fn_match = re.search(r'frame(\d+)', cfg.EXPERIMENT_BASE_NAME)
+            PULSE_FRAME = int(fn_match.group(1)) if fn_match else 0
+            logger.info(f"Pulse frame: {PULSE_FRAME}  (from filename tag)")
+
         t_pulse = data['time_array'][PULSE_FRAME]
-        
+
+        # Re-draw all per-GUV score plots now that the confirmed pulse frame is known.
+        # (Workers drew them without a pulse line because detection hadn't run yet.)
+        if getattr(cfg, 'EXPORT_TRACK_VISUALIZATION', True):
+            utils.redraw_score_plots(
+                guv_results, data['circles'], data['roi_mmap_info'],
+                PULSE_FRAME,
+                cfg.FOLDER_TRACKING, cfg.FOLDER_SCORES, cfg.EXPERIMENT_BASE_NAME,
+            )
+            logger.info(f"Redrawn score plots with confirmed pulse frame = {PULSE_FRAME}")
+
         # Generate the Size, Deformation, and MSD plots
         df_track = guv_results.get('tracking_dataframe')
         
@@ -618,7 +703,7 @@ def main():
                 utils.plot_tracking_metrics(
                     df_track, 
                     data['time_array'], 
-                    cfg.OUTPUT_IMAGE_FOLDER, 
+                    cfg.FOLDER_TRACKING, 
                     cfg.EXPERIMENT_BASE_NAME, 
                     getattr(cfg, 'MICRONS_PER_PIXEL', 1.0),
                     pulse_time=t_pulse
@@ -636,7 +721,7 @@ def main():
 
         # Step 4 – normalise & align
         aligned = normalize_and_align_curves(
-            guv_results, data['time_array'], data['circles'], logger
+            guv_results, data['time_array'], data['circles'], PULSE_FRAME, logger
         )
         if aligned is None:
             return
@@ -648,6 +733,72 @@ def main():
         # Step 6 – export
         export_results(aligned, data['dye_files'], logger)
 
+        # Step 7 – Actin cortex analysis (C2 channel)
+        actin_data_list = [ad for ad in guv_results.get('all_actin_data', [])
+                           if ad is not None]
+        if actin_data_list and getattr(cfg, 'ANALYZE_ACTIN_CHANNEL', False):
+            logger.info("Running actin cortex analysis ...")
+            aligned_actin = utils.normalize_actin_curves(
+                actin_data_list, PULSE_FRAME, data['time_array']
+            )
+            valid_ids = aligned['valid_guv_ids']  # same order as GUV results
+
+            if getattr(cfg, 'EXPORT_ACTIN_TRACES', True):
+                csv_path = utils.export_actin_csv(
+                    aligned_actin, valid_ids,
+                    cfg.FOLDER_DYE, cfg.EXPERIMENT_BASE_NAME
+                )
+                logger.info(f"Saved actin traces → {csv_path}")
+
+            plot_path = utils.plot_actin_analysis(
+                aligned_actin, valid_ids,
+                cfg.FOLDER_DYE, cfg.EXPERIMENT_BASE_NAME,
+                smooth_sigma=getattr(cfg, 'ACTIN_PLOT_SMOOTH_SIGMA', 1.5),
+            )
+            logger.info(f"Saved actin analysis plot → {plot_path}")
+
+            bar_path = utils.plot_actin_pre_post(
+                aligned_actin, valid_ids,
+                aligned_actin['t_aligned'],
+                cfg.FOLDER_DYE, cfg.EXPERIMENT_BASE_NAME,
+                post_window_s=60.0,
+            )
+            logger.info(f"Saved pre/post bar chart → {bar_path}")
+
+            # Combined dye + actin overlay (only when both pipelines ran)
+            if aligned is not None:
+                overlay_path = utils.plot_dye_actin_overlay(
+                    aligned, aligned_actin, valid_ids,
+                    cfg.FOLDER_DYE, cfg.EXPERIMENT_BASE_NAME,
+                    smooth_sigma=getattr(cfg, 'ACTIN_PLOT_SMOOTH_SIGMA', 1.5),
+                )
+                logger.info(f"Saved dye/actin overlay → {overlay_path}")
+
+            # Radial profile snapshot at the last pre-pulse frame
+            pre_frame = max(0, PULSE_FRAME - 1)
+            snapshots = []
+            for i, gid in enumerate(valid_ids):
+                raw_idx = guv_results['valid_guv_indices'][i]
+                raw = guv_results['raw_results'][raw_idx][0]
+                if raw is None:
+                    continue
+                ellipses_list = raw.get('tracking', {}).get('ellipses', [])
+                if pre_frame < len(ellipses_list) and ellipses_list[pre_frame] is not None:
+                    snapshots.append((gid, pre_frame, ellipses_list[pre_frame]))
+
+            if snapshots and data.get('actin_mmap_info', (None,))[0] is not None:
+                ap, ashape, adtype = data['actin_mmap_info']
+                actin_stack_main = np.memmap(ap, dtype=adtype, mode='r', shape=ashape)
+                utils.plot_actin_spatial_snapshot(
+                    actin_stack_main, snapshots,
+                    cfg.FOLDER_DYE, cfg.EXPERIMENT_BASE_NAME,
+                    microns_per_pixel=getattr(cfg, 'MICRONS_PER_PIXEL', 1.0),
+                )
+                del actin_stack_main
+                logger.info("Saved actin radial profile snapshots.")
+        elif getattr(cfg, 'ANALYZE_ACTIN_CHANNEL', False):
+            logger.warning("Actin analysis enabled but no actin data was extracted.")
+
         logger.info("=== Pipeline finished successfully ===")
 
     except Exception as e:
@@ -656,7 +807,7 @@ def main():
     finally:
         # Guarantee removal of memory-mapped files from local disk
         if data is not None:
-            for path_key in ('roi_mmap_path', 'dye_mmap_path'):
+            for path_key in ('roi_mmap_path', 'dye_mmap_path', 'actin_mmap_path'):
                 mmap_path = data.get(path_key)
                 if mmap_path and os.path.exists(mmap_path):
                     try:

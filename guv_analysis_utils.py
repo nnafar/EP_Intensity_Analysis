@@ -116,7 +116,114 @@ def efflux_2exp(t, Iinf, a1, tau1, a2, tau2, D=0):
     return Iinf + a1 * np.exp(-t / tau1) + a2 * np.exp(-t / tau2) + D * t
 
 # -------------------------------------------------------------------
-# --- 3. MASK HELPERS ---
+# --- 3. PULSE-FRAME DETECTION ---
+# -------------------------------------------------------------------
+
+def detect_pulse_frame_efflux(
+        intensity_curves: list,
+        background_curves: list,
+        smooth_sigma: float = 2.0,
+        output_folder: str  = None,
+        experiment_name: str = "",
+        time_array: Optional[np.ndarray] = None,
+) -> int:
+    """
+    Auto-detects the pulse frame for DYE EFFLUX experiments.
+
+    Strategy
+    --------
+    1. Compute net signal (intensity − background) for every GUV.
+    2. Average across all GUVs (NaN-safe) to get a single mean trace.
+    3. Smooth with a Gaussian kernel to suppress single-frame noise.
+    4. Differentiate with respect to *time* (dI/dt) rather than frame
+       index so that variable acquisition rates (e.g. 1 s → 0.1 s → 5 s)
+       do not bias the detection toward long-interval transitions.
+       Falls back to dI/dframe when no time_array is supplied.
+    5. The pulse frame is the index of the most negative dI/dt step.
+
+    A diagnostic PNG is written to *output_folder* (if provided) so the
+    detection can be visually verified.
+
+    Parameters
+    ----------
+    intensity_curves  : list of 1-D float arrays, one per GUV
+    background_curves : list of 1-D float arrays, one per GUV
+    smooth_sigma      : Gaussian σ in frames for pre-smoothing
+    output_folder     : directory for the diagnostic plot (optional)
+    experiment_name   : used in the plot filename
+    time_array        : 1-D array of frame timestamps (seconds).
+                        When provided the derivative is dI/dt; otherwise
+                        dI/dframe is used (legacy behaviour).
+
+    Returns
+    -------
+    int  – detected pulse frame index (0-based)
+    """
+    if not intensity_curves:
+        return 0
+
+    # Net signal per GUV, stacked into a 2-D array (n_guvs × n_frames)
+    net_traces = np.vstack([
+        np.asarray(d, float) - np.asarray(b, float)
+        for d, b in zip(intensity_curves, background_curves)
+    ])
+
+    mean_trace = np.nanmean(net_traces, axis=0)
+    smoothed   = gaussian_filter1d(mean_trace, sigma=smooth_sigma)
+
+    # ── dI/dt: normalise by the actual time step between frames ───────────
+    raw_diff = np.diff(smoothed)          # dI/dframe  (length = n_frames − 1)
+    if time_array is not None and len(time_array) >= len(smoothed):
+        dt = np.diff(time_array[:len(smoothed)])
+        dt = np.where(dt > 0, dt, 1.0)   # guard against zero-length intervals
+        diff = raw_diff / dt              # dI/dt
+        diff_label = 'dI/dt  (AU/s, smoothed)'
+        diff_ylabel = 'Δ intensity / second'
+    else:
+        diff = raw_diff
+        diff_label = 'dI/dframe  (smoothed)'
+        diff_ylabel = 'Δ intensity / frame'
+
+    pulse_frame = int(np.argmin(diff))    # steepest negative step in dI/dt
+
+    # ── Diagnostic plot ────────────────────────────────────────────────────
+    if output_folder:
+        fig, axes = plt.subplots(2, 1, figsize=(8, 5), sharex=True)
+
+        n_frames = len(mean_trace)
+        frames   = np.arange(n_frames)
+
+        axes[0].plot(frames, mean_trace, color='steelblue', lw=1.0,
+                     alpha=0.6, label='Mean net signal (raw)')
+        axes[0].plot(frames, smoothed, color='navy', lw=1.5,
+                     label=f'Smoothed (σ={smooth_sigma} fr)')
+        axes[0].axvline(pulse_frame, color='crimson', ls='--', lw=1.5,
+                        label=f'Detected pulse  (frame {pulse_frame})')
+        axes[0].set_ylabel('Mean net fluorescence (AU)')
+        axes[0].legend(fontsize=8)
+        axes[0].set_title('Pulse-frame detection — efflux')
+
+        axes[1].plot(np.arange(len(diff)), diff, color='darkorange', lw=1.0,
+                     label=diff_label)
+        axes[1].axvline(pulse_frame, color='crimson', ls='--', lw=1.5)
+        axes[1].axhline(0, color='gray', lw=0.5, ls=':')
+        axes[1].set_xlabel('Frame index')
+        axes[1].set_ylabel(diff_ylabel)
+        axes[1].legend(fontsize=8)
+
+        fig.tight_layout()
+        out_path = os.path.join(
+            output_folder,
+            f"{experiment_name}_pulse_frame_detection.png"
+        )
+        fig.savefig(out_path, dpi=150)
+        plt.close(fig)
+
+    return pulse_frame
+
+
+# -------------------------------------------------------------------
+# --- 4. MASK HELPERS ---
 # -------------------------------------------------------------------
 
 def _convert_to_8bit_gray(image: np.ndarray) -> np.ndarray:
@@ -534,7 +641,8 @@ def process_single_guv(guv_id: str,
                         is_first_guv: bool,
                         roi_mmap_info: Tuple,
                         dye_mmap_info: Tuple,
-                        n_frames: int) -> Tuple:
+                        n_frames: int,
+                        actin_mmap_info: Tuple = (None, None, None)) -> Tuple:
     """
     Full analysis pipeline for a single GUV using frame-by-frame tracking.
     Modified to strip heavy masks and return only coordinate data to save RAM.
@@ -548,6 +656,11 @@ def process_single_guv(guv_id: str,
     if dye_mmap_info[0] is not None:
         dye_path, dye_shape, dye_dtype = dye_mmap_info
         dye_stack = np.memmap(dye_path, dtype=dye_dtype, mode='r', shape=dye_shape)
+
+    actin_stack = None
+    if actin_mmap_info[0] is not None:
+        actin_path, actin_shape, actin_dtype = actin_mmap_info
+        actin_stack = np.memmap(actin_path, dtype=actin_dtype, mode='r', shape=actin_shape)
 
     # --- 1. Track GUV ---
     tracking = track_guv_across_frames(
@@ -569,6 +682,23 @@ def process_single_guv(guv_id: str,
     intensity_trace  = get_intensity_trace_tracked(dye_stack, n_frames, tracking['inner_masks'], method='mean')
     background_trace = get_intensity_trace_tracked(dye_stack, n_frames, tracking['bg_masks'], method='median')
 
+    # --- 2b. Extract Actin Cortex Traces (C2 channel) ---
+    actin_data = None
+    if actin_stack is not None and getattr(cfg, 'ANALYZE_ACTIN_CHANNEL', False):
+        img_shape = roi_stack[0].shape[:2]
+        actin_data = extract_actin_traces(
+            actin_stack   = actin_stack,
+            n_frames      = n_frames,
+            mem_masks     = tracking['mem_masks'],
+            inner_masks   = tracking['inner_masks'],
+            cortex_hw     = getattr(cfg, 'ACTIN_CORTEX_HALF_WIDTH', 4),
+            centers       = tracking['centers'],
+            ellipses      = tracking['ellipses'],
+            img_shape     = img_shape,
+            bg_buffer     = cfg.BG_BUFFER_PIXELS,
+            bg_width      = cfg.BG_RING_WIDTH_PIXELS,
+        )
+
     # --- 3. Diagnostics and Export ---
     ruptured_at = tracking['ruptured_at']
     n_valid     = tracking['n_valid_frames']
@@ -580,13 +710,15 @@ def process_single_guv(guv_id: str,
         'comments': f"RUPTURED_AT_F{ruptured_at}" if ruptured_at is not None else 'OK',
     }
 
-    match = re.search(r'frame(\d+)', cfg.EXPERIMENT_BASE_NAME)
-    pf = int(match.group(1)) if match else None
-
     if getattr(cfg, 'EXPORT_TRACK_VISUALIZATION', True):
-        export_track_visualization(cfg.OUTPUT_IMAGE_FOLDER, cfg.EXPERIMENT_BASE_NAME, guv_id,
-                                    roi_stack, tracking['centers'], tracking['ellipses'],
-                                    tracking['ring_scores'], ruptured_at, pulse_frame=pf)
+        # Workers run before the pulse frame is auto-detected, so we pass
+        # pulse_frame=None here.  main() will redraw these plots with the
+        # confirmed PULSE_FRAME once detection is complete.
+        export_track_visualization(
+            cfg.FOLDER_TRACKING, cfg.FOLDER_SCORES, cfg.EXPERIMENT_BASE_NAME, guv_id,
+            roi_stack, tracking['centers'], tracking['ellipses'],
+            tracking['ring_scores'], ruptured_at, pulse_frame=None
+        )
 
     # --- 4. LIGHTWEIGHT RETURN (Discard heavy masks to prevent MemoryError) ---
     # We strip 'inner_masks', 'mem_masks', and 'bg_masks' here
@@ -600,7 +732,8 @@ def process_single_guv(guv_id: str,
     result = {
         'intensity_trace':  intensity_trace,
         'background_trace': background_trace,
-        'tracking':         light_tracking, 
+        'tracking':         light_tracking,
+        'actin_data':       actin_data,   # None if ANALYZE_ACTIN_CHANNEL is False
     }
     return result, quality_entry
 
@@ -619,7 +752,7 @@ def create_mask_visualization(base_image, inner_mask, membrane_mask,
     return cv2.addWeighted(viz, alpha, ov, 1.0 - alpha, 0)
 
 
-def export_track_visualization(output_folder, experiment_name, guv_id,
+def export_track_visualization(track_folder, score_folder, experiment_name, guv_id,
                                 roi_stack, centers, ellipses, ring_scores,
                                 ruptured_at, pulse_frame=None):
     """
@@ -679,7 +812,7 @@ def export_track_visualization(output_folder, experiment_name, guv_id,
     ax.set_title(f"GUV {guv_id}")
     ax.legend(fontsize=7); fig.tight_layout()
 
-    score_path = os.path.join(output_folder, f"_score_plot_GUV_{guv_id}.png")
+    score_path = os.path.join(score_folder, f"_score_plot_GUV_{guv_id}.png")
     fig.savefig(score_path, dpi=120); plt.close(fig)
 
     # Combine side-by-side (resize score plot to match canvas height)
@@ -689,10 +822,10 @@ def export_track_visualization(output_folder, experiment_name, guv_id,
         tw = int(score_img.shape[1] * th / score_img.shape[0])
         score_img = cv2.resize(score_img, (tw, th))
         combined  = np.hstack([canvas, score_img])
-        cv2.imwrite(os.path.join(output_folder, f"{experiment_name}_track_GUV_{guv_id}.png"), combined)
-        os.remove(score_path)
+        cv2.imwrite(os.path.join(track_folder, f"{experiment_name}_track_GUV_{guv_id}.png"), combined)
+        # Score plot is kept in score_folder — not deleted
     else:
-        cv2.imwrite(os.path.join(output_folder, f"{experiment_name}_track_GUV_{guv_id}.png"), canvas)
+        cv2.imwrite(os.path.join(track_folder, f"{experiment_name}_track_GUV_{guv_id}.png"), canvas)
 
 
 def style_image(frame, time_label, microns_per_pixel, scale_bar_microns):
@@ -758,7 +891,7 @@ def export_track_video(output_folder: str, experiment_name: str, guv_id: str,
 
     out.release()
 
-def export_full_stack_videos(output_folder: str, experiment_name: str, 
+def export_full_stack_videos(track_folder: str, mask_folder: str, experiment_name: str,
                              roi_stack: np.ndarray, raw_results: list, 
                              circles: list[dict], fps: float = 10.0):
     """
@@ -768,8 +901,8 @@ def export_full_stack_videos(output_folder: str, experiment_name: str,
     h, w = roi_stack[0].shape[:2]
     n_frames = roi_stack.shape[0]
     
-    track_path = os.path.join(output_folder, f"{experiment_name}_ALL_TRACKING.avi")
-    mask_path = os.path.join(output_folder, f"{experiment_name}_ALL_MASKS.avi")
+    track_path = os.path.join(track_folder, f"{experiment_name}_ALL_TRACKING.avi")
+    mask_path = os.path.join(mask_folder, f"{experiment_name}_ALL_MASKS.avi")
     fourcc = cv2.VideoWriter_fourcc(*'MJPG')
     
     out_track = cv2.VideoWriter(track_path, fourcc, fps, (w, h))
@@ -832,6 +965,548 @@ def export_full_stack_videos(output_folder: str, experiment_name: str,
     out_track.release()
     out_mask.release()
     
+# -------------------------------------------------------------------
+# --- 10. ACTIN CORTEX ANALYSIS ---
+# -------------------------------------------------------------------
+
+def extract_actin_traces(
+        actin_stack: np.ndarray,
+        n_frames: int,
+        mem_masks: list,
+        inner_masks: list,
+        cortex_hw: int,
+        centers: list,
+        ellipses: list,
+        img_shape: tuple,
+        bg_buffer: int,
+        bg_width: int,
+) -> dict:
+    """
+    Extracts per-frame actin intensity from the C2 channel for one GUV.
+
+    Two regions are sampled:
+      - Cortex  : a thin ring at the membrane position
+                  (re-generated with *cortex_hw* so it can differ from the
+                  dye-channel membrane-half-width).
+      - Lumen   : the full interior of the GUV.
+
+    Returns
+    -------
+    dict with keys:
+        'cortex_trace'      – mean intensity in the cortex ring  (n_frames,)
+        'lumen_trace'       – mean intensity in the lumen        (n_frames,)
+        'bg_trace'          – median background (reused from dye pipeline)
+        'enrichment_ratio'  – cortex_net / lumen_net per frame
+    """
+    cortex_tr = np.full(n_frames, np.nan)
+    lumen_tr  = np.full(n_frames, np.nan)
+    bg_tr     = np.full(n_frames, np.nan)
+
+    for i in range(n_frames):
+        el = ellipses[i]
+        if el is None or actin_stack is None:
+            continue
+
+        # Re-generate cortex mask with actin-specific half-width
+        inner_m, cortex_m, bg_m = generate_vectorized_masks(
+            img_shape,
+            el['center'],
+            el['axes'],
+            el['angle'],
+            cortex_hw,
+            bg_buffer,
+            bg_width,
+        )
+
+        frame = actin_stack[i]
+        if frame is None:
+            continue
+
+        if cortex_m is not None and cortex_m.any():
+            cortex_tr[i] = float(np.mean(frame[cortex_m]))
+        if inner_m is not None and inner_m.any():
+            lumen_tr[i] = float(np.mean(frame[inner_m]))
+        if bg_m is not None and bg_m.any():
+            bg_tr[i] = float(np.median(frame[bg_m]))
+
+    # Net signals (background-subtracted)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        net_cortex = cortex_tr - bg_tr
+        net_lumen  = lumen_tr  - bg_tr
+        enrichment = np.where(net_lumen > 0, net_cortex / net_lumen, np.nan)
+
+    return {
+        'cortex_trace':     cortex_tr,
+        'lumen_trace':      lumen_tr,
+        'bg_trace':         bg_tr,
+        'enrichment_ratio': enrichment,
+    }
+
+
+def normalize_actin_curves(
+        actin_data_list: list,
+        pulse_frame: int,
+        time_array: np.ndarray,
+) -> dict:
+    """
+    Normalise actin traces to their pre-pulse baseline (first 5 frames)
+    and align to t=0 at the pulse frame.
+
+    Parameters
+    ----------
+    actin_data_list : list of dicts from extract_actin_traces(), one per GUV
+    pulse_frame     : frame index of the electroporation pulse
+    time_array      : absolute timestamps (s)
+
+    Returns
+    -------
+    dict with aligned arrays and GUV-averaged traces
+    """
+    cortex_norm_list    = []
+    lumen_norm_list     = []
+    enrichment_al_list  = []
+    pre_enrichment_list = []   # scalar pre-pulse baseline per GUV
+
+    # Use up to 5 frames strictly before the pulse for the baseline.
+    # If pulse_frame == 0 there is no pre-pulse window; fall back to
+    # the first post-pulse frame so the ratio still makes dimensional sense.
+    safe_pre_end   = pulse_frame if pulse_frame > 0 else 1
+    safe_pre_start = max(0, safe_pre_end - 5)
+
+    for ad in actin_data_list:
+        cortex = np.asarray(ad['cortex_trace'], float)
+        lumen  = np.asarray(ad['lumen_trace'],  float)
+        bg     = np.asarray(ad['bg_trace'],     float)
+        enrich = np.asarray(ad['enrichment_ratio'], float)
+
+        # Baseline net values
+        c0 = float(np.nanmean((cortex - bg)[safe_pre_start:safe_pre_end]))
+        l0 = float(np.nanmean((lumen  - bg)[safe_pre_start:safe_pre_end]))
+
+        with np.errstate(divide='ignore', invalid='ignore'):
+            c_norm = (cortex - bg) / c0 if c0 != 0 else np.full_like(cortex, np.nan)
+            l_norm = (lumen  - bg) / l0 if l0 != 0 else np.full_like(lumen,  np.nan)
+
+        # Pre-pulse mean enrichment ratio (the actual "before" value for the bar chart)
+        pre_enrich = float(np.nanmean(enrich[safe_pre_start:safe_pre_end]))
+        pre_enrichment_list.append(pre_enrich)
+
+        cortex_norm_list.append(c_norm[pulse_frame:])
+        lumen_norm_list .append(l_norm[pulse_frame:])
+        enrichment_al_list.append(enrich[pulse_frame:])
+
+    t_aligned = time_array[pulse_frame:] - time_array[pulse_frame]
+
+    cortex_arr = np.array(cortex_norm_list)
+    lumen_arr  = np.array(lumen_norm_list)
+    enrich_arr = np.array(enrichment_al_list)
+
+    return {
+        't_aligned':          t_aligned,
+        'cortex_norm':        cortex_arr,
+        'lumen_norm':         lumen_arr,
+        'enrichment_aligned': enrich_arr,
+        'avg_cortex':         np.nanmean(cortex_arr,  axis=0),
+        'avg_lumen':          np.nanmean(lumen_arr,   axis=0),
+        'avg_enrichment':     np.nanmean(enrich_arr,  axis=0),
+        'pre_enrichment':     np.array(pre_enrichment_list),  # shape (n_guvs,)
+    }
+
+
+def plot_actin_analysis(
+        aligned_actin: dict,
+        valid_guv_ids: list,
+        output_folder: str,
+        experiment_name: str,
+        smooth_sigma: float = 1.5,
+):
+    """
+    Three-panel actin summary figure:
+      Panel 1 – Normalised cortex intensity (per GUV + mean)
+      Panel 2 – Normalised lumen intensity  (per GUV + mean)
+      Panel 3 – Cortex enrichment ratio     (per GUV + mean)
+
+    A vertical dashed line marks the pulse (t = 0).
+    Optionally smoothed with a Gaussian for display.
+    """
+    from scipy.ndimage import gaussian_filter1d
+
+    t             = aligned_actin['t_aligned']
+    cortex_arr    = aligned_actin['cortex_norm']
+    lumen_arr     = aligned_actin['lumen_norm']
+    enrich_arr    = aligned_actin['enrichment_aligned']
+    avg_cortex    = aligned_actin['avg_cortex']
+    avg_lumen     = aligned_actin['avg_lumen']
+    avg_enrich    = aligned_actin['avg_enrichment']
+
+    def _smooth(x):
+        if smooth_sigma > 0:
+            finite = np.isfinite(x)
+            if finite.sum() < 3:
+                return x
+            s = gaussian_filter1d(np.where(finite, x, 0), smooth_sigma)
+            n = gaussian_filter1d(finite.astype(float), smooth_sigma)
+            return np.where(n > 0, s / n, np.nan)
+        return x
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+    palette = plt.cm.tab10.colors
+
+    for i, (gid, c_row, l_row, e_row) in enumerate(
+            zip(valid_guv_ids, cortex_arr, lumen_arr, enrich_arr)):
+        col = palette[i % len(palette)]
+        axes[0].plot(t, _smooth(c_row), color=col, alpha=0.4, lw=1,   label=f'GUV {gid}')
+        axes[1].plot(t, _smooth(l_row), color=col, alpha=0.4, lw=1,   label=f'GUV {gid}')
+        axes[2].plot(t, _smooth(e_row), color=col, alpha=0.4, lw=1,   label=f'GUV {gid}')
+
+    axes[0].plot(t, _smooth(avg_cortex), 'k-', lw=2.5, label='Mean')
+    axes[1].plot(t, _smooth(avg_lumen),  'k-', lw=2.5, label='Mean')
+    axes[2].plot(t, _smooth(avg_enrich), 'k-', lw=2.5, label='Mean')
+
+    for ax in axes:
+        ax.axvline(0, color='crimson', ls='--', lw=1.5, label='Pulse', zorder=3)
+        ax.axhline(1, color='gray',    ls=':',  lw=0.8)
+        ax.set_xlabel('Time relative to pulse (s)')
+        ax.grid(True, alpha=0.25)
+        ax.legend(fontsize=7, ncol=2)
+
+    axes[0].set_title('Cortex actin (C2, membrane mask)\nNormalised to pre-pulse')
+    axes[0].set_ylabel('Normalised intensity (a.u.)')
+
+    axes[1].set_title('Lumenal actin (C2, inner mask)\nNormalised to pre-pulse')
+    axes[1].set_ylabel('Normalised intensity (a.u.)')
+
+    axes[2].set_title('Cortex enrichment ratio\n(cortex_net / lumen_net)')
+    axes[2].set_ylabel('Enrichment ratio')
+    axes[2].axhline(1, color='tomato', ls='--', lw=1, alpha=0.6,
+                    label='No enrichment (=1)')
+
+    plt.suptitle(f'{experiment_name}  –  Actin cortex analysis', fontsize=11)
+    plt.tight_layout()
+    out_path = os.path.join(output_folder, f'{experiment_name}_actin_cortex_analysis.png')
+    fig.savefig(out_path, dpi=300)
+    plt.close(fig)
+    return out_path
+
+
+def export_actin_csv(
+        aligned_actin: dict,
+        valid_guv_ids: list,
+        output_folder: str,
+        experiment_name: str,
+):
+    """Save per-GUV aligned actin traces to a single tidy CSV."""
+    t = aligned_actin['t_aligned']
+    rows = [{'time_s': tv} for tv in t]
+    df = pd.DataFrame(rows)
+
+    for gid, c_row, l_row, e_row in zip(
+            valid_guv_ids,
+            aligned_actin['cortex_norm'],
+            aligned_actin['lumen_norm'],
+            aligned_actin['enrichment_aligned']):
+        df[f'GUV_{gid}_cortex']     = c_row
+        df[f'GUV_{gid}_lumen']      = l_row
+        df[f'GUV_{gid}_enrichment'] = e_row
+
+    df['avg_cortex']     = aligned_actin['avg_cortex']
+    df['avg_lumen']      = aligned_actin['avg_lumen']
+    df['avg_enrichment'] = aligned_actin['avg_enrichment']
+
+    csv_path = os.path.join(output_folder,
+                            f'{experiment_name}_actin_cortex_traces.csv')
+    df.to_csv(csv_path, index=False, float_format='%.6f', na_rep='NaN')
+    return csv_path
+
+
+def plot_actin_pre_post(
+        aligned_actin: dict,
+        valid_guv_ids: list,
+        time_array_aligned: np.ndarray,
+        output_folder: str,
+        experiment_name: str,
+        post_window_s: float = 60.0,
+):
+    """
+    Paired bar chart comparing the cortex enrichment ratio BEFORE vs AFTER
+    the electroporation pulse, per GUV.
+
+    The "pre" value is the actual pre-pulse baseline stored in aligned_actin
+    (computed in normalize_actin_curves from the frames just before the pulse).
+
+    post_window_s : average the first N seconds of post-pulse data as "after".
+    """
+    t      = time_array_aligned           # starts at 0 (pulse = t=0)
+    enrich = aligned_actin['enrichment_aligned']
+    pre_vals = aligned_actin['pre_enrichment']   # shape (n_guvs,) — actual pre-pulse
+
+    post_mask  = (t >= 0) & (t <= post_window_s)
+    if not post_mask.any():
+        post_mask = np.ones(len(t), bool)
+
+    post_means = np.nanmean(enrich[:, post_mask], axis=1)
+
+    x     = np.arange(len(valid_guv_ids))
+    width = 0.35
+
+    fig, ax = plt.subplots(figsize=(max(6, len(valid_guv_ids) * 1.2), 5))
+    ax.bar(x - width/2, pre_vals,   width, label='Pre-pulse baseline',
+           color='steelblue', alpha=0.8)
+    ax.bar(x + width/2, post_means, width,
+           label=f'Post-pulse  (first {post_window_s:.0f} s)',
+           color='tomato', alpha=0.8)
+    ax.axhline(1, color='gray', ls=':', lw=0.8, label='No enrichment (=1)')
+    ax.set_xticks(x)
+    ax.set_xticklabels([f'GUV {g}' for g in valid_guv_ids], rotation=45, ha='right')
+    ax.set_ylabel('Cortex enrichment ratio  (cortex_net / lumen_net)')
+    ax.set_title(f'{experiment_name}\nCortex enrichment: pre vs post electroporation')
+    ax.legend()
+    plt.tight_layout()
+    out_path = os.path.join(output_folder,
+                            f'{experiment_name}_actin_pre_post_bar.png')
+    fig.savefig(out_path, dpi=300)
+    plt.close(fig)
+    return out_path
+
+
+def plot_actin_spatial_snapshot(
+        actin_stack: np.ndarray,
+        ellipses_per_guv: list,   # list of (guv_id, frame_idx, ellipse_dict)
+        output_folder: str,
+        experiment_name: str,
+        microns_per_pixel: float = 1.0,
+):
+    """
+    Montage of per-GUV radial intensity profiles from the actin channel
+    at the pre-pulse frame, showing membrane peak vs lumenal actin.
+
+    ellipses_per_guv : [(guv_id, frame_idx, el_dict), ...]
+    """
+    n = len(ellipses_per_guv)
+    if n == 0 or actin_stack is None:
+        return
+
+    ncols = min(4, n)
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 3.5 * nrows),
+                             squeeze=False)
+
+    for k, (gid, fi, el) in enumerate(ellipses_per_guv):
+        ax = axes[k // ncols][k % ncols]
+        frame = actin_stack[fi]
+        if frame is None or el is None:
+            ax.set_visible(False)
+            continue
+
+        cx, cy = el['center']
+        avg_r  = int(sum(el['axes']) / 2.0)
+        r_max  = int(avg_r * 1.6)
+
+        h, w = frame.shape[:2]
+        x_min = max(0, int(cx - r_max - 2))
+        x_max = min(w, int(cx + r_max + 2))
+        y_min = max(0, int(cy - r_max - 2))
+        y_max = min(h, int(cy + r_max + 2))
+
+        # Skip if we cannot fit a full radial profile inside the image
+        if (cx - r_max < 0 or cx + r_max >= w or
+                cy - r_max < 0 or cy + r_max >= h):
+            ax.set_visible(False)
+            continue
+
+        local   = frame[y_min:y_max, x_min:x_max]
+        profile = radial_profile_local(local, (cx - x_min, cy - y_min), r_max)
+
+        r_um = np.arange(r_max) * microns_per_pixel
+        mem_um = avg_r * microns_per_pixel
+
+        ax.plot(r_um, profile, color='steelblue', lw=1.4)
+        ax.axvline(mem_um, color='crimson', ls='--', lw=1.2, label='Membrane')
+        ax.axvspan(0, mem_um, alpha=0.06, color='gold',  label='Lumen')
+        ax.axvspan(mem_um, r_um[-1], alpha=0.06, color='tomato', label='Extracellular')
+        ax.set_title(f'GUV {gid}  (frame {fi})', fontsize=9)
+        ax.set_xlabel(r'Radius ($\mu$m)', fontsize=8)
+        ax.set_ylabel('Intensity (AU)', fontsize=8)
+        ax.legend(fontsize=7)
+        ax.grid(True, alpha=0.3)
+
+    # Hide empty panels
+    for k in range(n, nrows * ncols):
+        axes[k // ncols][k % ncols].set_visible(False)
+
+    plt.suptitle(f'{experiment_name} – Actin radial profiles (pre-pulse)',
+                 fontsize=11)
+    plt.tight_layout()
+    out_path = os.path.join(output_folder,
+                            f'{experiment_name}_actin_radial_profiles.png')
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+    return out_path
+
+
+def plot_dye_actin_overlay(
+        aligned_dye: dict,
+        aligned_actin: dict,
+        valid_guv_ids: list,
+        output_folder: str,
+        experiment_name: str,
+        smooth_sigma: float = 1.5,
+):
+    """
+    Per-GUV dual-axis figure correlating dye efflux with actin cortex dynamics.
+
+    Left y-axis  (blue)   – Normalised dye intensity (fractional retention)
+    Right y-axis (orange) – Cortex enrichment ratio (cortex_net / lumen_net)
+
+    One subplot per GUV, up to 4 per row.  A summary panel (last subplot)
+    shows population means of both signals.
+
+    Parameters
+    ----------
+    aligned_dye   : dict returned by normalize_and_align_curves()
+    aligned_actin : dict returned by normalize_actin_curves()
+    valid_guv_ids : list of GUV id strings in the same order as both arrays
+    """
+    from scipy.ndimage import gaussian_filter1d
+
+    t_dye    = aligned_dye['t_aligned']
+    t_act    = aligned_actin['t_aligned']
+
+    dye_arr  = aligned_dye['all_curves_aligned']     # (n, T_dye)
+    act_arr  = aligned_actin['enrichment_aligned']   # (n, T_act)
+
+    avg_dye  = aligned_dye['average_curve']
+    avg_act  = aligned_actin['avg_enrichment']
+
+    def _sm(x):
+        if smooth_sigma <= 0:
+            return x
+        finite = np.isfinite(x)
+        if finite.sum() < 3:
+            return x
+        s = gaussian_filter1d(np.where(finite, x, 0.0), smooth_sigma)
+        n = gaussian_filter1d(finite.astype(float),      smooth_sigma)
+        return np.where(n > 0, s / n, np.nan)
+
+    n_guvs = len(valid_guv_ids)
+    # +1 panel for the population summary
+    n_panels = n_guvs + 1
+    ncols = min(4, n_panels)
+    nrows = int(np.ceil(n_panels / ncols))
+
+    fig, axes = plt.subplots(nrows, ncols,
+                             figsize=(5 * ncols, 4 * nrows),
+                             squeeze=False)
+
+    DYE_COLOR = '#1f77b4'    # blue
+    ACT_COLOR = '#ff7f0e'    # orange
+
+    def _draw_panel(ax, t_d, dye_row, t_a, act_row, title):
+        ax2 = ax.twinx()
+
+        ax .plot(t_d, _sm(dye_row), color=DYE_COLOR, lw=1.6, label='Dye (ret.)')
+        ax2.plot(t_a, _sm(act_row), color=ACT_COLOR, lw=1.6, label='Cortex enrich.')
+
+        ax .axvline(0, color='crimson', ls='--', lw=1.2, zorder=3)
+        ax .axhline(1, color=DYE_COLOR, ls=':', lw=0.6, alpha=0.5)
+        ax2.axhline(1, color=ACT_COLOR, ls=':', lw=0.6, alpha=0.5)
+
+        ax .set_xlabel('Time relative to pulse (s)', fontsize=8)
+        ax .set_ylabel('Dye retention (a.u.)',        fontsize=8, color=DYE_COLOR)
+        ax2.set_ylabel('Cortex enrichment ratio',     fontsize=8, color=ACT_COLOR)
+        ax .tick_params(axis='y', labelcolor=DYE_COLOR, labelsize=7)
+        ax2.tick_params(axis='y', labelcolor=ACT_COLOR, labelsize=7)
+        ax .set_title(title, fontsize=9)
+        ax .grid(True, alpha=0.2)
+
+        # Combined legend
+        lines  = ax .get_lines() + ax2.get_lines()
+        labels = [l.get_label() for l in lines]
+        ax.legend(lines, labels, fontsize=7, loc='upper right')
+
+    # Per-GUV panels
+    for i, gid in enumerate(valid_guv_ids):
+        row_idx = i // ncols
+        col_idx = i  % ncols
+        ax = axes[row_idx][col_idx]
+
+        dye_row = dye_arr[i] if i < len(dye_arr) else np.full_like(t_dye, np.nan)
+        act_row = act_arr[i] if i < len(act_arr) else np.full_like(t_act, np.nan)
+
+        _draw_panel(ax, t_dye, dye_row, t_act, act_row, f'GUV {gid}')
+
+    # Population summary panel (last)
+    summary_idx  = n_guvs
+    sr, sc       = summary_idx // ncols, summary_idx % ncols
+    ax_sum       = axes[sr][sc]
+    _draw_panel(ax_sum, t_dye, avg_dye, t_act, avg_act,
+                'Population mean ± shade')
+
+    # Add shaded ±1 SD to the summary panel
+    ax_sum2 = ax_sum.get_shared_x_axes()   # twin already created inside _draw_panel
+    # Recreate twin for shading (ax_sum.twinx() would add a third axis; shade on existing)
+    if len(dye_arr) > 1:
+        dye_sd  = np.nanstd(dye_arr,  axis=0)
+        act_sd  = np.nanstd(act_arr,  axis=0)
+        sm_dye  = _sm(avg_dye)
+        sm_act  = _sm(avg_act)
+        ax_sum .fill_between(t_dye,
+                             _sm(avg_dye - dye_sd), _sm(avg_dye + dye_sd),
+                             color=DYE_COLOR, alpha=0.15)
+        # The twin axis was created inside _draw_panel; we can't reach it directly.
+        # Plot the actin SD on top of ax_sum with a secondary colour for clarity.
+        ax_sum.fill_between(t_act,
+                            _sm(avg_act - act_sd), _sm(avg_act + act_sd),
+                            color=ACT_COLOR, alpha=0.12, transform=ax_sum.transData)
+
+    # Hide unused panels
+    for k in range(n_panels, nrows * ncols):
+        axes[k // ncols][k % ncols].set_visible(False)
+
+    plt.suptitle(f'{experiment_name}  –  Dye efflux vs Actin cortex dynamics',
+                 fontsize=11)
+    plt.tight_layout()
+    out_path = os.path.join(output_folder,
+                            f'{experiment_name}_dye_actin_overlay.png')
+    fig.savefig(out_path, dpi=300)
+    plt.close(fig)
+    return out_path
+
+
+def redraw_score_plots(
+        guv_results: dict,
+        circles: list,
+        roi_mmap_info: tuple,
+        pulse_frame: int,
+        track_folder: str,
+        score_folder: str,
+        experiment_name: str,
+):
+    """
+    Re-exports every per-GUV tracking PNG with the confirmed pulse-frame
+    marker.  Called from main() after PULSE_FRAME is finalised so all score
+    plots are consistent, regardless of what the filename tag said.
+    """
+    roi_path, roi_shape, roi_dtype = roi_mmap_info
+    roi_stack = np.memmap(roi_path, dtype=roi_dtype, mode='r', shape=roi_shape)
+
+    for i, (result, qe) in enumerate(guv_results['raw_results']):
+        if result is None:
+            continue
+        guv_id    = qe['guv_id']
+        tr        = result['tracking']
+        rup       = qe.get('ruptured_at_frame')
+        export_track_visualization(
+            track_folder, score_folder, experiment_name, guv_id,
+            roi_stack,
+            tr['centers'], tr['ellipses'], tr['ring_scores'],
+            rup,
+            pulse_frame=pulse_frame,   # ← confirmed value
+        )
+
+    del roi_stack
+
+
 def plot_tracking_metrics(df: pd.DataFrame, time_array: np.ndarray, 
                           output_folder: str, experiment_name: str, 
                           um_per_px: float = 1.0, pulse_time=None):
