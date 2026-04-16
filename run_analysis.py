@@ -102,18 +102,29 @@ def create_memmap_stack(files: list, mmap_path: str, desc: str = "Processing") -
     """Reads individual TIFFs and writes them to a contiguous binary memmap file."""
     if not files:
         return None, None, None
-    
+
+    # On Windows a file left open by a crashed previous run causes [Errno 22].
+    # Explicitly remove the stale file before np.memmap tries to create it.
+    if os.path.exists(mmap_path):
+        try:
+            os.remove(mmap_path)
+        except OSError as e:
+            raise OSError(
+                f"Cannot remove stale temp file '{mmap_path}'. "
+                f"Close any process that may still have it open, then retry.\n"
+                f"Original error: {e}"
+            ) from e
+
     first_frame = cv2.imread(files[0], cv2.IMREAD_ANYDEPTH | cv2.IMREAD_GRAYSCALE)
     dtype = first_frame.dtype
     shape = (len(files), first_frame.shape[0], first_frame.shape[1])
-    
+
     mmap_arr = np.memmap(mmap_path, dtype=dtype, mode='w+', shape=shape)
-    
-    # Wrap the enumerator in tqdm for the progress bar
+
     for i, f in enumerate(tqdm(files, desc=desc, unit="frame")):
         mmap_arr[i] = cv2.imread(f, cv2.IMREAD_ANYDEPTH | cv2.IMREAD_GRAYSCALE)
     mmap_arr.flush()
-    
+
     return mmap_path, shape, str(dtype)
 
 def load_input_data(circles: list[dict], logger: logging.Logger) -> dict | None:
@@ -594,6 +605,7 @@ def main():
         cfg.FOLDER_TRACKING,
         cfg.FOLDER_MASKS,
         cfg.FOLDER_DYE,
+        cfg.FOLDER_ACTIN,
         cfg.FOLDER_SCORES,
     ):
         os.makedirs(_folder, exist_ok=True)
@@ -746,13 +758,13 @@ def main():
             if getattr(cfg, 'EXPORT_ACTIN_TRACES', True):
                 csv_path = utils.export_actin_csv(
                     aligned_actin, valid_ids,
-                    cfg.FOLDER_DYE, cfg.EXPERIMENT_BASE_NAME
+                    cfg.FOLDER_ACTIN, cfg.EXPERIMENT_BASE_NAME
                 )
                 logger.info(f"Saved actin traces → {csv_path}")
 
             plot_path = utils.plot_actin_analysis(
                 aligned_actin, valid_ids,
-                cfg.FOLDER_DYE, cfg.EXPERIMENT_BASE_NAME,
+                cfg.FOLDER_ACTIN, cfg.EXPERIMENT_BASE_NAME,
                 smooth_sigma=getattr(cfg, 'ACTIN_PLOT_SMOOTH_SIGMA', 1.5),
             )
             logger.info(f"Saved actin analysis plot → {plot_path}")
@@ -760,7 +772,7 @@ def main():
             bar_path = utils.plot_actin_pre_post(
                 aligned_actin, valid_ids,
                 aligned_actin['t_aligned'],
-                cfg.FOLDER_DYE, cfg.EXPERIMENT_BASE_NAME,
+                cfg.FOLDER_ACTIN, cfg.EXPERIMENT_BASE_NAME,
                 post_window_s=60.0,
             )
             logger.info(f"Saved pre/post bar chart → {bar_path}")
@@ -769,7 +781,7 @@ def main():
             if aligned is not None:
                 overlay_path = utils.plot_dye_actin_overlay(
                     aligned, aligned_actin, valid_ids,
-                    cfg.FOLDER_DYE, cfg.EXPERIMENT_BASE_NAME,
+                    cfg.FOLDER_ACTIN, cfg.EXPERIMENT_BASE_NAME,
                     smooth_sigma=getattr(cfg, 'ACTIN_PLOT_SMOOTH_SIGMA', 1.5),
                 )
                 logger.info(f"Saved dye/actin overlay → {overlay_path}")
@@ -791,7 +803,7 @@ def main():
                 actin_stack_main = np.memmap(ap, dtype=adtype, mode='r', shape=ashape)
                 utils.plot_actin_spatial_snapshot(
                     actin_stack_main, snapshots,
-                    cfg.FOLDER_DYE, cfg.EXPERIMENT_BASE_NAME,
+                    cfg.FOLDER_ACTIN, cfg.EXPERIMENT_BASE_NAME,
                     microns_per_pixel=getattr(cfg, 'MICRONS_PER_PIXEL', 1.0),
                 )
                 del actin_stack_main

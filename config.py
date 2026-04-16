@@ -92,6 +92,7 @@ OUTPUT_IMAGE_FOLDER      = os.path.join(DATA_FOLDER, "output_images")
 FOLDER_TRACKING = os.path.join(OUTPUT_IMAGE_FOLDER, "tracking")   # track PNGs/AVIs, metrics, CSVs
 FOLDER_MASKS    = os.path.join(OUTPUT_IMAGE_FOLDER, "masks")      # mask overlay AVI
 FOLDER_DYE      = os.path.join(OUTPUT_IMAGE_FOLDER, "dye")        # fit plots, frame exports, CSVs
+FOLDER_ACTIN    = os.path.join(OUTPUT_IMAGE_FOLDER, "actin")      # actin cortex plots, traces, profiles
 FOLDER_SCORES   = os.path.join(OUTPUT_IMAGE_FOLDER, "scores")     # per-GUV ring-score plots
 
 EXPORT_TIME_POINTS_S     = [0, 50, 100, 200, 300]
@@ -167,7 +168,7 @@ ACTIN_CORTEX_MASK = 'membrane'
 
 # Half-width (pixels) for the cortex ring mask in C2.
 # Increase slightly if the cortex ring is thicker than the membrane label.
-ACTIN_CORTEX_HALF_WIDTH = 4   # px  (~0.44 µm at 0.11 µm/px)
+ACTIN_CORTEX_HALF_WIDTH = 5   # px  (~0.44 µm at 0.11 µm/px)
 
 # Export a per-GUV CSV and plot of cortex / lumen actin over time
 EXPORT_ACTIN_TRACES = True
@@ -179,5 +180,5 @@ ACTIN_PLOT_SMOOTH_SIGMA = 1.5
 # --- 6. ADVANCED ---
 # -----------------------------------------------------------------------------
 
-N_WORKERS    = 3 #os.cpu_count() - 1 if os.cpu_count() > 1 else 1
+N_WORKERS    = os.cpu_count() - 1 if os.cpu_count() > 1 else 1
 FALLBACK_FPS = 1.0 # second(s)
