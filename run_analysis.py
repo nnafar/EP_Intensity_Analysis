@@ -270,7 +270,7 @@ def process_all_guvs(circles: list[dict],
     # ── Unpack ────────────────────────────────────────────────────────────
     all_intensity  = []
     all_background = []
-    all_actin_data = []     # ← new: per-GUV actin traces
+    all_actin_data = []     
     quality_log    = []
     valid_indices  = []
     tracking_rows  = []
@@ -416,95 +416,101 @@ def normalize_and_align_curves(guv_results: dict,
 # -------------------------------------------------------------------
 
 def fit_individual_curves(aligned: dict, guv_results: dict, t: np.ndarray, logger: logging.Logger) -> pd.DataFrame:
-    arr = aligned['all_curves_aligned']
-    ids = aligned['valid_guv_ids']
+    arr      = aligned['all_curves_aligned']
+    ids      = aligned['valid_guv_ids']
     df_track = guv_results['tracking_dataframe']
-    
+
     fit_records = []
-    
+    fit_plot_data = []   # accumulated for the grid figure
+
     for i, curve in enumerate(arr):
         guv_id = ids[i]
-        
+
         guv_data = df_track[df_track['guv_id'] == guv_id]
         if guv_data.empty: continue
         r_px = guv_data['radius'].iloc[0]
         r_um = r_px * getattr(cfg, 'MICRONS_PER_PIXEL', 1.0)
-        
+
         ok = np.isfinite(curve)
         t_c, y_c = t[ok], curve[ok]
-        
+
         if len(t_c) < 5:
             continue
-            
+
         y_start, y_end = y_c[0], y_c[-1]
         A_est = abs(y_end - y_start)
-        
+
         try:
             target_y = y_start - 0.63 * A_est if cfg.MODEL_TO_USE.startswith('EFFLUX') else y_start + 0.63 * A_est
             idx63 = np.argmax(y_c < target_y) if cfg.MODEL_TO_USE.startswith('EFFLUX') else np.argmax(y_c > target_y)
             tau_e = t_c[idx63] if idx63 > 0 else t_c[-1] / 3.0
         except Exception:
             tau_e = t_c[-1] / 3.0
-            
+
         tau_e = max(tau_e, 1.0)
-        
+
         if cfg.MODEL_TO_USE == 'EFFLUX-1EXP':
             fn = utils.efflux_1exp
-            # Clip guesses to fit within ((0, -2, 0.01, -0.1), (2, 2, 5000, 0.1))
             p0 = (np.clip(y_start, 0.01, 1.99),
-                  np.clip(y_end, -1.99, 1.99),
-                  np.clip(tau_e, 0.02, 4999.0),
+                  np.clip(y_end,   -1.99, 1.99),
+                  np.clip(tau_e,   0.02, 4999.0),
                   0.0)
-            bnds = ((0, -2, 0.01, -0.1), (2, 2, 5000, 0.1))
+            bnds  = ((0, -2, 0.01, -0.1), (2, 2, 5000, 0.1))
             names = ['I0', 'Iinf', 'tau', 'D']
         elif cfg.MODEL_TO_USE == 'INFLUX-1EXP':
             fn = utils.influx_1exp
-            # Clip guesses to fit within ((-2, 0, 0.01, -0.1), (2, 2, 5000, 0.1))
             p0 = (np.clip(y_start, -1.99, 1.99),
-                  np.clip(y_end, 0.01, 1.99),
-                  np.clip(tau_e, 0.02, 4999.0),
+                  np.clip(y_end,    0.01, 1.99),
+                  np.clip(tau_e,   0.02, 4999.0),
                   0.0)
-            bnds = ((-2, 0, 0.01, -0.1), (2, 2, 5000, 0.1))
+            bnds  = ((-2, 0, 0.01, -0.1), (2, 2, 5000, 0.1))
             names = ['I0', 'Iinf', 'tau', 'D']
         elif cfg.MODEL_TO_USE == 'EFFLUX-2EXP':
             fn = utils.efflux_2exp
-            p0 = (y_end, A_est * 0.5, tau_e * 0.5, A_est * 0.5, tau_e * 2.0, 0.0)
-            bnds = ((-2, 0, 0.01, 0, 0.01, -0.1), (2, 2, 5000, 2, 5000, 0.1))
+            p0    = (y_end, A_est*0.5, tau_e*0.5, A_est*0.5, tau_e*2.0, 0.0)
+            bnds  = ((-2, 0, 0.01, 0, 0.01, -0.1), (2, 2, 5000, 2, 5000, 0.1))
             names = ['Iinf', 'a1', 'tau1', 'a2', 'tau2', 'D']
         elif cfg.MODEL_TO_USE == 'INFLUX-2EXP':
             fn = utils.influx_2exp
-            p0 = (y_start, A_est * 0.5, tau_e * 0.5, A_est * 0.5, tau_e * 2.0, 0.0)
-            bnds = ((-2, 0, 0.01, 0, 0.01, -0.1), (2, 2, 5000, 2, 5000, 0.1))
+            p0    = (y_start, A_est*0.5, tau_e*0.5, A_est*0.5, tau_e*2.0, 0.0)
+            bnds  = ((-2, 0, 0.01, 0, 0.01, -0.1), (2, 2, 5000, 2, 5000, 0.1))
             names = ['I0', 'a1', 'tau1', 'a2', 'tau2', 'D']
         else:
             logger.error("Unknown model selected.")
             continue
-        
+
         try:
             params, _ = sc.curve_fit(fn, t_c, y_c, p0=p0, bounds=bnds, maxfev=10000)
             res = {'guv_id': guv_id, 'radius_um': r_um}
             res.update(dict(zip(names, params)))
             fit_records.append(res)
-            
-            fig, ax = plt.subplots()
-            ax.plot(t_c, y_c, 'k.', alpha=0.5, label='Data')
-            ax.plot(t_c, fn(t_c, *params), 'r-', label='Fit')
-            # Add Pulse line at t=0 (since data is aligned to pulse)
-            ax.axvline(0, color='gray', ls='--', lw=1.5, label='Pulse', zorder=0)
-            
+
+            # Build a short parameter label for the subplot title
             if 'tau2' in names:
-                ax.set_title(rf"GUV {guv_id} (R={r_um:.1f} $\mu$m)\nTau1: {params[2]:.2f} s, Tau2: {params[4]:.2f} s")
+                param_str = f"τ₁={params[2]:.1f} s,  τ₂={params[4]:.1f} s"
             else:
-                ax.set_title(rf"GUV {guv_id} (R={r_um:.1f} $\mu$m)\nTau: {params[2]:.2f} s")
-            ax.set_xlabel("Time (s)")
-            ax.set_ylabel("Normalized Intensity")
-            ax.legend()
-            fig.savefig(os.path.join(cfg.FOLDER_DYE, f"{cfg.EXPERIMENT_BASE_NAME}_fit_GUV_{guv_id}.png"))
-            plt.close(fig)
-            
+                param_str = f"τ = {params[2]:.1f} s"
+
+            fit_plot_data.append({
+                'guv_id':    guv_id,
+                't_data':    t_c,
+                'y_data':    y_c,
+                'y_fit':     fn(t_c, *params),
+                'r_um':      r_um,
+                'param_str': param_str,
+            })
+
         except RuntimeError:
             logger.warning(f"Fitting failed for GUV {guv_id}")
-            
+
+    # ── Grid figure (replaces individual PNGs) ────────────────────────────
+    if fit_plot_data:
+        grid_path = utils.plot_dye_fits_grid(
+            fit_plot_data, cfg.FOLDER_DYE,
+            cfg.EXPERIMENT_BASE_NAME, cfg.MODEL_TO_USE
+        )
+        logger.info(f"Saved dye fits grid → {grid_path}")
+
     df_fits = pd.DataFrame(fit_records)
     return df_fits
 
@@ -648,7 +654,7 @@ def main():
                 cfg.FOLDER_MASKS,
                 cfg.EXPERIMENT_BASE_NAME,
                 roi_stack,
-                [r[0] for r in guv_results['raw_results']], # List of 'result' dicts
+                [r[0] for r in guv_results['raw_results']],
                 data['circles'],
                 fps=getattr(cfg, 'VIDEO_EXPORT_FPS', 10.0)
             )
@@ -698,7 +704,6 @@ def main():
         t_pulse = data['time_array'][PULSE_FRAME]
 
         # Re-draw all per-GUV score plots now that the confirmed pulse frame is known.
-        # (Workers drew them without a pulse line because detection hadn't run yet.)
         if getattr(cfg, 'EXPORT_TRACK_VISUALIZATION', True):
             utils.redraw_score_plots(
                 guv_results, data['circles'], data['roi_mmap_info'],
@@ -737,6 +742,12 @@ def main():
         )
         if aligned is None:
             return
+
+        # Step 4b – dye summary (all traces + mean)
+        summary_path = utils.plot_dye_summary(
+            aligned, cfg.FOLDER_DYE, cfg.EXPERIMENT_BASE_NAME
+        )
+        logger.info(f"Saved dye summary plot → {summary_path}")
 
         # Step 5 – fit
         df_fits = fit_individual_curves(aligned, guv_results, aligned['t_aligned'], logger)
@@ -789,6 +800,7 @@ def main():
             # Radial profile snapshot at the last pre-pulse frame
             pre_frame = max(0, PULSE_FRAME - 1)
             snapshots = []
+            
             for i, gid in enumerate(valid_ids):
                 raw_idx = guv_results['valid_guv_indices'][i]
                 raw = guv_results['raw_results'][raw_idx][0]
@@ -801,6 +813,7 @@ def main():
             if snapshots and data.get('actin_mmap_info', (None,))[0] is not None:
                 ap, ashape, adtype = data['actin_mmap_info']
                 actin_stack_main = np.memmap(ap, dtype=adtype, mode='r', shape=ashape)
+                
                 utils.plot_actin_spatial_snapshot(
                     actin_stack_main, snapshots,
                     cfg.FOLDER_ACTIN, cfg.EXPERIMENT_BASE_NAME,

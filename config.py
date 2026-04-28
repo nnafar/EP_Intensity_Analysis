@@ -170,6 +170,13 @@ ACTIN_CORTEX_MASK = 'membrane'
 # Increase slightly if the cortex ring is thicker than the membrane label.
 ACTIN_CORTEX_HALF_WIDTH = 5   # px  (~0.44 µm at 0.11 µm/px)
 
+# Minimum peak prominence for cortex detection.
+# The peak-to-baseline amplitude must exceed this fraction of the total
+# radial profile range (max − min) to be accepted as a real cortex peak.
+# Raise this value if flat-profile GUVs (no cortex) are being falsely detected;
+# lower it if faint-but-real cortices are being missed.  Default = 0.10 (10 %).
+ACTIN_PEAK_MIN_PROMINENCE = 0.10
+
 # Export a per-GUV CSV and plot of cortex / lumen actin over time
 EXPORT_ACTIN_TRACES = True
 
