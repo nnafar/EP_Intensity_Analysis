@@ -20,8 +20,8 @@ import re
 
 INPUT_FORMAT = 'ND2' 
 
-DATA_FOLDER  = r"D:\EP\260331_Trial4_InvE_BranchedCortex_SRB_Inside"
-EXPERIMENT_BASE_NAME  = "DOPC_BranchedCortex_Experiment2-400V-500us-frame6"
+DATA_FOLDER  = r"D:\EP\260507_InvE_Empty_Branched_Threshold"
+EXPERIMENT_BASE_NAME  = "DOPC_Empty_Experiment2-360V-500us-frame5"
 
 # --- NEW DIRECTORY ROUTING ---
 # Define the master parent directory where all analyses will be stored
@@ -103,6 +103,10 @@ PULSE_FRAME_OVERRIDE = None
 # Increase if the signal is noisy; decrease if pulses are very abrupt.
 PULSE_DETECT_SMOOTH_SIGMA = 2.0
 
+# Maximum number of frames to evaluate for the pulse within the fast-acquisition window.
+# Set to None to search the entire fast window.
+PULSE_SEARCH_MAX_FRAMES = 5
+
 # -----------------------------------------------------------------------------
 # --- 4. OUTPUT & VISUALIZATION ---
 # -----------------------------------------------------------------------------
@@ -176,7 +180,7 @@ EXPORT_TRACK_VISUALIZATION = True
 # -----------------------------------------------------------------------------
 
 # Enable actin cortex analysis on the C2 channel
-ANALYZE_ACTIN_CHANNEL = True
+ANALYZE_ACTIN_CHANNEL = False
 
 # Which mask to use for the cortex signal.
 # 'membrane' = the ring mask (peak ± MEMBRANE_FIXED_HALF_WIDTH).

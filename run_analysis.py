@@ -38,6 +38,7 @@ import scipy.optimize as sc
 import pandas as pd
 import tempfile
 from tqdm import tqdm
+import gc
 
 import config as cfg
 import guv_analysis_utils as utils
@@ -382,13 +383,20 @@ def process_all_guvs(circles: list[dict],
         )
         logger.info("Saved per-frame tracking data.")
 
+    ruptured_ids = {
+        str(qe['guv_id'])
+        for qe in quality_log
+        if qe.get('ruptured_at_frame') is not None
+    }
+
     return {
-        'raw_results':           results, 
+        'raw_results':           results,
         'all_intensity_curves':  all_intensity,
         'all_background_curves': all_background,
-        'all_actin_data':        all_actin_data,   # ← new
+        'all_actin_data':        all_actin_data,
         'valid_guv_indices':     valid_indices,
         'tracking_dataframe':    df_track,
+        'ruptured_guv_ids':      ruptured_ids,   # set of str IDs that ruptured
     }
 
 
@@ -542,7 +550,8 @@ def fit_individual_curves(aligned: dict, guv_results: dict, t: np.ndarray, logge
     if fit_plot_data:
         grid_path = utils.plot_dye_fits_grid(
             fit_plot_data, cfg.FOLDER_DYE,
-            cfg.EXPERIMENT_BASE_NAME, cfg.MODEL_TO_USE
+            cfg.EXPERIMENT_BASE_NAME, cfg.MODEL_TO_USE,
+            ruptured_guv_ids=guv_results.get('ruptured_guv_ids'),
         )
         logger.info(f"Saved dye fits grid → {grid_path}")
 
@@ -648,13 +657,17 @@ def validate_config(logger: logging.Logger) -> bool:
 # -------------------------------------------------------------------
 
 def main():
-    for _folder in (
+    folders = [
         cfg.OUTPUT_IMAGE_FOLDER,
         cfg.FOLDER_TRACKING,
         cfg.FOLDER_MASKS,
         cfg.FOLDER_DYE,
-        cfg.FOLDER_ACTIN,
-    ):
+    ]
+    
+    if getattr(cfg, 'ANALYZE_ACTIN_CHANNEL', False):
+        folders.append(cfg.FOLDER_ACTIN)
+        
+    for _folder in folders:
         os.makedirs(_folder, exist_ok=True)
     
     logger = utils.setup_logging(cfg.OUTPUT_IMAGE_FOLDER, cfg.EXPERIMENT_BASE_NAME)
@@ -792,7 +805,8 @@ def main():
 
         # Step 4b – dye summary (all traces + mean)
         summary_path = utils.plot_dye_summary(
-            aligned, cfg.FOLDER_DYE, cfg.EXPERIMENT_BASE_NAME
+            aligned, cfg.FOLDER_DYE, cfg.EXPERIMENT_BASE_NAME,
+            ruptured_guv_ids=guv_results.get('ruptured_guv_ids'),
         )
         logger.info(f"Saved dye summary plot → {summary_path}")
 
@@ -824,6 +838,7 @@ def main():
                 aligned_actin, valid_ids,
                 cfg.FOLDER_ACTIN, cfg.EXPERIMENT_BASE_NAME,
                 smooth_sigma=getattr(cfg, 'ACTIN_PLOT_SMOOTH_SIGMA', 1.5),
+                ruptured_guv_ids=guv_results.get('ruptured_guv_ids'),
             )
             logger.info(f"Saved actin analysis plot → {plot_path}")
 
@@ -833,6 +848,7 @@ def main():
                     aligned, aligned_actin, valid_ids,
                     cfg.FOLDER_ACTIN, cfg.EXPERIMENT_BASE_NAME,
                     smooth_sigma=getattr(cfg, 'ACTIN_PLOT_SMOOTH_SIGMA', 1.5),
+                    ruptured_guv_ids=guv_results.get('ruptured_guv_ids'),
                 )
                 logger.info(f"Saved dye/actin overlay → {overlay_path}")
 
@@ -889,6 +905,9 @@ def main():
         logger.critical(f"Unhandled exception: {e}", exc_info=True)
         
     finally:
+        # Force garbage collection to release lingering Windows memmap file locks
+        gc.collect()
+        
         # Guarantee removal of memory-mapped files from local disk
         if data is not None:
             for path_key in ('roi_mmap_path', 'dye_mmap_path', 'actin_mmap_path'):

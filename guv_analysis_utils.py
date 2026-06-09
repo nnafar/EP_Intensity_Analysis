@@ -171,18 +171,14 @@ def efflux_2exp(t, Iinf, a1, tau1, a2, tau2, D=0):
 
 def _get_fast_window(time_array: np.ndarray) -> Tuple[int, int]:
     """
-    Identify the frame range of the shortest-interval acquisition segment
-    from FRAME_INTERVAL_SCHEDULE (or by inspecting the time_array directly).
-
-    Returns (fast_start, fast_end) as inclusive frame indices of the fast
-    segment.  The search window for pulse detection is (fast_start - 1,
-    fast_end) so that the transition INTO the fast segment is included.
-
-    Falls back to (0, n-1) if no schedule is defined.
+    Returns (fast_start, fast_end) — inclusive frame indices of the
+    shortest-interval acquisition segment from FRAME_INTERVAL_SCHEDULE,
+    or by inspecting the time_array dt distribution.
+    The pulse-detection search window is (fast_start - 1, fast_end) so the
+    transition INTO the fast segment is included.
     """
     n = len(time_array)
     schedule = getattr(cfg, 'FRAME_INTERVAL_SCHEDULE', None)
-
     if schedule is not None and len(schedule) > 0:
         min_interval = min(interval for (_, _, interval) in schedule)
         for (start, end, interval) in schedule:
@@ -190,17 +186,14 @@ def _get_fast_window(time_array: np.ndarray) -> Tuple[int, int]:
                 lo = int(start)
                 hi = (int(end) - 1) if end is not None else (n - 1)
                 return max(0, lo), min(n - 1, hi)
-
-    # Fallback: find the run of shortest dt steps in the actual time array
     if n > 2:
         dt = np.diff(time_array)
         dt = np.where(dt > 0, dt, np.inf)
-        min_dt = dt.min()
+        min_dt    = dt.min()
         fast_mask = dt <= min_dt * 1.5
         fast_idx  = np.where(fast_mask)[0]
         if len(fast_idx) > 0:
             return int(fast_idx[0]), int(fast_idx[-1] + 1)
-
     return 0, n - 1
 
 
@@ -217,60 +210,31 @@ def detect_pulse_frame_efflux(
 
     Strategy
     --------
-    1.  Stack net signals (intensity − background) for every GUV into a
-        2-D array (n_guvs × n_frames).
+    1.  Build a (n_guvs × n_frames) net-signal array.
     2.  Restrict the search to the fast-acquisition window only
-        (shortest-dt segment from FRAME_INTERVAL_SCHEDULE, including the
-        one frame immediately before the window so the transition step
-        F(fast_start−1) → F(fast_start) is captured in the derivative).
-        The pulse is always delivered within this window; including slow-
-        interval frames in a dI/dt derivative causes artefactually large
-        values at the interval-change boundary.
+        (shortest-dt segment from FRAME_INTERVAL_SCHEDULE), including the
+        one frame immediately before the window so the pre→fast transition
+        is captured.
     3.  Within the fast window all frames share the same dt, so dI/dframe
-        is equivalent to dI/dt for ranking purposes.  Compute per-GUV
-        dI/dframe for each consecutive pair of frames in the window.
-    4.  Take the **median** across GUVs at each step.  The median is
-        intrinsically robust to single-GUV dropouts (mask loss, transient
-        tracking failure): a minority of GUVs with artefactual dips cannot
-        shift the median.  No Gaussian smoothing is needed within the
-        window — averaging across GUVs already suppresses noise.
-    5.  The pulse frame is the frame that *arrives* at the steepest median
-        drop, i.e.  fast_start − 1 + argmin(median_diff) + 1.
+        is equivalent to dI/dt for ranking.  Compute per-GUV dI/dframe.
+    4.  Take the **median** across GUVs at each step — robust to minority
+        GUVs with mask dropouts or transient tracking failures, with no
+        smoothing required.
+    5.  Pulse frame = frame that *arrives* at the steepest median drop
+        (search_lo + argmin + 1).
 
-    The diagnostic plot shows the full mean trace (smoothed for display)
-    with the search window highlighted, and a bar chart of the median
-    dI/dframe within that window.
-
-    Parameters
-    ----------
-    intensity_curves  : list of 1-D float arrays, one per GUV
-    background_curves : list of 1-D float arrays, one per GUV
-    smooth_sigma      : Gaussian σ in seconds for the display-only
-                        smoothed trace.  Not used in detection logic.
-    output_folder     : directory for the diagnostic plot (optional)
-    experiment_name   : used in the plot filename
-    time_array        : 1-D array of frame timestamps (seconds).
-                        Required for window identification; falls back to
-                        full-trace mean dI/dframe if not supplied.
-
-    Returns
-    -------
-    int  – detected pulse frame index (0-based)
+    smooth_sigma is used only for the display trace in the diagnostic plot.
     """
     if not intensity_curves:
         return 0
 
     n_frames = len(intensity_curves[0])
-
-    # ── 1. Per-GUV net signal ──────────────────────────────────────────────
-    net_arr = np.vstack([
+    net_arr  = np.vstack([
         np.asarray(d, float) - np.asarray(b, float)
         for d, b in zip(intensity_curves, background_curves)
-    ])   # shape: (n_guvs, n_frames)
-
+    ])
     mean_trace = np.nanmean(net_arr, axis=0)
 
-    # ── 2. Fast-window bounds ──────────────────────────────────────────────
     if time_array is not None and len(time_array) >= n_frames:
         t = time_array[:n_frames]
         fast_start, fast_end = _get_fast_window(t)
@@ -278,36 +242,42 @@ def detect_pulse_frame_efflux(
         fast_start, fast_end = 0, n_frames - 1
         t = np.arange(n_frames, dtype=float)
 
-    # Include the frame immediately before the fast segment so the
-    # transition step (pre-pulse → first fast frame) is captured.
     search_lo = max(0, fast_start - 1)
-    search_hi = fast_end   # inclusive
+    
+    # Restrict the upper bound if a max frame limit is set
+    max_search = getattr(cfg, 'PULSE_SEARCH_MAX_FRAMES', None)
+    if max_search is not None:
+        search_hi = min(fast_end, search_lo + max_search)
+    else:
+        search_hi = fast_end
 
-    # ── 3 & 4. Median dI/dframe across GUVs within the window ─────────────
-    window_arr   = net_arr[:, search_lo : search_hi + 1]   # (n_guvs, window)
-    per_guv_diff = np.diff(window_arr, axis=1)              # (n_guvs, window-1)
-    median_diff  = np.nanmedian(per_guv_diff, axis=0)       # (window-1,)
+    window_arr   = net_arr[:, search_lo : search_hi + 1]
+    per_guv_diff = np.diff(window_arr, axis=1)
+    
+    # Extract corresponding time window and compute actual dt
+    window_t = t[search_lo : search_hi + 1]
+    dt = np.diff(window_t)
+    dt = np.where(dt <= 0, 1e-6, dt) # Prevent division by zero
+    
+    # Compute the true rate of change (dI/dt)
+    per_guv_rate = per_guv_diff / dt[np.newaxis, :]
+    median_rate  = np.nanmedian(per_guv_rate, axis=0)
 
-    # ── 5. Pulse frame = frame that ARRIVES at the steepest drop ──────────
-    argmin_local = int(np.argmin(median_diff))
-    pulse_frame  = search_lo + argmin_local + 1   # +1: diff[i]=frame[i+1]-frame[i]
+    argmin_local = int(np.argmin(median_rate))
+    pulse_frame  = search_lo + argmin_local + 1
 
-    # ── Diagnostic plot ────────────────────────────────────────────────────
     if output_folder:
-        # Smooth mean trace on a uniform time grid for display only
         dt_min     = max(float(np.diff(t).min()), 1e-6)
         dt_uniform = min(0.01, dt_min / 2.0)
         t_unif     = np.arange(t[0], t[-1] + dt_uniform, dt_uniform)
         sig_unif   = np.interp(t_unif, t, mean_trace)
-        sigma_uni  = smooth_sigma / dt_uniform
-        sm_unif    = gaussian_filter1d(sig_unif, sigma=sigma_uni)
+        sm_unif    = gaussian_filter1d(sig_unif, sigma=smooth_sigma / dt_uniform)
         smoothed   = np.interp(t, t_unif, sm_unif)
 
         frames = np.arange(n_frames)
         fig, axes = plt.subplots(2, 1, figsize=(9, 6), sharex=True)
-
-        axes[0].plot(frames, mean_trace, color='steelblue', lw=1.0,
-                     alpha=0.6, label='Mean net signal (raw)')
+        axes[0].plot(frames, mean_trace, color='steelblue', lw=1.0, alpha=0.6,
+                     label='Mean net signal (raw)')
         axes[0].plot(frames, smoothed, color='navy', lw=1.5,
                      label=f'Smoothed (σ={smooth_sigma} s, display only)')
         axes[0].axvspan(search_lo, search_hi, alpha=0.10, color='gold',
@@ -319,20 +289,16 @@ def detect_pulse_frame_efflux(
         axes[0].set_title('Pulse-frame detection — efflux')
 
         win_frames = np.arange(search_lo, search_hi)
-        axes[1].bar(win_frames, median_diff, color='darkorange', alpha=0.7,
-                    label='Median dI/dframe across GUVs (within window)')
+        axes[1].bar(win_frames, median_rate, color='darkorange', alpha=0.7,
+                    label='Median dI/dt across GUVs (within window)')
         axes[1].axvline(pulse_frame - 0.5, color='crimson', ls='--', lw=1.5)
         axes[1].axhline(0, color='gray', lw=0.5, ls=':')
         axes[1].set_xlabel('Frame index')
-        axes[1].set_ylabel('Median Δ intensity / frame')
+        axes[1].set_ylabel('Median dI/dt (AU/s)')
         axes[1].legend(fontsize=8)
-
         fig.tight_layout()
-        out_path = os.path.join(
-            output_folder,
-            f"{experiment_name}_pulse_frame_detection.png"
-        )
-        fig.savefig(out_path, dpi=150)
+        fig.savefig(os.path.join(output_folder,
+                    f"{experiment_name}_pulse_frame_detection.png"), dpi=150)
         plt.close(fig)
 
     return pulse_frame
@@ -352,21 +318,32 @@ def _convert_to_8bit_gray(image: np.ndarray) -> np.ndarray:
         img_clipped = np.clip(img, low, high)
         return cv2.normalize(img_clipped, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
     return img
-def generate_vectorized_masks(shape, center, axes, angle, mem_hw, bg_buf, bg_w) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Generates inner, membrane, and background boolean masks simultaneously.
 
-    ``mem_hw`` may be either:
-      * a scalar  – symmetric half-width (original behaviour), or
-      * a 2-tuple ``(inner_hw, outer_hw)`` – asymmetric ring, extending
-        *inner_hw* pixels inward from the membrane contour and *outer_hw*
-        pixels outward.  Background placement is based on ``outer_hw``.
-    """
+def generate_vectorized_masks(shape, center, axes, angle, mem_hw, bg_buf, bg_w) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Generates inner, membrane, and background boolean masks using a memory-optimized local bounding box."""
     h, w = shape[:2]
     cx, cy = center
     a, b = axes
 
-    # Create coordinate grid
-    y, x = np.ogrid[:h, :w]
+    # Resolve symmetric vs. asymmetric half-width
+    if isinstance(mem_hw, (tuple, list)):
+        mem_inner_hw, mem_outer_hw = mem_hw
+    else:
+        mem_inner_hw = mem_outer_hw = mem_hw
+
+    # 1. Define a localized bounding box to prevent massive RAM allocation
+    max_r = max(a, b) + mem_outer_hw + bg_buf + bg_w + 5
+    x_min = max(0, int(cx - max_r))
+    x_max = min(w, int(cx + max_r))
+    y_min = max(0, int(cy - max_r))
+    y_max = min(h, int(cy + max_r))
+
+    # Check if the GUV is entirely out of bounds
+    if x_min >= x_max or y_min >= y_max:
+        return np.zeros((h, w), dtype=bool), np.zeros((h, w), dtype=bool), np.zeros((h, w), dtype=bool)
+
+    # Create coordinate grid ONLY for the local bounding box
+    y, x = np.ogrid[y_min:y_max, x_min:x_max]
     
     # Rotate coordinates to align with ellipse angle
     theta = np.radians(angle)
@@ -376,15 +353,8 @@ def generate_vectorized_masks(shape, center, axes, angle, mem_hw, bg_buf, bg_w) 
     y_rot = -sin_t * (x - cx) + cos_t * (y - cy)
 
     # Compute normalized elliptical distance squared
-    # A value of 1.0 lies exactly on the ellipse contour
     dist_sq = (x_rot**2) / (a**2) + (y_rot**2) / (b**2)
     dist = np.sqrt(dist_sq)
-
-    # Resolve symmetric vs. asymmetric half-width
-    if isinstance(mem_hw, (tuple, list)):
-        mem_inner_hw, mem_outer_hw = mem_hw
-    else:
-        mem_inner_hw = mem_outer_hw = mem_hw
 
     # Calculate fractional thresholds based on semi-major axis
     mem_inner_frac = max(0.01, (a - mem_inner_hw) / a)
@@ -392,9 +362,19 @@ def generate_vectorized_masks(shape, center, axes, angle, mem_hw, bg_buf, bg_w) 
     bg_inner_frac  = (a + mem_outer_hw + bg_buf) / a
     bg_outer_frac  = (a + mem_outer_hw + bg_buf + bg_w) / a
 
-    inner_mask = dist < mem_inner_frac
-    mem_mask   = (dist >= mem_inner_frac) & (dist <= mem_outer_frac)
-    bg_mask    = (dist >= bg_inner_frac)  & (dist <= bg_outer_frac)
+    # Generate masks in local space
+    local_inner = dist < mem_inner_frac
+    local_mem   = (dist >= mem_inner_frac) & (dist <= mem_outer_frac)
+    local_bg    = (dist >= bg_inner_frac)  & (dist <= bg_outer_frac)
+
+    # 2. Embed the local bool masks into the full-frame bool arrays (lightweight)
+    inner_mask = np.zeros((h, w), dtype=bool)
+    mem_mask   = np.zeros((h, w), dtype=bool)
+    bg_mask    = np.zeros((h, w), dtype=bool)
+
+    inner_mask[y_min:y_max, x_min:x_max] = local_inner
+    mem_mask[y_min:y_max, x_min:x_max]   = local_mem
+    bg_mask[y_min:y_max, x_min:x_max]    = local_bg
 
     return inner_mask, mem_mask, bg_mask
 
@@ -442,31 +422,19 @@ def _compute_peak_fwhm(
         hi_override: Optional[int] = None,
 ) -> Optional[Tuple[int, float, int, int]]:
     """
-    Locate the membrane peak and return its FWHM using a shared baseline
-    so that an elevated lumen signal does not artificially narrow the
-    measured width.
+    Locate the membrane peak and return its FWHM using a shared extracellular
+    baseline so that an elevated lumen plateau does not artificially narrow
+    the measured width.
 
-    Baseline strategy
-    -----------------
-    GUV actin profiles have a bright lumenal plateau that rises toward
-    the membrane peak from the inside.  If the left (lumenal) minimum is
-    used as the left baseline, ``left_half_max`` is set too close to the
-    peak and the left crossing is found just 1–2 px from the apex,
-    severely under-estimating FWHM.
-
-    Instead we use a **single shared baseline = right_base** (the
-    extracellular / outer side), which is the true background level the
-    peak sits above.  The lumenal plateau is cortex-adjacent signal, not
-    background, and should not be treated as the reference floor on the
-    inward side.  Both left and right crossings are therefore found at the
-    same threshold:  peak_val − (peak_val − right_base) * 0.5.
+    Both the left and right crossings use the same threshold:
+        half_max = right_base + (peak_val - right_base) * 0.5
+    where right_base is the minimum of the profile on the outer (extracellular)
+    side of the peak.  The lumenal plateau is cortex-adjacent signal, not
+    background, and must not be used as the inward baseline.
 
     lo_override / hi_override
-        When provided (both must be given together), these replace the
-        expected_r ± search_factor window with the actual inner/outer
-        boundary indices detected from the membrane (ROI) channel profile.
-        This anchors the FWHM search to the physically meaningful region of
-        the membrane ring rather than a generic radial fraction.
+        When provided, replace the generic search window with the actual
+        membrane inner/outer boundary from the ROI channel.
     """
     n  = len(profile)
     if lo_override is not None and hi_override is not None:
@@ -483,45 +451,39 @@ def _compute_peak_fwhm(
     peak_idx   = peak_local + lo
     peak_val   = float(profile[peak_idx])
 
-    # Ensure peak is brighter than lumen interior reference
+    # Establish left (lumenal) baseline using median to reject noise
     inner_end  = max(1, int(expected_r * 0.70))
-    lumen_mean = float(np.mean(profile[:inner_end]))
-    if peak_val <= lumen_mean:
+    left_base  = float(np.median(profile[:inner_end]))
+    
+    if peak_val <= left_base:
         return None
 
-    # ── Baseline: use the extracellular (outer) side only ─────────────────
-    # The lumenal plateau is signal, not background.  Using the outer
-    # minimum as the shared baseline means both crossings are found at the
-    # same level, producing a physically correct peak width even when the
-    # inner signal is elevated (e.g. lumenal actin release post-pulse).
+    # Establish right (extracellular) baseline
     band       = max(5, (hi - lo) // 2)
     right_zone = profile[peak_idx : min(n, hi + band)]
     right_base = float(right_zone.min()) if len(right_zone) > 0 else float(profile.min())
 
-    # Prominence validation: peak must rise meaningfully above the shared baseline
+    # Prominence check against the deeper right-side baseline
     amplitude     = peak_val - right_base
     profile_range = float(profile.max() - profile.min())
-
     if profile_range > 0 and (amplitude / profile_range) < min_prominence_fraction:
         return None
 
-    # Shared half-maximum threshold (same for both sides)
-    half_max = right_base + amplitude * 0.5
+    # Calculate independent half-max thresholds for asymmetric peaks
+    left_half_max  = left_base + (peak_val - left_base) * 0.5
+    right_half_max = right_base + (peak_val - right_base) * 0.5
 
-    # Find left crossing — walk inward from the peak; search all the way to
-    # the start of the profile so the crossing is not missed when the lumenal
-    # plateau sits above half_max (in that case left_idx stays at lo,
-    # correctly capturing the full inward extent of the peak).
+    # Left crossing using left_half_max
     left_idx = lo
     for j in range(peak_idx - 1, -1, -1):
-        if profile[j] <= half_max:
+        if profile[j] <= left_half_max:
             left_idx = j + 1
             break
 
-    # Find right crossing — walk outward from the peak
+    # Right crossing using right_half_max
     right_idx = hi
     for j in range(peak_idx + 1, min(n, hi + band)):
-        if profile[j] <= half_max:
+        if profile[j] <= right_half_max:
             right_idx = j - 1
             break
 
@@ -1555,6 +1517,7 @@ def plot_actin_analysis(
         output_folder: str,
         experiment_name: str,
         smooth_sigma: float = 1.5,
+        ruptured_guv_ids: Optional[set] = None,
 ):
     """
     2x2 actin summary figure:
@@ -1593,15 +1556,19 @@ def plot_actin_analysis(
     ax_fwhm  = axes[1, 0]
     ax_gini  = axes[1, 1]
 
-    palette = plt.cm.tab10.colors
+    C_SURV = '#888888'
+    C_RUPT = '#CC2222'
 
-    for i, (gid, p_row, l_row, f_row, g_row) in enumerate(
-            zip(valid_guv_ids, peak_arr, lumen_arr, fwhm_arr, gini_arr)):
-        col = palette[i % len(palette)]
-        ax_cpeak.plot(t, _smooth(p_row), color=col, alpha=0.4, lw=1, label=f'GUV {gid}')
-        ax_lumen.plot(t, _smooth(l_row), color=col, alpha=0.4, lw=1, label=f'GUV {gid}')
-        ax_fwhm .plot(t, _smooth(f_row), color=col, alpha=0.4, lw=1, label=f'GUV {gid}')
-        ax_gini .plot(t, _smooth(g_row), color=col, alpha=0.4, lw=1, label=f'GUV {gid}')
+    for gid, p_row, l_row, f_row, g_row in zip(
+            valid_guv_ids, peak_arr, lumen_arr, fwhm_arr, gini_arr):
+        ruptured = str(gid) in (ruptured_guv_ids or set())
+        col      = C_RUPT if ruptured else C_SURV
+        lw       = 1.2 if ruptured else 0.9
+        label    = f'GUV {gid} (ruptured)' if ruptured else f'GUV {gid}'
+        ax_cpeak.plot(t, _smooth(p_row), color=col, alpha=0.75, lw=lw, label=label)
+        ax_lumen.plot(t, _smooth(l_row), color=col, alpha=0.75, lw=lw, label=label)
+        ax_fwhm .plot(t, _smooth(f_row), color=col, alpha=0.75, lw=lw, label=label)
+        ax_gini .plot(t, _smooth(g_row), color=col, alpha=0.75, lw=lw, label=label)
 
     ax_cpeak.plot(t, _smooth(avg_peak),  'k-', lw=2.5, label='Mean')
     ax_lumen.plot(t, _smooth(avg_lumen), 'k-', lw=2.5, label='Mean')
@@ -1656,7 +1623,9 @@ def export_actin_csv(
 ):
     """Save per-GUV aligned actin traces to a single tidy CSV."""
     t = aligned_actin['t_aligned']
-    df = pd.DataFrame({'time_s': t})
+    
+    # Pre-allocate dictionary to prevent pandas DataFrame fragmentation
+    data_dict = {'time_s': t}
 
     for gid, c_row, p_row, l_row, f_row, g_row, d_row in zip(
             valid_guv_ids,
@@ -1666,19 +1635,23 @@ def export_actin_csv(
             aligned_actin['fwhm_aligned'],
             aligned_actin['gini_aligned'],
             aligned_actin['peak_detected']):
-        df[f'GUV_{gid}_cortex_mean']    = c_row
-        df[f'GUV_{gid}_cortex_peak']    = p_row
-        df[f'GUV_{gid}_lumen']          = l_row
-        df[f'GUV_{gid}_fwhm_um']        = f_row
-        df[f'GUV_{gid}_gini']           = g_row
-        df[f'GUV_{gid}_peak_detected']  = d_row
+        
+        data_dict[f'GUV_{gid}_cortex_mean']   = c_row
+        data_dict[f'GUV_{gid}_cortex_peak']   = p_row
+        data_dict[f'GUV_{gid}_lumen']         = l_row
+        data_dict[f'GUV_{gid}_fwhm_um']       = f_row
+        data_dict[f'GUV_{gid}_gini']          = g_row
+        data_dict[f'GUV_{gid}_peak_detected'] = d_row
 
-    df['avg_cortex_mean']  = aligned_actin['avg_cortex']
-    df['avg_cortex_peak']  = aligned_actin['avg_peak']
-    df['avg_lumen']        = aligned_actin['avg_lumen']
-    df['avg_fwhm_um']      = aligned_actin['avg_fwhm']
-    df['avg_gini']         = aligned_actin['avg_gini']
-    df['peak_detect_frac'] = aligned_actin['peak_detect_frac']
+    data_dict['avg_cortex_mean']  = aligned_actin['avg_cortex']
+    data_dict['avg_cortex_peak']  = aligned_actin['avg_peak']
+    data_dict['avg_lumen']        = aligned_actin['avg_lumen']
+    data_dict['avg_fwhm_um']      = aligned_actin['avg_fwhm']
+    data_dict['avg_gini']         = aligned_actin['avg_gini']
+    data_dict['peak_detect_frac'] = aligned_actin['peak_detect_frac']
+
+    # Initialize the DataFrame in a single operation
+    df = pd.DataFrame(data_dict)
 
     csv_path = os.path.join(output_folder,
                             f'{experiment_name}_actin_cortex_traces.csv')
@@ -1913,6 +1886,7 @@ def plot_dye_actin_overlay(
         output_folder: str,
         experiment_name: str,
         smooth_sigma: float = 1.5,
+        ruptured_guv_ids: Optional[set] = None,
 ):
     """
     Per-GUV dual-axis figure correlating dye efflux with actin cortex dynamics.
@@ -1960,14 +1934,18 @@ def plot_dye_actin_overlay(
                              figsize=(5 * ncols, 4 * nrows),
                              squeeze=False)
 
-    DYE_COLOR = '#1f77b4'    # blue
-    ACT_COLOR = '#ff7f0e'    # orange
+    DYE_COLOR = '#1f77b4'    # blue  (kept for dual-axis lines)
+    ACT_COLOR = '#ff7f0e'    # orange (kept for dual-axis lines)
+    C_SURV    = '#888888'
+    C_RUPT    = '#CC2222'
 
-    def _draw_panel(ax, t_d, dye_row, t_a, act_row, title):
+    def _draw_panel(ax, t_d, dye_row, t_a, act_row, title, ruptured=False):
         ax2 = ax.twinx()
 
-        ax .plot(t_d, _sm(dye_row), color=DYE_COLOR, lw=1.6, label='Dye (ret.)')
-        ax2.plot(t_a, _sm(act_row), color=ACT_COLOR, lw=1.6, label='Cortex (norm.)')
+        trace_col = C_RUPT if ruptured else DYE_COLOR
+        ax .plot(t_d, _sm(dye_row), color=trace_col, lw=1.6, label='Dye (ret.)')
+        ax2.plot(t_a, _sm(act_row), color=ACT_COLOR if not ruptured else C_RUPT,
+                 lw=1.6, label='Cortex (norm.)')
 
         ax .axvline(0, color='crimson', ls='--', lw=1.2, zorder=3)
         ax .axhline(1, color=DYE_COLOR, ls=':', lw=0.6, alpha=0.5)
@@ -1995,7 +1973,8 @@ def plot_dye_actin_overlay(
         dye_row = dye_arr[i] if i < len(dye_arr) else np.full_like(t_dye, np.nan)
         act_row = act_arr[i] if i < len(act_arr) else np.full_like(t_act, np.nan)
 
-        _draw_panel(ax, t_dye, dye_row, t_act, act_row, f'GUV {gid}')
+        _draw_panel(ax, t_dye, dye_row, t_act, act_row, f'GUV {gid}',
+                    ruptured=str(gid) in (ruptured_guv_ids or set()))
 
     # Population summary panel (last)
     summary_idx  = n_guvs
@@ -2043,63 +2022,70 @@ def plot_dye_fits_grid(
         output_folder: str,
         experiment_name: str,
         model_name: str,
+        ruptured_guv_ids: Optional[set] = None,
 ) -> str:
     """
     Multigrid plot of per-GUV kinetic fits — one subplot per GUV plus a
     population-mean panel.
 
+    Colour scheme
+    -------------
+    Surviving GUVs : medium grey (#888888) data dots, dark grey (#444444) fit line.
+    Ruptured GUVs  : red (#CC2222) data dots and fit line.
+    Population mean panel: grey individual fits, bold black mean, light grey ±1 SD band.
+
     Parameters
     ----------
     fit_data : list of dicts, one per GUV, each containing:
-        'guv_id'  – str
-        't_data'  – 1-D array of finite time points used in the fit
-        'y_data'  – corresponding normalised intensity values
-        'y_fit'   – model evaluated at t_data with fitted parameters
-        'r_um'    – GUV radius in µm
-        'param_str' – short label string, e.g. "τ = 12.3 s"
-    output_folder : str
-    experiment_name : str
-    model_name : str  – used for the figure title
+        'guv_id', 't_data', 'y_data', 'y_fit', 'r_um', 'param_str'
+    ruptured_guv_ids : set of guv_id strings that ruptured (coloured red)
     """
     n = len(fit_data)
     if n == 0:
         return ""
 
-    n_panels = n + 1                       # +1 for population mean
+    if ruptured_guv_ids is None:
+        ruptured_guv_ids = set()
+
+    C_DATA_SURV = '#888888'   # mid-grey  — surviving data points
+    C_FIT_SURV  = '#444444'   # dark grey — surviving fit line
+    C_RUPT      = '#CC2222'   # red       — ruptured GUV (data + fit)
+    C_SD_BAND   = '#BBBBBB'   # light grey — ±1 SD shading (distinct from traces)
+
+    n_panels = n + 1
     ncols    = min(4, n_panels)
     nrows    = int(np.ceil(n_panels / ncols))
-    palette  = plt.cm.tab10.colors
 
     fig, axes = plt.subplots(nrows, ncols,
                              figsize=(5 * ncols, 4 * nrows),
                              squeeze=False)
 
     for k, d in enumerate(fit_data):
-        ax  = axes[k // ncols][k % ncols]
-        col = palette[k % len(palette)]
+        ax       = axes[k // ncols][k % ncols]
+        ruptured = str(d['guv_id']) in ruptured_guv_ids
+        c_data   = C_RUPT if ruptured else C_DATA_SURV
+        c_fit    = C_RUPT if ruptured else C_FIT_SURV
+        suffix   = ' (ruptured)' if ruptured else ''
 
-        ax.plot(d['t_data'], d['y_data'], '.', color=col,
-                alpha=0.45, ms=3, label='Data')
-        ax.plot(d['t_data'], d['y_fit'],  '-', color=col,
-                lw=1.8, label='Fit')
-        ax.axvline(0, color='gray', ls='--', lw=1.2, label='Pulse', zorder=0)
+        ax.plot(d['t_data'], d['y_data'], '.', color=c_data,
+                alpha=0.55, ms=3, label='Data' + suffix)
+        ax.plot(d['t_data'], d['y_fit'],  '-', color=c_fit,
+                lw=2.0, label='Fit')
+        ax.axvline(0, color='dimgray', ls='--', lw=1.0, label='Pulse', zorder=0)
 
+        title_color = C_RUPT if ruptured else 'black'
         ax.set_title(
-            rf"GUV {d['guv_id']}  (R={d['r_um']:.1f} µm)"
+            rf"GUV {d['guv_id']}  (R={d['r_um']:.1f} µm){suffix}"
             f"\n{d['param_str']}",
-            fontsize=8
+            fontsize=8, color=title_color
         )
         ax.set_xlabel('Time (s)', fontsize=8)
         ax.set_ylabel('Norm. intensity', fontsize=8)
         ax.tick_params(labelsize=7)
-        ax.grid(True, alpha=0.25)
+        ax.grid(True, alpha=0.20)
         ax.legend(fontsize=6)
 
     # ── Population mean panel ─────────────────────────────────────────────
-    # Each GUV's t_data covers only its finite points and may have a
-    # different length.  Build a common dense grid spanning the union of
-    # all time ranges, then interpolate each fit onto that grid before
-    # computing the mean and SD.
     mean_ax = axes[n // ncols][n % ncols]
 
     t_min = min(float(d['t_data'][0])  for d in fit_data)
@@ -2108,34 +2094,33 @@ def plot_dye_fits_grid(
     all_t = np.linspace(t_min, t_max, n_pts)
 
     y_stack = []
-    for k, d in enumerate(fit_data):
-        col = palette[k % len(palette)]
-        mean_ax.plot(d['t_data'], d['y_data'], '.', color=col,
-                     alpha=0.20, ms=2)
-        mean_ax.plot(d['t_data'], d['y_fit'],  '-', color=col,
-                     lw=0.8, alpha=0.4)
-        # Interpolate this GUV's fit onto the shared grid; NaN outside range
+    for d in fit_data:
+        ruptured = str(d['guv_id']) in ruptured_guv_ids
+        c_fit    = C_RUPT if ruptured else C_FIT_SURV
+        mean_ax.plot(d['t_data'], d['y_data'], '.', color=c_fit,
+                     alpha=0.18, ms=2)
+        mean_ax.plot(d['t_data'], d['y_fit'],  '-', color=c_fit,
+                     lw=0.8, alpha=0.45)
         y_interp = np.interp(all_t, d['t_data'], d['y_fit'],
                              left=np.nan, right=np.nan)
         y_stack.append(y_interp)
 
     if len(y_stack) > 0:
-        y_arr  = np.array(y_stack)          # now always (n_guvs, n_pts)
+        y_arr  = np.array(y_stack)
         y_mean = np.nanmean(y_arr, axis=0)
         y_sd   = np.nanstd(y_arr,  axis=0)
-        mean_ax.plot(all_t, y_mean, 'k-', lw=2.5, label='Mean fit')
         mean_ax.fill_between(all_t, y_mean - y_sd, y_mean + y_sd,
-                             color='black', alpha=0.12, label='±1 SD')
+                             color=C_SD_BAND, alpha=0.55, label='±1 SD', zorder=1)
+        mean_ax.plot(all_t, y_mean, 'k-', lw=2.5, label='Mean fit', zorder=2)
 
-    mean_ax.axvline(0, color='gray', ls='--', lw=1.2, label='Pulse', zorder=0)
+    mean_ax.axvline(0, color='dimgray', ls='--', lw=1.0, label='Pulse', zorder=0)
     mean_ax.set_title('Population mean (fits)', fontsize=8)
     mean_ax.set_xlabel('Time (s)', fontsize=8)
     mean_ax.set_ylabel('Norm. intensity', fontsize=8)
     mean_ax.tick_params(labelsize=7)
-    mean_ax.grid(True, alpha=0.25)
+    mean_ax.grid(True, alpha=0.20)
     mean_ax.legend(fontsize=6)
 
-    # Hide unused panels
     for k in range(n_panels, nrows * ncols):
         axes[k // ncols][k % ncols].set_visible(False)
 
@@ -2156,26 +2141,25 @@ def plot_dye_summary(
         output_folder: str,
         experiment_name: str,
         smooth_sigma: float = 0.0,
+        ruptured_guv_ids: Optional[set] = None,
 ) -> str:
     """
-    Single-panel summary of all normalised dye traces + population mean
-    (± 1 SD shading).  Mirrors the leftmost panel of the actin cortex
-    analysis figure.
+    Single-panel summary of all normalised dye traces + population mean.
 
-    Parameters
-    ----------
-    aligned : dict returned by normalize_and_align_curves()
-        Keys used: 't_aligned', 'all_curves_aligned', 'average_curve',
-                   'valid_guv_ids'
-    output_folder : str
-    experiment_name : str
-    smooth_sigma : float  Gaussian σ (frames) for display smoothing; 0 = off
+    Colour scheme: surviving GUVs in medium grey (#888888), ruptured GUVs
+    in red (#CC2222), bold black mean, light grey (#BBBBBB) ±1 SD band.
     """
     t       = aligned['t_aligned']
-    arr     = aligned['all_curves_aligned']   
+    arr     = aligned['all_curves_aligned']
     avg     = aligned['average_curve']
     ids     = aligned['valid_guv_ids']
-    palette = plt.cm.tab10.colors
+
+    if ruptured_guv_ids is None:
+        ruptured_guv_ids = set()
+
+    C_SURV  = '#888888'
+    C_RUPT  = '#CC2222'
+    C_SD    = '#BBBBBB'
 
     def _smooth(x):
         if smooth_sigma > 0:
@@ -2189,23 +2173,21 @@ def plot_dye_summary(
 
     fig, ax = plt.subplots(figsize=(9, 5))
 
-    for i, (gid, row) in enumerate(zip(ids, arr)):
-        ax.plot(t, _smooth(row), color=palette[i % len(palette)],
-                alpha=0.40, lw=1.0, label=f'GUV {gid}')
+    for gid, row in zip(ids, arr):
+        ruptured = str(gid) in ruptured_guv_ids
+        col      = C_RUPT if ruptured else C_SURV
+        lw       = 1.2 if ruptured else 0.9
+        label    = f'GUV {gid} (ruptured)' if ruptured else f'GUV {gid}'
+        ax.plot(t, _smooth(row), color=col, alpha=0.70, lw=lw, label=label)
 
-    # Mean ± SD
-    sd  = np.nanstd(arr, axis=0)
-    sm  = _smooth(avg)
-    sd_sm_lo = _smooth(avg - sd)
-    sd_sm_hi = _smooth(avg + sd)
-
-    ax.fill_between(t, sd_sm_lo, sd_sm_hi, color='black', alpha=0.12,
-                    label='±1 SD')
-    ax.plot(t, sm, 'k-', lw=2.5, label='Mean')
+    sd       = np.nanstd(arr, axis=0)
+    sm       = _smooth(avg)
+    ax.fill_between(t, _smooth(avg - sd), _smooth(avg + sd),
+                    color=C_SD, alpha=0.55, label='±1 SD', zorder=1)
+    ax.plot(t, sm, 'k-', lw=2.5, label='Mean', zorder=2)
 
     ax.axvline(0, color='crimson', ls='--', lw=1.5, label='Pulse', zorder=3)
-    ax.axhline(1, color='gray',    ls=':',  lw=0.8)
-
+    ax.axhline(1, color='gray', ls=':', lw=0.8)
     ax.set_xlabel('Time relative to pulse (s)', fontsize=11)
     ax.set_ylabel('Normalised dye intensity (a.u.)', fontsize=11)
     ax.set_title(
@@ -2213,16 +2195,12 @@ def plot_dye_summary(
         fontsize=11
     )
     ax.grid(True, alpha=0.25)
-
-    # Legend: all GUVs + stat lines, arranged in 3 columns to keep it compact
-    handles, labels = ax.get_legend_handles_labels()
+    handles, labels_leg = ax.get_legend_handles_labels()
     ncols_leg = 3 if len(handles) > 10 else 2
-    ax.legend(handles, labels, fontsize=8, ncol=ncols_leg,
+    ax.legend(handles, labels_leg, fontsize=8, ncol=ncols_leg,
               loc='upper right' if avg[-1] < avg[0] else 'lower right')
-
     plt.tight_layout()
-    out_path = os.path.join(output_folder,
-                            f'{experiment_name}_dye_summary.png')
+    out_path = os.path.join(output_folder, f'{experiment_name}_dye_summary.png')
     fig.savefig(out_path, dpi=300)
     plt.close(fig)
     return out_path
