@@ -89,6 +89,48 @@ def extract_timestamps_from_metadata(
     
     return None, None
 
+def extract_timestamps_nd2(nd2_file) -> Tuple[np.ndarray, float]:
+    """Extracts absolute timestamps in seconds from ND2 frame metadata."""
+    try:
+        times = [
+            frame.channels[0].time.relativeTimeMs / 1000.0 
+            for frame in nd2_file.frame_metadata()
+        ]
+        t_array = np.array(times)
+        dt = float(np.median(np.diff(t_array)))
+        return t_array, dt
+    except Exception:
+        # Fallback to manual intervals if metadata extraction fails
+        return create_manual_timestamps(
+            nd2_file.sizes.get('T', 1), 
+            getattr(cfg, 'FALLBACK_FPS', 1.0)
+        )
+
+def create_memmap_from_nd2_channel(nd2_file, ch_idx: int, mmap_path: str, desc: str) -> tuple:
+    """Reads a specific channel from an ND2 file into a contiguous binary memmap."""
+    if os.path.exists(mmap_path):
+        os.remove(mmap_path)
+
+    data = nd2_file.asarray()
+    
+    # Handle standard (Time, Channel, Y, X) shape
+    if data.ndim == 4:
+        ch_data = data[:, ch_idx, :, :]
+    elif data.ndim == 3:
+        ch_data = data  # Single channel scenario
+    else:
+        raise ValueError(f"Unexpected ND2 array shape: {data.shape}")
+
+    shape = ch_data.shape
+    dtype = ch_data.dtype
+    mmap_arr = np.memmap(mmap_path, dtype=dtype, mode='w+', shape=shape)
+
+    for i in tqdm(range(shape[0]), desc=desc, unit="frame"):
+        mmap_arr[i] = ch_data[i]
+    mmap_arr.flush()
+
+    return mmap_path, shape, str(dtype)
+
 
 def create_manual_timestamps(num_frames: int,
                               fallback_fps: float = 1.0

@@ -17,13 +17,26 @@ import os
 # --- 1. FILE & EXPERIMENT IDENTIFICATION ---
 # -----------------------------------------------------------------------------
 
+# Set to 'TIFF' for standard image sequences or 'ND2' for a single multiphoton stack
+INPUT_FORMAT = 'ND2' 
+
 # Set this to the specific folder for the current run
 DATA_FOLDER           = r"M:\tnw\bn\gk\NN\2_Data-Analysis\BulkElectroporation\260331_DOPC_BranchedCortex_Experiment1-400V-500us-frame7"
 
 # The shared base name across all channels for the image files
 EXPERIMENT_BASE_NAME  = "DOPC_BranchedCortex_Experiment1-400V-500us-frame7"
 
-# Channel prefixes updated to use underscores
+# Required if INPUT_FORMAT = 'ND2'
+ND2_FILE_NAME = f"{EXPERIMENT_BASE_NAME}.nd2"
+
+# ND2 dimensions (typically T, C, Y, X)
+# 488=Membrane, 561=Dye, 640=Actin
+ND2_CHANNEL_IDX_MEMBRANE = 0
+ND2_CHANNEL_IDX_DYE      = 1
+ND2_CHANNEL_IDX_ACTIN    = 2
+
+
+# TIFF Prefixes (typically T, C, Y, X)
 ROI_CHANNEL_PREFIX    = "C1_"    # Guide / membrane channel (used for tracking)
 ACTIN_CHANNEL_PREFIX  = "C2_"    # Actin channel (for future implementation)
 DYE_CHANNEL_PREFIX    = "C3_"    # Dye / measurement channel

@@ -50,12 +50,8 @@ import guv_analysis_utils as utils
 def get_guv_circles(logger: logging.Logger) -> list[dict]:
     """
     Returns the list of user-drawn GUV circles.
-
     If CIRCLES_JSON_PATH already exists, loads it.
-    Otherwise, launches the interactive circle selector so the user
-    can draw circles on the first ROI frame, then saves the result.
-
-    Each circle is a dict: {"id": N, "x": int, "y": int, "r": int}
+    Otherwise, extracts the first frame (ND2 or TIFF) and launches the interactive selector.
     """
     path = cfg.CIRCLES_JSON_PATH
 
@@ -65,24 +61,43 @@ def get_guv_circles(logger: logging.Logger) -> list[dict]:
         logger.info(f"Loaded {len(circles)} GUV circle(s) from: {path}")
         return circles
 
-    # ── No JSON found → run interactive selector ──────────────────────────
     logger.info("No circle definitions found — launching interactive selector.")
 
-    roi_pattern = os.path.join(
-        cfg.DATA_FOLDER,
-        cfg.ROI_CHANNEL_PREFIX + cfg.EXPERIMENT_BASE_NAME + cfg.TIF_SUFFIX
-    )
-    roi_files = natsorted(glob.glob(roi_pattern))
-    if not roi_files:
-        logger.error(f"No ROI files found matching: {roi_pattern}")
-        return []
+    input_format = getattr(cfg, 'INPUT_FORMAT', 'TIFF').upper()
+    first_frame = None
 
-    first_frame = cv2.imread(roi_files[0], cv2.IMREAD_ANYDEPTH | cv2.IMREAD_GRAYSCALE)
+    if input_format == 'ND2':
+        import nd2
+        nd2_path = os.path.join(cfg.DATA_FOLDER, getattr(cfg, 'ND2_FILE_NAME', f"{cfg.EXPERIMENT_BASE_NAME}.nd2"))
+        if not os.path.exists(nd2_path):
+            logger.error(f"ND2 file not found: {nd2_path}")
+            return []
+            
+        with nd2.ND2File(nd2_path) as f:
+            idx_mem = getattr(cfg, 'ND2_CHANNEL_IDX_MEMBRANE', 0)
+            data = f.asarray()
+            # Extract first frame, membrane channel. Handle 3D or 4D ND2 arrays.
+            if data.ndim == 4:
+                first_frame = data[0, idx_mem, :, :]
+            elif data.ndim == 3:
+                first_frame = data[0, :, :]
+    else:
+        import glob
+        from natsort import natsorted
+        roi_pattern = os.path.join(
+            cfg.DATA_FOLDER,
+            cfg.ROI_CHANNEL_PREFIX + cfg.EXPERIMENT_BASE_NAME + cfg.TIF_SUFFIX
+        )
+        roi_files = natsorted(glob.glob(roi_pattern))
+        if not roi_files:
+            logger.error(f"No ROI files found matching: {roi_pattern}")
+            return []
+        first_frame = cv2.imread(roi_files[0], cv2.IMREAD_ANYDEPTH | cv2.IMREAD_GRAYSCALE)
+
     if first_frame is None:
-        logger.error(f"Could not load first ROI frame: {roi_files[0]}")
+        logger.error("Could not load first ROI frame.")
         return []
 
-    # Import here so the rest of the pipeline works even without a display
     from interactive_select import run_selector
     circles = run_selector(first_frame, save_path=path)
 
@@ -127,90 +142,85 @@ def create_memmap_stack(files: list, mmap_path: str, desc: str = "Processing") -
 
     return mmap_path, shape, str(dtype)
 
+
 def load_input_data(circles: list[dict], logger: logging.Logger) -> dict | None:
     """
-    Loads ROI frames, dye frames, and timestamps.
-
-    Parameters
-    ----------
-    circles : list of {"id", "x", "y", "r"} dicts
+    Loads image frames and timestamps, supporting both TIFF sequences and ND2 stacks.
     """
-    dye_files = natsorted(glob.glob(os.path.join(
-        cfg.DATA_FOLDER,
-        cfg.DYE_CHANNEL_PREFIX + cfg.EXPERIMENT_BASE_NAME + cfg.TIF_SUFFIX
-    )))
-    roi_files = natsorted(glob.glob(os.path.join(
-        cfg.DATA_FOLDER,
-        cfg.ROI_CHANNEL_PREFIX + cfg.EXPERIMENT_BASE_NAME + cfg.TIF_SUFFIX
-    )))
-    actin_files = natsorted(glob.glob(os.path.join(
-        cfg.DATA_FOLDER,
-        cfg.ACTIN_CHANNEL_PREFIX + cfg.EXPERIMENT_BASE_NAME + cfg.TIF_SUFFIX
-    ))) if getattr(cfg, 'ANALYZE_ACTIN_CHANNEL', False) else []
-
-    if not dye_files:
-        logger.error("No dye files found.")
-        return None
-    if not roi_files:
-        logger.error("No ROI files found.")
-        return None
-
-    if actin_files and len(actin_files) != len(roi_files):
-        n = min(len(actin_files), len(roi_files))
-        logger.warning(f"Actin frame count mismatch — trimming to {n} frames.")
-        actin_files = actin_files[:n]
-
-    if len(dye_files) != len(roi_files):
-        n = min(len(dye_files), len(roi_files))
-        logger.warning(f"Frame count mismatch — trimming to {n} frames.")
-        dye_files = dye_files[:n]
-        roi_files = roi_files[:n]
-
-    logger.info(f"Found {len(dye_files)} frame(s), {len(circles)} GUV(s).")
-
-    # Timestamps
-    time_array, frame_interval = utils.extract_timestamps_from_metadata(dye_files)
-    if time_array is None:
-        logger.warning("Metadata timestamps not found — using fallback FPS.")
-        time_array, frame_interval = utils.create_manual_timestamps(
-            len(dye_files), getattr(cfg, 'FALLBACK_FPS', 1.0)
-        )
-    logger.info(f"Frame interval: {frame_interval:.3f} s  ({len(time_array)} frames)")
-    
-    
-    # Reroute the memory maps to a shorter, dedicated local path
     mmap_dir = r"C:\temp_guv_data" 
-    if not os.path.exists(mmap_dir):
-        try:
-            os.makedirs(mmap_dir)
-        except Exception:
-            # Fallback to the experiment folder if C: is restricted
-            mmap_dir = cfg.DATA_FOLDER
+    os.makedirs(mmap_dir, exist_ok=True)
    
-    # Use a generic name to keep the path length short
     roi_mmap_path   = os.path.join(mmap_dir, "roi_temp.dat")
     dye_mmap_path   = os.path.join(mmap_dir, "dye_temp.dat")
     actin_mmap_path = os.path.join(mmap_dir, "actin_temp.dat")
-    
-    tracking_only = getattr(cfg, 'TRACKING_ONLY_MODE', False)
-    
-    logger.info(f"Compiling TIFFs into local memory-mapped stacks at {mmap_dir}...")
-    roi_mmap_info = create_memmap_stack(roi_files, roi_mmap_path, desc="ROI Stack")
-    
-    if tracking_only:
-        logger.info("TRACKING_ONLY_MODE is True. Skipping Dye Stack compilation.")
-        dye_mmap_info = (None, None, None)
-    else:
-        dye_mmap_info = create_memmap_stack(dye_files, dye_mmap_path, desc="Dye Stack")
 
-    # Actin (C2) stack — only if analysis is enabled and files were found
-    if actin_files and getattr(cfg, 'ANALYZE_ACTIN_CHANNEL', False):
-        actin_mmap_info = create_memmap_stack(actin_files, actin_mmap_path, desc="Actin Stack")
-        logger.info(f"Loaded {len(actin_files)} actin (C2) frame(s).")
+    input_format = getattr(cfg, 'INPUT_FORMAT', 'TIFF').upper()
+
+    if input_format == 'ND2':
+        import nd2
+        nd2_path = os.path.join(cfg.DATA_FOLDER, getattr(cfg, 'ND2_FILE_NAME', f"{cfg.EXPERIMENT_BASE_NAME}.nd2"))
+        
+        if not os.path.exists(nd2_path):
+            logger.error(f"ND2 file not found: {nd2_path}")
+            return None
+
+        logger.info(f"Loading ND2 file: {nd2_path}")
+        with nd2.ND2File(nd2_path) as f:
+            ch_names = [c.channel.name for c in f.metadata.channels]
+            logger.info(f"ND2 Channels found: {ch_names}")
+
+            idx_mem = getattr(cfg, 'ND2_CHANNEL_IDX_MEMBRANE', 0)
+            idx_dye = getattr(cfg, 'ND2_CHANNEL_IDX_DYE', 1)
+            idx_act = getattr(cfg, 'ND2_CHANNEL_IDX_ACTIN', 2)
+
+            logger.info(f"Compiling ND2 channels into local memory-mapped stacks at {mmap_dir}...")
+            roi_mmap_info = utils.create_memmap_from_nd2_channel(f, idx_mem, roi_mmap_path, "ROI Stack")
+            
+            if getattr(cfg, 'TRACKING_ONLY_MODE', False):
+                dye_mmap_info = (None, None, None)
+            else:
+                dye_mmap_info = utils.create_memmap_from_nd2_channel(f, idx_dye, dye_mmap_path, "Dye Stack")
+
+            if getattr(cfg, 'ANALYZE_ACTIN_CHANNEL', False):
+                actin_mmap_info = utils.create_memmap_from_nd2_channel(f, idx_act, actin_mmap_path, "Actin Stack")
+            else:
+                actin_mmap_info = (None, None, None)
+
+            time_array, frame_interval = utils.extract_timestamps_nd2(f)
+            dye_files = [f"nd2_frame_{i}" for i in range(roi_mmap_info[1][0])]
+
     else:
-        actin_mmap_info = (None, None, None)
-        if getattr(cfg, 'ANALYZE_ACTIN_CHANNEL', False):
-            logger.warning("ANALYZE_ACTIN_CHANNEL=True but no C2 files found — skipping actin analysis.")
+        # Existing TIFF processing logic
+        dye_files = natsorted(glob.glob(os.path.join(
+            cfg.DATA_FOLDER, cfg.DYE_CHANNEL_PREFIX + cfg.EXPERIMENT_BASE_NAME + cfg.TIF_SUFFIX
+        )))
+        roi_files = natsorted(glob.glob(os.path.join(
+            cfg.DATA_FOLDER, cfg.ROI_CHANNEL_PREFIX + cfg.EXPERIMENT_BASE_NAME + cfg.TIF_SUFFIX
+        )))
+        actin_files = natsorted(glob.glob(os.path.join(
+            cfg.DATA_FOLDER, cfg.ACTIN_CHANNEL_PREFIX + cfg.EXPERIMENT_BASE_NAME + cfg.TIF_SUFFIX
+        ))) if getattr(cfg, 'ANALYZE_ACTIN_CHANNEL', False) else []
+
+        if not dye_files or not roi_files:
+            logger.error("Required TIFF files not found.")
+            return None
+
+        time_array, frame_interval = utils.extract_timestamps_from_metadata(dye_files)
+        if time_array is None:
+            time_array, frame_interval = utils.create_manual_timestamps(
+                len(dye_files), getattr(cfg, 'FALLBACK_FPS', 1.0)
+            )
+
+        logger.info(f"Compiling TIFFs into local memory-mapped stacks at {mmap_dir}...")
+        roi_mmap_info = create_memmap_stack(roi_files, roi_mmap_path, desc="ROI Stack")
+        
+        dye_mmap_info = (None, None, None) if getattr(cfg, 'TRACKING_ONLY_MODE', False) else \
+                        create_memmap_stack(dye_files, dye_mmap_path, desc="Dye Stack")
+        
+        actin_mmap_info = create_memmap_stack(actin_files, actin_mmap_path, desc="Actin Stack") \
+                          if actin_files and getattr(cfg, 'ANALYZE_ACTIN_CHANNEL', False) else (None, None, None)
+
+    logger.info(f"Frame interval: {frame_interval:.3f} s  ({len(time_array)} frames)")
 
     return {
         'dye_files':        dye_files,
