@@ -12,19 +12,31 @@ Workflow
 
 import numpy as np
 import os
+import re
 
 # -----------------------------------------------------------------------------
 # --- 1. FILE & EXPERIMENT IDENTIFICATION ---
 # -----------------------------------------------------------------------------
 
-# Set to 'TIFF' for standard image sequences or 'ND2' for a single multiphoton stack
 INPUT_FORMAT = 'ND2' 
 
-# Set this to the specific folder for the current run
 DATA_FOLDER  = r"D:\EP\260331_Trial4_InvE_BranchedCortex_SRB_Inside"
-
-# The shared base name across all channels for the image files
 EXPERIMENT_BASE_NAME  = "DOPC_BranchedCortex_Experiment1-400V-500us-frame7"
+
+# --- NEW DIRECTORY ROUTING ---
+# Define the master parent directory where all analyses will be stored
+PARENT_OUTPUT_FOLDER = r"C:\GitHub\EP_Intensity_Analysis\Outputs"
+
+# Extract the 6-digit YYMMDD date from the DATA_FOLDER name
+_data_dir_name = os.path.basename(os.path.normpath(DATA_FOLDER))
+_match = re.search(r'^(\d{6})', _data_dir_name)
+_yymmdd = _match.group(1) if _match else "000000"
+
+# Construct the specific output subfolder: Parent\YYMMDD_EXPERIMENT_BASE_NAME
+OUTPUT_IMAGE_FOLDER = os.path.join(PARENT_OUTPUT_FOLDER, f"{_yymmdd}_{EXPERIMENT_BASE_NAME}")
+
+# Route the circle definitions JSON into the new output subfolder
+CIRCLES_JSON_PATH = os.path.join(OUTPUT_IMAGE_FOLDER, f"{EXPERIMENT_BASE_NAME}_guv_circles.json")
 
 # Required if INPUT_FORMAT = 'ND2'
 ND2_FILE_NAME = f"{EXPERIMENT_BASE_NAME}.nd2"
@@ -42,9 +54,6 @@ DYE_CHANNEL_PREFIX    = "C3_"    # Dye / measurement channel
 
 # The new frame index pattern
 TIF_SUFFIX            = "-f*.tif"
-
-# Path where the interactively-drawn circle definitions are saved/loaded.
-CIRCLES_JSON_PATH = os.path.join(DATA_FOLDER, f"{EXPERIMENT_BASE_NAME}_guv_circles.json")
 
 # Variable frame rate schedule: (start_frame_index, end_frame_index, interval_seconds)
 # Set to `None` to attempt metadata extraction.
@@ -98,22 +107,11 @@ PULSE_DETECT_SMOOTH_SIGMA = 2.0
 # --- 4. OUTPUT & VISUALIZATION ---
 # -----------------------------------------------------------------------------
 
-# Set to a specific path (e.g., r"C:\MyCustomOutputs\Exp1") to define the output location.
-# Set to None to default to an "output_images" subfolder inside DATA_FOLDER.
-CUSTOM_OUTPUT_FOLDER = r"C:\GitHub\EP_Intensity_Analysis"  #None 
-
-if CUSTOM_OUTPUT_FOLDER:
-    OUTPUT_IMAGE_FOLDER = CUSTOM_OUTPUT_FOLDER
-else:
-    OUTPUT_IMAGE_FOLDER = os.path.join(DATA_FOLDER, "output_images")
-
-
-# Output sub-folders (created automatically at runtime)
+# Output sub-folders (created automatically at runtime inside the new directory)
 FOLDER_TRACKING = os.path.join(OUTPUT_IMAGE_FOLDER, "tracking")   # track PNGs/AVIs, metrics, CSVs
 FOLDER_MASKS    = os.path.join(OUTPUT_IMAGE_FOLDER, "masks")      # mask overlay AVI
 FOLDER_DYE      = os.path.join(OUTPUT_IMAGE_FOLDER, "dye")        # fit plots, frame exports, CSVs
 FOLDER_ACTIN    = os.path.join(OUTPUT_IMAGE_FOLDER, "actin")      # actin cortex plots, traces, profiles
-FOLDER_SCORES   = os.path.join(OUTPUT_IMAGE_FOLDER, "scores")     # per-GUV ring-score plots
 
 EXPORT_TIME_POINTS_S     = [0, 50, 100, 200, 300]
 EXPORT_DEBUG_PLOTS       = True

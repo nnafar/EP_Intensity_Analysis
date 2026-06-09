@@ -221,6 +221,29 @@ def load_input_data(circles: list[dict], logger: logging.Logger) -> dict | None:
                           if actin_files and getattr(cfg, 'ANALYZE_ACTIN_CHANNEL', False) else (None, None, None)
 
     logger.info(f"Frame interval: {frame_interval:.3f} s  ({len(time_array)} frames)")
+    
+    if len(time_array) > 1:
+        steps = np.zeros(len(time_array))
+        steps[1:] = np.round(np.diff(time_array), 3)
+        steps[0]  = steps[1]
+        
+        changes = np.where(steps[:-1] != steps[1:])[0] + 1
+        splits  = [0] + changes.tolist() + [len(time_array)]
+        
+        for i in range(len(splits) - 1):
+            start = splits[i]
+            end   = splits[i+1] - 1
+            count = end - start + 1
+            
+            interval = steps[start]
+            t_start  = np.round(time_array[start], 3)
+            t_end    = np.round(time_array[end], 3)
+            
+            logger.info(
+                f"Frames {start}–{end} ({count} frames): {interval} s intervals. "
+                f"The timestamps progress from {t_start} to {t_end}."
+            )
+    
 
     return {
         'dye_files':        dye_files,
@@ -321,7 +344,8 @@ def process_all_guvs(circles: list[dict],
                     a, b = el['axes']
                     major = max(a, b)
                     minor = min(a, b)
-                    eccentricity = np.sqrt(1.0 - (minor / major)**2)
+                    eccentricity = np.sqrt(1.0 - (minor / major)**2) if major > 0 else 0
+                    circularity = (2.0 * major * minor) / (major**2 + minor**2) if (major**2 + minor**2) > 0 else 0
                     
                     tracking_rows.append({
                         'guv_id': gid, 'frame': fi,
@@ -330,6 +354,7 @@ def process_all_guvs(circles: list[dict],
                         'semi_major': round(major, 2), 
                         'semi_minor': round(minor, 2),
                         'eccentricity': round(eccentricity, 4),
+                        'circularity': round(circularity, 4),
                         'ring_score': round(s, 2)
                     })
         else:
@@ -552,28 +577,36 @@ def generate_parameter_boxplots(df_fits: pd.DataFrame, logger: logging.Logger):
 # --- 6. EXPORT ---
 # -------------------------------------------------------------------
 
-def export_results(aligned: dict, dye_files: list, logger: logging.Logger):
+def export_results(aligned: dict, dye_mmap_info: tuple, time_array: np.ndarray, logger: logging.Logger):
     t    = aligned['t_aligned']
     avg  = aligned['average_curve']
     arr  = aligned['all_curves_aligned']
     ids  = aligned['valid_guv_ids']
     mjf  = aligned['median_jump_frame']
 
-    dye_al = dye_files[mjf:]
-
-    for i, tp in enumerate(cfg.EXPORT_TIME_POINTS_S):
-        fi, _ = utils.find_closest_frame(t, tp)
-        if fi >= len(dye_al): continue
-        img_raw = cv2.imread(dye_al[fi], cv2.IMREAD_ANYDEPTH | cv2.IMREAD_GRAYSCALE)
-        if img_raw is None: continue
+    # Extract 5 dynamic snapshots directly from the memmap
+    if dye_mmap_info[0] is not None:
+        dye_path, dye_shape, dye_dtype = dye_mmap_info
+        dye_stack = np.memmap(dye_path, dtype=dye_dtype, mode='r', shape=dye_shape)
         
-        img_bright = utils._convert_to_8bit_gray(img_raw)
-        
-        styled = utils.style_image(img_bright, f"{int(round(tp))} S",
-                                   cfg.MICRONS_PER_PIXEL, cfg.SCALE_BAR_LENGTH_MICRONS)
-        cv2.imwrite(os.path.join(cfg.FOLDER_DYE,
-                    f"frame_{i+1}_at_{int(round(tp))}s.png"), styled)
+        total_frames = dye_shape[0]
+        if mjf < total_frames:
+            # Generate 5 evenly spaced indices from the pulse frame to the end
+            export_indices = np.linspace(mjf, total_frames - 1, 5).astype(int)
+            
+            for i, fi in enumerate(export_indices):
+                img_raw = dye_stack[fi]
+                rel_time = time_array[fi] - time_array[mjf]
+                
+                img_bright = utils._convert_to_8bit_gray(img_raw)
+                styled = utils.style_image(img_bright, f"{int(round(rel_time))} S",
+                                           cfg.MICRONS_PER_PIXEL, cfg.SCALE_BAR_LENGTH_MICRONS)
+                
+                cv2.imwrite(os.path.join(cfg.FOLDER_DYE,
+                            f"snapshot_{i+1}_frame{fi}_at_{int(round(rel_time))}s.png"), styled)
+        del dye_stack
 
+    # Export CSV data
     try:
         hdrs  = ['Time (s)'] + [f'GUV_{g}_I_uptake' for g in ids] + ['Average_I_uptake']
         data  = np.hstack([t.reshape(-1,1), arr.T, avg.reshape(-1,1)])
@@ -584,8 +617,7 @@ def export_results(aligned: dict, dye_files: list, logger: logging.Logger):
     except Exception as e:
         logger.warning(f"Could not save normalised CSV: {e}")
 
-    logger.info("Export complete.")
-    
+    logger.info("Export complete.")    
 
 # -------------------------------------------------------------------
 # --- 7. VALIDATION ---
@@ -622,9 +654,9 @@ def main():
         cfg.FOLDER_MASKS,
         cfg.FOLDER_DYE,
         cfg.FOLDER_ACTIN,
-        cfg.FOLDER_SCORES,
     ):
         os.makedirs(_folder, exist_ok=True)
+    
     logger = utils.setup_logging(cfg.OUTPUT_IMAGE_FOLDER, cfg.EXPERIMENT_BASE_NAME)
     logger.info("=== GUV Analysis Pipeline ===")
 
@@ -713,31 +745,36 @@ def main():
 
         t_pulse = data['time_array'][PULSE_FRAME]
 
-        # Re-draw all per-GUV score plots now that the confirmed pulse frame is known.
-        if getattr(cfg, 'EXPORT_TRACK_VISUALIZATION', True):
-            utils.redraw_score_plots(
-                guv_results, data['circles'], data['roi_mmap_info'],
-                PULSE_FRAME,
-                cfg.FOLDER_TRACKING, cfg.FOLDER_SCORES, cfg.EXPERIMENT_BASE_NAME,
-            )
-            logger.info(f"Redrawn score plots with confirmed pulse frame = {PULSE_FRAME}")
-
-        # Generate the Size, Deformation, and MSD plots
+        # Generate the Size and Circularity plots and update tracking CSV
         df_track = guv_results.get('tracking_dataframe')
         
         if df_track is not None:
+            # 1. Normalize Tracking Data based on detected PULSE_FRAME
+            df_track = utils.normalize_tracking_data(df_track, PULSE_FRAME)
+            
+            # 2. Re-save updated main tracking CSV
+            df_track.to_csv(
+                os.path.join(cfg.FOLDER_TRACKING, f"{cfg.EXPERIMENT_BASE_NAME}_tracking_data.csv"),
+                index=False
+            )
+            
+            # 3. Export Summary CSV
+            utils.export_tracking_summary_csv(
+                df_track, data['time_array'], cfg.FOLDER_TRACKING, cfg.EXPERIMENT_BASE_NAME
+            )
+            
+            # 4. Generate 1x2 shape plots for each GUV
             try:
-                utils.plot_tracking_metrics(
+                utils.plot_guv_shape_metrics(
                     df_track, 
                     data['time_array'], 
                     cfg.FOLDER_TRACKING, 
                     cfg.EXPERIMENT_BASE_NAME, 
-                    getattr(cfg, 'MICRONS_PER_PIXEL', 1.0),
-                    pulse_time=t_pulse
+                    t_pulse
                 )
-                logger.info("Saved size, deformation, and MSD tracking plots.")
+                logger.info("Saved normalized size and circularity plots + summary CSV.")
             except Exception as e:
-                logger.warning(f"Failed to generate tracking metrics plots: {e}")
+                logger.warning(f"Failed to generate shape metrics plots: {e}")
         
         if getattr(cfg, 'TRACKING_ONLY_MODE', False):
             logger.info("=== TRACKING_ONLY_MODE Active: Halting before intensity analysis ===")
@@ -764,7 +801,7 @@ def main():
         generate_parameter_boxplots(df_fits, logger)
         
         # Step 6 – export
-        export_results(aligned, data['dye_files'], logger)
+        export_results(aligned, data['dye_mmap_info'], data['time_array'], logger)
 
         # Step 7 – Actin cortex analysis (C2 channel)
         actin_data_list = [ad for ad in guv_results.get('all_actin_data', [])
@@ -824,11 +861,30 @@ def main():
                 ap, ashape, adtype = data['actin_mmap_info']
                 actin_stack_main = np.memmap(ap, dtype=adtype, mode='r', shape=ashape)
                 
+                # Single Radial profile  (pre-pulse frame, per GUV)
                 utils.plot_actin_spatial_snapshot(
                     actin_stack_main, snapshots,
                     cfg.FOLDER_ACTIN, cfg.EXPERIMENT_BASE_NAME,
                     microns_per_pixel=getattr(cfg, 'MICRONS_PER_PIXEL', 1.0),
                 )
+
+                # Radial profile evolution (all frames, per GUV)
+                evolution_input = []
+                for i, gid in enumerate(valid_ids):
+                    raw_idx = guv_results['valid_guv_indices'][i]
+                    raw = guv_results['raw_results'][raw_idx][0]
+                    if raw is None:
+                        continue
+                    el_list = raw.get('tracking', {}).get('ellipses', [])
+                    evolution_input.append((gid, el_list))
+
+                if evolution_input:
+                    evo_path = utils.plot_actin_radial_evolution(
+                        actin_stack_main, evolution_input,
+                        cfg.FOLDER_ACTIN, cfg.EXPERIMENT_BASE_NAME,
+                    )
+                    logger.info(f"Saved actin radial evolution plot → {evo_path}")
+
                 del actin_stack_main
                 logger.info("Saved actin radial profile snapshots.")
         elif getattr(cfg, 'ANALYZE_ACTIN_CHANNEL', False):

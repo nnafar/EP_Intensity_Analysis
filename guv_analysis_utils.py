@@ -28,7 +28,6 @@ import matplotlib.pyplot as plt
 
 import config as cfg
 
-
 # -------------------------------------------------------------------
 # --- 0. LOGGING ---
 # -------------------------------------------------------------------
@@ -376,32 +375,8 @@ def _compute_peak_fwhm(
         min_prominence_fraction: float = 0.10,
 ) -> Optional[Tuple[int, float, int, int]]:
     """
-    Locate the membrane peak near *expected_r* in *profile* and return its
-    FWHM plus the left/right half-max crossing indices.
-
-    Two validity guards are applied before returning a result:
-
-    1. **Peak must exceed the lumen interior.**
-       A genuine actin cortex rises above the interior signal level.  A flat
-       profile that simply drops at the membrane (no cortex, e.g. GUV 4) has
-       its highest point in the lumen, not at the membrane, and is rejected.
-
-    2. **Minimum amplitude.**
-       The peak-to-baseline contrast must exceed
-       ``min_prominence_fraction × profile_range``.  This suppresses noise
-       bumps on otherwise flat profiles.
-
-    Parameters
-    ----------
-    profile                  : 1-D radial intensity array (median over angles)
-    expected_r               : expected membrane radius in pixels
-    search_factor            : fractional search window half-width (e.g. 0.35)
-    min_prominence_fraction  : minimum (peak − baseline) / profile_range to
-                               accept as a real peak (default 0.10 = 10 %)
-
-    Returns
-    -------
-    (peak_idx, fwhm_px, left_idx, right_idx)  or  None if no clear peak found.
+    Locate the membrane peak and return its FWHM using independent left/right 
+    baselines to handle asymmetric lumen/extracellular backgrounds.
     """
     n  = len(profile)
     lo = max(2, int(expected_r * (1.0 - search_factor)))
@@ -414,42 +389,44 @@ def _compute_peak_fwhm(
     peak_idx   = peak_local + lo
     peak_val   = float(profile[peak_idx])
 
-    # --- Guard 1: peak must be brighter than the lumen interior ------------
-    # Use the mean of the inner 70 % of expected_r as the lumen reference.
+    # Ensure peak is brighter than lumen interior reference
     inner_end  = max(1, int(expected_r * 0.70))
     lumen_mean = float(np.mean(profile[:inner_end]))
     if peak_val <= lumen_mean:
         return None
 
-    # Baseline: mean of flanking bands outside the search window
-    band       = max(5, (hi - lo) // 2)
-    left_band  = profile[max(0, lo - band):lo]
-    right_band = profile[hi:min(n, hi + band)]
-    flanks     = np.concatenate([left_band, right_band])
-    baseline   = float(flanks.mean()) if len(flanks) > 0 else float(profile.min())
+    # Define left and right search zones for independent baselines
+    band        = max(5, (hi - lo) // 2)
+    left_zone   = profile[max(0, lo - band):peak_idx]
+    right_zone  = profile[peak_idx:min(n, hi + band)]
+    
+    # Use local minima as independent baselines for each side of the peak
+    left_base   = float(left_zone.min()) if len(left_zone) > 0 else lumen_mean
+    right_base  = float(right_zone.min()) if len(right_zone) > 0 else float(profile.min())
 
-    amplitude  = peak_val - baseline
-    if amplitude <= 0:
-        return None
-
-    # --- Guard 2: minimum relative prominence ------------------------------
-    profile_range = float(profile.max() - profile.min())
+    # Prominence validation check against the maximum background level
+    conservative_base = max(left_base, right_base)
+    amplitude         = peak_val - conservative_base
+    profile_range     = float(profile.max() - profile.min())
+    
     if profile_range > 0 and (amplitude / profile_range) < min_prominence_fraction:
         return None
 
-    half_max = baseline + amplitude * 0.5
+    # Calculate distinct half-maximum thresholds for each side
+    left_half_max  = left_base + (peak_val - left_base) * 0.5
+    right_half_max = right_base + (peak_val - right_base) * 0.5
 
-    # Walk left from peak to find last index still above half_max
-    left_idx = lo  # safe fallback
+    # Find left crossing point
+    left_idx = lo
     for j in range(peak_idx - 1, max(0, lo - band) - 1, -1):
-        if profile[j] <= half_max:
+        if profile[j] <= left_half_max:
             left_idx = j + 1
             break
 
-    # Walk right from peak to find last index still above half_max
-    right_idx = hi  # safe fallback
+    # Find right crossing point
+    right_idx = hi
     for j in range(peak_idx + 1, min(n, hi + band)):
-        if profile[j] <= half_max:
+        if profile[j] <= right_half_max:
             right_idx = j - 1
             break
 
@@ -865,13 +842,10 @@ def process_single_guv(guv_id: str,
     }
 
     if getattr(cfg, 'EXPORT_TRACK_VISUALIZATION', True):
-        # Workers run before the pulse frame is auto-detected, so we pass
-        # pulse_frame=None here.  main() will redraw these plots with the
-        # confirmed PULSE_FRAME once detection is complete.
         export_track_visualization(
-            cfg.FOLDER_TRACKING, cfg.FOLDER_SCORES, cfg.EXPERIMENT_BASE_NAME, guv_id,
+            cfg.FOLDER_TRACKING, cfg.EXPERIMENT_BASE_NAME, guv_id,
             roi_stack, tracking['centers'], tracking['ellipses'],
-            tracking['ring_scores'], ruptured_at, pulse_frame=None
+            ruptured_at
         )
 
     # --- 4. LIGHTWEIGHT RETURN (Discard heavy masks to prevent MemoryError) ---
@@ -906,14 +880,9 @@ def create_mask_visualization(base_image, inner_mask, membrane_mask,
     return cv2.addWeighted(viz, alpha, ov, 1.0 - alpha, 0)
 
 
-def export_track_visualization(track_folder, score_folder, experiment_name, guv_id,
-                                roi_stack, centers, ellipses, ring_scores,
-                                ruptured_at, pulse_frame=None):
-    """
-    Saves a diagnostic PNG showing the GUV trajectory and ring scores.
-    Left panel: last valid ROI frame with centre path overlaid.
-    Right panel: ring score time series with rupture threshold.
-    """
+def export_track_visualization(track_folder, experiment_name, guv_id,
+                                roi_stack, centers, ellipses, ruptured_at):
+    """Saves a diagnostic PNG showing the GUV trajectory."""
     valid_pairs = [(i, c) for i, c in enumerate(centers) if c is not None]
     if not valid_pairs:
         return
@@ -923,7 +892,6 @@ def export_track_visualization(track_folder, score_folder, experiment_name, guv_
     if frame is None:
         return
 
-    # ── Left: trajectory on ROI frame ─────────────────────────────────────
     img8   = _convert_to_8bit_gray(frame)
     canvas = cv2.cvtColor(img8, cv2.COLOR_GRAY2BGR)
 
@@ -931,7 +899,6 @@ def export_track_visualization(track_folder, score_folder, experiment_name, guv_
     if len(pts) > 1:
         cv2.polylines(canvas, [pts], False, (0, 230, 0), 1, cv2.LINE_AA)
 
-    # Start (green) and end (yellow=survived, red=ruptured)
     _, c0 = valid_pairs[0]
     el0 = ellipses[valid_pairs[0][0]]
     if el0:
@@ -950,37 +917,100 @@ def export_track_visualization(track_folder, score_folder, experiment_name, guv_
     label = f"GUV {guv_id}  {'RUPTURED @F'+str(ruptured_at) if ruptured_at is not None else 'SURVIVED'}"
     cv2.putText(canvas, label, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, ec, 1, cv2.LINE_AA)
 
-    # ── Right: ring score plot ─────────────────────────────────────────────
-    fig, ax = plt.subplots(figsize=(5, 3))
-    ax.plot(ring_scores, 'b-', lw=1, alpha=0.8, label='Ring score')
-   
-    # Add Pulse Line
-    if pulse_frame is not None:
-        ax.axvline(pulse_frame, color='gray', ls='--', lw=1.5, label='Pulse', zorder=0)
-   
-    ax.axhline(getattr(cfg, 'RUPTURE_SCORE_THRESHOLD', 4.0), color='orange', ls='--', lw=1, label='Rupture threshold')
+    cv2.imwrite(os.path.join(track_folder, f"{experiment_name}_track_GUV_{guv_id}.png"), canvas)
+
+
+def normalize_tracking_data(df: pd.DataFrame, pulse_frame: int) -> pd.DataFrame:
+    """Calculates normalized radius and circularity relative to pre-pulse averages."""
+    df['norm_radius'] = np.nan
+    df['norm_circularity'] = np.nan
     
-    if ruptured_at is not None:
-        ax.axvline(ruptured_at, color='red', ls=':', lw=1, label=f'Rupture F{ruptured_at}')
-    ax.set_xlabel("Frame"); ax.set_ylabel("Ring quality score")
-    ax.set_title(f"GUV {guv_id}")
-    ax.legend(fontsize=7); fig.tight_layout()
+    for gid in df['guv_id'].unique():
+        mask = df['guv_id'] == gid
+        guv_df = df[mask]
+        
+        pre_mask = guv_df['frame'] < pulse_frame
+        if not pre_mask.any():
+            pre_mask = guv_df['frame'] == guv_df['frame'].min()
+            
+        mean_r = guv_df.loc[pre_mask, 'radius'].mean()
+        mean_c = guv_df.loc[pre_mask, 'circularity'].mean()
+        
+        if mean_r > 0:
+            df.loc[mask, 'norm_radius'] = df.loc[mask, 'radius'] / mean_r
+        if mean_c > 0:
+            df.loc[mask, 'norm_circularity'] = df.loc[mask, 'circularity'] / mean_c
+            
+    return df
 
-    score_path = os.path.join(score_folder, f"_score_plot_GUV_{guv_id}.png")
-    fig.savefig(score_path, dpi=120); plt.close(fig)
 
-    # Combine side-by-side (resize score plot to match canvas height)
-    score_img = cv2.imread(score_path)
-    if score_img is not None:
-        th = canvas.shape[0]
-        tw = int(score_img.shape[1] * th / score_img.shape[0])
-        score_img = cv2.resize(score_img, (tw, th))
-        combined  = np.hstack([canvas, score_img])
-        cv2.imwrite(os.path.join(track_folder, f"{experiment_name}_track_GUV_{guv_id}.png"), combined)
-        # Score plot is kept in score_folder — not deleted
-    else:
-        cv2.imwrite(os.path.join(track_folder, f"{experiment_name}_track_GUV_{guv_id}.png"), canvas)
+def export_tracking_summary_csv(df: pd.DataFrame, time_array: np.ndarray, output_folder: str, experiment_name: str):
+    """Exports a pivoted CSV summarizing normalized tracking metrics for all GUVs."""
+    frames = sorted(df['frame'].unique())
+    t_vals = [time_array[f] if f < len(time_array) else np.nan for f in frames]
+    
+    summary_df = pd.DataFrame({'frame': frames, 'time_s': t_vals})
+    
+    for gid in df['guv_id'].unique():
+        guv_df = df[df['guv_id'] == gid].set_index('frame')
+        summary_df[f'GUV_{gid}_norm_radius'] = summary_df['frame'].map(guv_df['norm_radius'])
+        summary_df[f'GUV_{gid}_norm_circularity'] = summary_df['frame'].map(guv_df['norm_circularity'])
+        
+    csv_path = os.path.join(output_folder, f"{experiment_name}_tracking_summary.csv")
+    summary_df.to_csv(csv_path, index=False, float_format='%.6f', na_rep='NaN')
+    return csv_path
 
+
+def plot_guv_shape_metrics(df: pd.DataFrame, time_array: np.ndarray, 
+                           output_folder: str, experiment_name: str, pulse_time: float):
+    """Generates a 1x2 panel plot for each GUV showing normalized circularity and size starting from 0."""
+    guv_ids = df['guv_id'].unique()
+    
+    for gid in guv_ids:
+        guv_data = df[df['guv_id'] == gid].sort_values('frame')
+        frames = guv_data['frame'].values
+        
+        valid_t_idx = [f for f in frames if f < len(time_array)]
+        if not valid_t_idx:
+            continue
+        
+        t_vals = time_array[valid_t_idx]
+        norm_c = guv_data['norm_circularity'].values[:len(valid_t_idx)]
+        norm_r = guv_data['norm_radius'].values[:len(valid_t_idx)]
+        
+        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+        
+        # Panel 1: Circularity
+        axes[0].plot(t_vals, norm_c, 'b-', lw=1.5, label='Norm. Circularity')
+        axes[0].axhline(1.0, color='gray', ls=':', lw=1)
+        axes[0].set_title(f'GUV {gid} Circularity Change')
+        axes[0].set_xlabel('Time (s)')
+        axes[0].set_ylabel('Normalized Circularity')
+        
+        # Dynamic upper bound calculation to avoid cutting off data if a GUV expands
+        max_c = np.nanmax(norm_c) if len(norm_c) > 0 else 1.0
+        axes[0].set_ylim(0, max(1.1, max_c * 1.05))
+        
+        # Panel 2: Size
+        axes[1].plot(t_vals, norm_r, 'r-', lw=1.5, label='Norm. Size (Radius)')
+        axes[1].axhline(1.0, color='gray', ls=':', lw=1)
+        axes[1].set_title(f'GUV {gid} Size Change')
+        axes[1].set_xlabel('Time (s)')
+        axes[1].set_ylabel('Normalized Radius')
+        
+        max_r = np.nanmax(norm_r) if len(norm_r) > 0 else 1.0
+        axes[1].set_ylim(0, max(1.1, max_r * 1.05))
+        
+        # Shared formatting
+        for ax in axes:
+            ax.axvline(pulse_time, color='k', ls='--', alpha=0.5, label='Pulse')
+            ax.grid(True, alpha=0.3)
+            ax.legend(fontsize=8)
+            
+        plt.tight_layout()
+        out_path = os.path.join(output_folder, f"{experiment_name}_shape_GUV_{gid}.png")
+        fig.savefig(out_path, dpi=300)
+        plt.close(fig)
 
 def style_image(frame, time_label, microns_per_pixel, scale_bar_microns):
     img8  = _convert_to_8bit_gray(frame)
@@ -1626,6 +1656,76 @@ def plot_actin_spatial_snapshot(
     plt.close(fig)
     return out_path
 
+def plot_actin_radial_evolution(
+        actin_stack: np.ndarray,
+        ellipses_per_guv: list,
+        output_folder: str,
+        experiment_name: str,
+):
+    """
+    Generates a multigrid plot showing radial intensity profile evolution 
+    over time for each GUV, using a colormap from light gray to black.
+    """
+    n = len(ellipses_per_guv)
+    if n == 0 or actin_stack is None:
+        return
+
+    ncols = min(4, n)
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 3.5 * nrows),
+                             squeeze=False)
+
+    for k, (gid, el_list) in enumerate(ellipses_per_guv):
+        ax = axes[k // ncols][k % ncols]
+        
+        # Filter to valid frames for this GUV
+        valid_frames = [(i, el) for i, el in enumerate(el_list) if el is not None]
+        
+        # Normalize color map: light gray (start) to black (end)
+        colors = plt.cm.Greys(np.linspace(0.2, 1.0, len(valid_frames)))
+
+        for idx, (fi, el) in enumerate(valid_frames):
+            frame = actin_stack[fi]
+            if frame is None: continue
+            
+            # Use fixed radial extraction parameters based on final frame
+            cx, cy = el['center']
+            avg_r = int(sum(el['axes']) / 2.0)
+            r_max = int(avg_r * 1.6)
+
+            h_f, w_f = frame.shape[:2]
+            # Skip this frame if the crop would fall outside the image boundary
+            if (cx - r_max < 0 or cx + r_max >= w_f or
+                    cy - r_max < 0 or cy + r_max >= h_f):
+                continue
+
+            x_min = max(0, int(cx - r_max - 2))
+            x_max = min(w_f, int(cx + r_max + 2))
+            y_min = max(0, int(cy - r_max - 2))
+            y_max = min(h_f, int(cy + r_max + 2))
+            local = frame[y_min:y_max, x_min:x_max]
+            profile = radial_profile_local(
+                local, (cx - x_min, cy - y_min), r_max
+            )
+            profile_sm = gaussian_filter1d(profile, sigma=1.5)
+
+            ax.plot(profile_sm, color=colors[idx], lw=1.0, alpha=0.7)
+
+        ax.set_title(f'GUV {gid} Profile Evolution')
+        ax.set_xlabel('Radius (px)')
+        ax.set_ylabel('Intensity (AU)')
+        ax.grid(True, alpha=0.2)
+
+    # Hide empty panels
+    for k in range(n, nrows * ncols):
+        axes[k // ncols][k % ncols].set_visible(False)
+
+    plt.tight_layout()
+    out_path = os.path.join(output_folder, f'{experiment_name}_actin_evolution.png')
+    fig.savefig(out_path, dpi=300)
+    plt.close(fig)
+    return out_path
+
 
 def plot_dye_actin_overlay(
         aligned_dye: dict,
@@ -1754,113 +1854,6 @@ def plot_dye_actin_overlay(
     fig.savefig(out_path, dpi=300)
     plt.close(fig)
     return out_path
-
-
-def redraw_score_plots(
-        guv_results: dict,
-        circles: list,
-        roi_mmap_info: tuple,
-        pulse_frame: int,
-        track_folder: str,
-        score_folder: str,
-        experiment_name: str,
-):
-    """
-    Re-exports every per-GUV tracking PNG with the confirmed pulse-frame
-    marker.  Called from main() after PULSE_FRAME is finalised so all score
-    plots are consistent, regardless of what the filename tag said.
-    """
-    roi_path, roi_shape, roi_dtype = roi_mmap_info
-    roi_stack = np.memmap(roi_path, dtype=roi_dtype, mode='r', shape=roi_shape)
-
-    for i, (result, qe) in enumerate(guv_results['raw_results']):
-        if result is None:
-            continue
-        guv_id    = qe['guv_id']
-        tr        = result['tracking']
-        rup       = qe.get('ruptured_at_frame')
-        export_track_visualization(
-            track_folder, score_folder, experiment_name, guv_id,
-            roi_stack,
-            tr['centers'], tr['ellipses'], tr['ring_scores'],
-            rup,
-            pulse_frame=pulse_frame,   # ← confirmed value
-        )
-
-    del roi_stack
-
-
-def plot_tracking_metrics(df: pd.DataFrame, time_array: np.ndarray, 
-                          output_folder: str, experiment_name: str, 
-                          um_per_px: float = 1.0, pulse_time=None):
-    """
-    Generates a 3-panel figure plotting Size (Radius), Deformation (Eccentricity),
-    and Mean Square Displacement (MSD) for each tracked GUV.
-    """
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-    guv_ids = df['guv_id'].unique()
-    
-    for gid in guv_ids:
-        guv_data = df[df['guv_id'] == gid].sort_values('frame')
-        frames = guv_data['frame'].values
-        
-        valid_t_idx = [f for f in frames if f < len(time_array)]
-        if not valid_t_idx:
-            continue
-        
-        t_vals = time_array[valid_t_idx]
-        
-        # 1. Size Plot
-        r_um = guv_data['radius'].values[:len(valid_t_idx)] * um_per_px
-        axes[0].plot(t_vals, r_um, label=f'GUV {gid}', alpha=0.8)
-        
-        # 2. Deformation Plot
-        if 'eccentricity' in guv_data.columns:
-            ecc = guv_data['eccentricity'].values[:len(valid_t_idx)]
-            axes[1].plot(t_vals, ecc, label=f'GUV {gid}', alpha=0.8)
-        
-        # 3. MSD Plot
-        x = guv_data['x'].values * um_per_px
-        y = guv_data['y'].values * um_per_px
-        
-        max_lag = len(x) // 4
-        if max_lag > 1:
-            msd = []
-            for lag in range(1, max_lag + 1):
-                dx = x[lag:] - x[:-lag]
-                dy = y[lag:] - y[:-lag]
-                msd.append(np.nanmean(dx**2 + dy**2))
-            
-            axes[2].plot(range(1, max_lag + 1), msd, label=f'GUV {gid}', alpha=0.8)
-
-    axes[0].set_title('GUV Size over Time')
-    axes[0].set_xlabel('Time (s)')
-    axes[0].set_ylabel(r'Radius ($\mu$m)')
-    
-    axes[1].set_title('Deformation (Eccentricity)')
-    axes[1].set_xlabel('Time (s)')
-    axes[1].set_ylabel('Eccentricity (0=Circle)')
-    axes[1].set_ylim(-0.05, 1.05)
-    
-    axes[2].set_title('Mean Square Displacement')
-    axes[2].set_xlabel('Frame Lag (frames)')
-    axes[2].set_ylabel(r'MSD ($\mu$m$^2$)')
-    
-    # Add Pulse lines to Size and Deformation plots
-    if pulse_time is not None:
-        for i in [0, 1]:
-            axes[i].axvline(pulse_time, color='k', ls='--', alpha=0.5, label='Pulse')
-            axes[i].legend(fontsize=8)
-    
-    for ax in axes:
-        ax.grid(True, alpha=0.3)
-        ax.legend(fontsize=8)
-        
-    plt.tight_layout()
-    out_path = os.path.join(output_folder, f"{experiment_name}_tracking_metrics.png")
-    fig.savefig(out_path, dpi=300)
-    plt.close(fig)
-
 
 # -------------------------------------------------------------------
 # --- 11. DYE CHANNEL SUMMARY PLOTS ---
