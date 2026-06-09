@@ -21,7 +21,7 @@ import os
 INPUT_FORMAT = 'ND2' 
 
 # Set this to the specific folder for the current run
-DATA_FOLDER           = r"M:\tnw\bn\gk\NN\2_Data-Analysis\BulkElectroporation\260331_DOPC_BranchedCortex_Experiment1-400V-500us-frame7"
+DATA_FOLDER  = r"D:\EP\260331_Trial4_InvE_BranchedCortex_SRB_Inside"
 
 # The shared base name across all channels for the image files
 EXPERIMENT_BASE_NAME  = "DOPC_BranchedCortex_Experiment1-400V-500us-frame7"
@@ -31,10 +31,9 @@ ND2_FILE_NAME = f"{EXPERIMENT_BASE_NAME}.nd2"
 
 # ND2 dimensions (typically T, C, Y, X)
 # 488=Membrane, 561=Dye, 640=Actin
-ND2_CHANNEL_IDX_MEMBRANE = 0
+ND2_CHANNEL_IDX_ACTIN    = 0
 ND2_CHANNEL_IDX_DYE      = 1
-ND2_CHANNEL_IDX_ACTIN    = 2
-
+ND2_CHANNEL_IDX_MEMBRANE = 2
 
 # TIFF Prefixes (typically T, C, Y, X)
 ROI_CHANNEL_PREFIX    = "C1_"    # Guide / membrane channel (used for tracking)
@@ -99,7 +98,15 @@ PULSE_DETECT_SMOOTH_SIGMA = 2.0
 # --- 4. OUTPUT & VISUALIZATION ---
 # -----------------------------------------------------------------------------
 
-OUTPUT_IMAGE_FOLDER      = os.path.join(DATA_FOLDER, "output_images")
+# Set to a specific path (e.g., r"C:\MyCustomOutputs\Exp1") to define the output location.
+# Set to None to default to an "output_images" subfolder inside DATA_FOLDER.
+CUSTOM_OUTPUT_FOLDER = r"C:\GitHub\EP_Intensity_Analysis"  #None 
+
+if CUSTOM_OUTPUT_FOLDER:
+    OUTPUT_IMAGE_FOLDER = CUSTOM_OUTPUT_FOLDER
+else:
+    OUTPUT_IMAGE_FOLDER = os.path.join(DATA_FOLDER, "output_images")
+
 
 # Output sub-folders (created automatically at runtime)
 FOLDER_TRACKING = os.path.join(OUTPUT_IMAGE_FOLDER, "tracking")   # track PNGs/AVIs, metrics, CSVs

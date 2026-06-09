@@ -221,29 +221,40 @@ def load_circles(path: str) -> list[dict]:
 def _main():
     # Lazy import so this script can be imported without config present
     import config as cfg
-    from natsort import natsorted
-
-    roi_pattern = os.path.join(
-        cfg.DATA_FOLDER,
-        cfg.ROI_CHANNEL_PREFIX + cfg.EXPERIMENT_BASE_NAME + cfg.TIF_SUFFIX
-    )
-    roi_files = natsorted(glob.glob(roi_pattern))
-    if not roi_files:
-        sys.exit(f"ERROR: No ROI files found matching: {roi_pattern}")
-
-    frame = cv2.imread(roi_files[0], cv2.IMREAD_ANYDEPTH | cv2.IMREAD_GRAYSCALE)
-    if frame is None:
-        sys.exit(f"ERROR: Could not load first ROI frame: {roi_files[0]}")
+    import sys
 
     save_path = cfg.CIRCLES_JSON_PATH
-    print(f"Opening selector on: {roi_files[0]}")
+    input_format = getattr(cfg, 'INPUT_FORMAT', 'TIFF').upper()
+    
+    if input_format == 'ND2':
+        import nd2
+        nd2_path = os.path.join(cfg.DATA_FOLDER, getattr(cfg, 'ND2_FILE_NAME', f"{cfg.EXPERIMENT_BASE_NAME}.nd2"))
+        if not os.path.exists(nd2_path):
+            sys.exit(f"ERROR: ND2 file not found: {nd2_path}")
+        with nd2.ND2File(nd2_path) as f:
+            idx_mem = getattr(cfg, 'ND2_CHANNEL_IDX_MEMBRANE', 0)
+            data = f.asarray()
+            frame = data[0, idx_mem, :, :] if data.ndim == 4 else data[0, :, :]
+        print(f"Opening selector on ND2: {nd2_path}")
+    else:
+        from natsort import natsorted
+        import glob
+        roi_pattern = os.path.join(cfg.DATA_FOLDER, cfg.ROI_CHANNEL_PREFIX + cfg.EXPERIMENT_BASE_NAME + cfg.TIF_SUFFIX)
+        roi_files = natsorted(glob.glob(roi_pattern))
+        if not roi_files:
+            sys.exit(f"ERROR: No ROI files found matching: {roi_pattern}")
+        frame = cv2.imread(roi_files[0], cv2.IMREAD_ANYDEPTH | cv2.IMREAD_GRAYSCALE)
+        print(f"Opening selector on: {roi_files[0]}")
+
+    if frame is None:
+        sys.exit("ERROR: Could not load first ROI frame.")
+
     print(f"Will save to: {save_path}")
 
     circles = run_selector(frame, save_path)
     print(f"\nSelected {len(circles)} GUV(s):")
     for c in circles:
         print(f"  GUV {c['id']:2d}  centre=({c['x']}, {c['y']})  r={c['r']} px")
-
 
 if __name__ == "__main__":
     _main()

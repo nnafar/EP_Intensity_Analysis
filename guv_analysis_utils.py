@@ -54,13 +54,8 @@ def setup_logging(output_folder: str, experiment_name: str,
 # --- 1. TIMESTAMP EXTRACTION ---
 # -------------------------------------------------------------------
 
-def extract_timestamps_from_metadata(
-        file_paths: List[str]) -> Tuple[Optional[np.ndarray], Optional[float]]:
-    
-    if not file_paths:
-        return None, None
-        
-    num_frames = len(file_paths)
+def _apply_fallback_schedule(num_frames: int) -> Tuple[np.ndarray, float]:
+    """Fallback routine: applies config schedule, or defaults to constant FPS."""
     schedule = getattr(cfg, 'FRAME_INTERVAL_SCHEDULE', None)
     
     if schedule is not None and len(schedule) > 0:
@@ -75,66 +70,80 @@ def extract_timestamps_from_metadata(
         t_array = np.cumsum(dt_array)
         return t_array, float(np.median(dt_array[1:]))
 
+    return create_manual_timestamps(num_frames, getattr(cfg, 'FALLBACK_FPS', 1.0))
+
+
+def extract_timestamps_from_metadata(file_paths: List[str]) -> Tuple[Optional[np.ndarray], Optional[float]]:
+    if not file_paths:
+        return None, None
+        
+    num_frames = len(file_paths)
+    
+    # Attempt 1: Embedded TIFF metadata
     try:
         with tifffile.TiffFile(file_paths[0]) as tif:
             tag = tif.pages[0].tags.get('ImageDescription')
-            if tag is None:
-                return None, None
-            match = re.search(r'finterval=([0-9.]+)', tag.value)
-            if match:
-                dt = float(match.group(1))
-                return np.arange(num_frames) * dt, dt
+            if tag is not None:
+                match = re.search(r'finterval=([0-9.]+)', tag.value)
+                if match:
+                    dt = float(match.group(1))
+                    return np.arange(num_frames) * dt, dt
     except Exception:
         pass
     
-    return None, None
+    # Attempt 2 & 3: Custom Schedule -> Constant FPS
+    return _apply_fallback_schedule(num_frames)
+
 
 def extract_timestamps_nd2(nd2_file) -> Tuple[np.ndarray, float]:
-    """Extracts absolute timestamps in seconds from ND2 frame metadata."""
+    num_frames = nd2_file.sizes.get('T', 1)
+    
+    # Attempt 1: Embedded ND2 hardware metadata
     try:
         times = [
             frame.channels[0].time.relativeTimeMs / 1000.0 
             for frame in nd2_file.frame_metadata()
         ]
-        t_array = np.array(times)
-        dt = float(np.median(np.diff(t_array)))
-        return t_array, dt
+        if len(times) > 0:
+            t_array = np.array(times)
+            dt = float(np.median(np.diff(t_array)))
+            return t_array, dt
     except Exception:
-        # Fallback to manual intervals if metadata extraction fails
-        return create_manual_timestamps(
-            nd2_file.sizes.get('T', 1), 
-            getattr(cfg, 'FALLBACK_FPS', 1.0)
-        )
+        pass
+        
+    # Attempt 2 & 3: Custom Schedule -> Constant FPS
+    return _apply_fallback_schedule(num_frames)
 
 def create_memmap_from_nd2_channel(nd2_file, ch_idx: int, mmap_path: str, desc: str) -> tuple:
-    """Reads a specific channel from an ND2 file into a contiguous binary memmap."""
+    """Reads a specific channel from an ND2 file into a contiguous binary memmap using out-of-core streaming."""
     if os.path.exists(mmap_path):
         os.remove(mmap_path)
 
-    data = nd2_file.asarray()
+    # Load file lazily to prevent RAM saturation
+    lazy_data = nd2_file.to_dask()
     
     # Handle standard (Time, Channel, Y, X) shape
-    if data.ndim == 4:
-        ch_data = data[:, ch_idx, :, :]
-    elif data.ndim == 3:
-        ch_data = data  # Single channel scenario
+    if lazy_data.ndim == 4:
+        ch_data = lazy_data[:, ch_idx, :, :]
+    elif lazy_data.ndim == 3:
+        ch_data = lazy_data
     else:
-        raise ValueError(f"Unexpected ND2 array shape: {data.shape}")
+        raise ValueError(f"Unexpected ND2 array shape: {lazy_data.shape}")
 
     shape = ch_data.shape
     dtype = ch_data.dtype
     mmap_arr = np.memmap(mmap_path, dtype=dtype, mode='w+', shape=shape)
 
     for i in tqdm(range(shape[0]), desc=desc, unit="frame"):
-        mmap_arr[i] = ch_data[i]
+        # .compute() evaluates and loads only the current frame into system RAM
+        mmap_arr[i] = ch_data[i].compute()
+        
     mmap_arr.flush()
 
     return mmap_path, shape, str(dtype)
 
 
-def create_manual_timestamps(num_frames: int,
-                              fallback_fps: float = 1.0
-                              ) -> Tuple[np.ndarray, float]:
+def create_manual_timestamps(num_frames: int, fallback_fps: float = 1.0) -> Tuple[np.ndarray, float]:
     dt = 1.0 / fallback_fps
     return np.arange(num_frames) * dt, dt
 
