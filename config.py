@@ -21,7 +21,7 @@ import re
 INPUT_FORMAT = 'ND2' 
 
 DATA_FOLDER  = r"D:\EP\260331_Trial4_InvE_BranchedCortex_SRB_Inside"
-EXPERIMENT_BASE_NAME  = "DOPC_BranchedCortex_Experiment1-400V-500us-frame7"
+EXPERIMENT_BASE_NAME  = "DOPC_BranchedCortex_Experiment2-400V-500us-frame6"
 
 # --- NEW DIRECTORY ROUTING ---
 # Define the master parent directory where all analyses will be stored
@@ -194,6 +194,17 @@ ACTIN_CORTEX_HALF_WIDTH = 5   # px  (~0.44 µm at 0.11 µm/px)
 # Raise this value if flat-profile GUVs (no cortex) are being falsely detected;
 # lower it if faint-but-real cortices are being missed.  Default = 0.10 (10 %).
 ACTIN_PEAK_MIN_PROMINENCE = 0.10
+
+# Number of angular samples used for the cortex angular profile and Gini index.
+# Higher values give a finer angular map but increase per-frame compute time.
+# 72 = 5° resolution (matches the tracking grid search default).
+ACTIN_N_ANGLES = 72
+
+# Padding (pixels) added outward to each side of the membrane FWHM border before
+# it is used as the search window for the actin peak.  Matches the ±3 px padding
+# in skeleton.py's membrane_detection().  Increase if the actin peak is being
+# clipped at the membrane edge; decrease (or set to 0) for tighter confinement.
+ACTIN_MEMBRANE_BORDER_PADDING = 3
 
 # Export a per-GUV CSV and plot of cortex / lumen actin over time
 EXPORT_ACTIN_TRACES = True

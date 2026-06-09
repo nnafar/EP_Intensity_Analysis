@@ -827,14 +827,6 @@ def main():
             )
             logger.info(f"Saved actin analysis plot → {plot_path}")
 
-            bar_path = utils.plot_actin_pre_post(
-                aligned_actin, valid_ids,
-                aligned_actin['t_aligned'],
-                cfg.FOLDER_ACTIN, cfg.EXPERIMENT_BASE_NAME,
-                post_window_s=60.0,
-            )
-            logger.info(f"Saved pre/post bar chart → {bar_path}")
-
             # Combined dye + actin overlay (only when both pipelines ran)
             if aligned is not None:
                 overlay_path = utils.plot_dye_actin_overlay(
@@ -882,6 +874,7 @@ def main():
                     evo_path = utils.plot_actin_radial_evolution(
                         actin_stack_main, evolution_input,
                         cfg.FOLDER_ACTIN, cfg.EXPERIMENT_BASE_NAME,
+                        microns_per_pixel=getattr(cfg, 'MICRONS_PER_PIXEL', 1.0),
                     )
                     logger.info(f"Saved actin radial evolution plot → {evo_path}")
 
