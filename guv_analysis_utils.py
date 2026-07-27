@@ -758,15 +758,26 @@ def track_guv_across_frames(
         max_radius_change_factor: float = 0.20,
         rupture_score_threshold: float  = 4.0,
         rupture_consecutive_fails: int  = 3,
+        dye_stack: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
+    """
+    NOTE ON MEMORY: per-frame inner/membrane/background masks are each a
+    full-frame (h, w) boolean array. Earlier versions of this function
+    stored one such triplet per frame for the entire movie (n_frames × 3
+    full-frame arrays), which for a 3200x3200 frame and ~166 frames is
+    ~4.9 GB *per GUV* held simultaneously — the direct cause of the
+    ArrayMemoryError seen when many GUVs are processed in parallel worker
+    processes. Masks are now generated and consumed one frame at a time
+    and never retained; if *dye_stack* is provided, the dye/background
+    intensity traces are computed inline here instead.
+    """
 
-    inner_masks: List[Optional[np.ndarray]] = [None] * n_frames
-    mem_masks:   List[Optional[np.ndarray]] = [None] * n_frames
-    bg_masks:    List[Optional[np.ndarray]] = [None] * n_frames
     centers:     List[Optional[Tuple]]      = [None] * n_frames
     radii:       List[Optional[int]]        = [None] * n_frames
     ellipses:    List[Optional[Dict]]       = [None] * n_frames 
     ring_scores: List[float]                = [0.0]  * n_frames
+    intensity_trace  = np.full(n_frames, np.nan)
+    background_trace = np.full(n_frames, np.nan)
 
     cx, cy = float(initial_center[0]), float(initial_center[1])
     axes   = (float(initial_radius), float(initial_radius))
@@ -838,12 +849,25 @@ def track_guv_across_frames(
         new_avg_r = int((new_a + new_b) / 2.0)
 
         img_shape = frame.shape[:2]
-        
-        inner_masks[i], mem_masks[i], bg_masks[i] = generate_vectorized_masks(
+
+        inner_mask, mem_mask, bg_mask = generate_vectorized_masks(
             img_shape, det_center, new_axes, det_angle,
             membrane_half_width, bg_buffer, bg_width
         )
-        
+
+        # Extract dye intensity/background right away and let the
+        # full-frame masks go out of scope at the end of this iteration —
+        # never retained across frames (see memory note in the docstring).
+        if dye_stack is not None:
+            dye_frame = dye_stack[i]
+            if dye_frame is not None:
+                inner_px = dye_frame[inner_mask]
+                if inner_px.size > 0:
+                    intensity_trace[i] = float(np.mean(inner_px))
+                bg_px = dye_frame[bg_mask]
+                if bg_px.size > 0:
+                    background_trace[i] = float(np.median(bg_px))
+
         centers[i]  = det_center
         radii[i]    = new_avg_r
         ellipses[i] = {'center': det_center, 'axes': new_axes, 'angle': det_angle}
@@ -855,9 +879,8 @@ def track_guv_across_frames(
         axes, angle = new_axes, det_angle
 
     return {
-        'inner_masks':    inner_masks,
-        'mem_masks':      mem_masks,
-        'bg_masks':       bg_masks,
+        'intensity_trace':  intensity_trace,
+        'background_trace': background_trace,
         'centers':        centers,
         'radii':          radii,
         'ellipses':       ellipses,
@@ -1266,11 +1289,14 @@ def process_single_guv(guv_id: str,
         max_radius_change_factor=getattr(cfg, 'TRACKING_MAX_RADIUS_CHANGE_FACTOR', 0.20),
         rupture_score_threshold=getattr(cfg, 'RUPTURE_SCORE_THRESHOLD', 4.0),
         rupture_consecutive_fails=getattr(cfg, 'RUPTURE_DETECTION_CONSECUTIVE_FAILS', 3),
+        dye_stack=dye_stack,
     )
 
-    # --- 2. Extract Intensity (Calculation happens here while masks are still in RAM) ---
-    intensity_trace  = get_intensity_trace_tracked(dye_stack, n_frames, tracking['inner_masks'], method='mean')
-    background_trace = get_intensity_trace_tracked(dye_stack, n_frames, tracking['bg_masks'], method='median')
+    # --- 2. Dye intensity/background traces are already computed inline
+    # inside track_guv_across_frames (per-frame, without retaining full
+    # movie-length mask arrays) ---
+    intensity_trace  = tracking['intensity_trace']
+    background_trace = tracking['background_trace']
 
     # --- 2b. Extract Actin Cortex Traces (C2 channel) ---
     actin_data = None
@@ -1279,8 +1305,6 @@ def process_single_guv(guv_id: str,
         actin_data = extract_actin_traces(
             actin_stack       = actin_stack,
             n_frames          = n_frames,
-            mem_masks         = tracking['mem_masks'],
-            inner_masks       = tracking['inner_masks'],
             cortex_hw         = getattr(cfg, 'ACTIN_CORTEX_HALF_WIDTH', 4),
             centers           = tracking['centers'],
             ellipses          = tracking['ellipses'],
@@ -1311,8 +1335,9 @@ def process_single_guv(guv_id: str,
             ruptured_at, exit_reason
         )
 
-    # --- 4. LIGHTWEIGHT RETURN (Discard heavy masks to prevent MemoryError) ---
-    # We strip 'inner_masks', 'mem_masks', and 'bg_masks' here
+    # --- 4. LIGHTWEIGHT RETURN ---
+    # track_guv_across_frames no longer produces full-frame mask arrays at
+    # all (see its docstring), so there is nothing heavy to strip here.
     light_tracking = {
         'centers':     tracking['centers'],
         'radii':       tracking['radii'],
@@ -1737,8 +1762,6 @@ def export_full_stack_videos(track_folder: str, mask_folder: str, experiment_nam
 def extract_actin_traces(
         actin_stack: np.ndarray,
         n_frames: int,
-        mem_masks: list,
-        inner_masks: list,
         cortex_hw: int,
         centers: list,
         ellipses: list,

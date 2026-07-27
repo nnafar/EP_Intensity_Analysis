@@ -573,12 +573,22 @@ def _get_kinetic_model_spec(model_name: str, y_start: float, y_end: float,
         names = ['I0', 'Iinf', 'tau', 'D']
     elif model_name == 'EFFLUX-2EXP':
         fn = utils.efflux_2exp
-        p0    = (y_end, A_est*0.5, tau_e*0.5, A_est*0.5, tau_e*2.0, 0.0)
+        p0    = (np.clip(y_end,   -1.99, 1.99),
+                 np.clip(A_est*0.5, 0.01, 1.99),
+                 np.clip(tau_e*0.5, 0.02, 4999.0),
+                 np.clip(A_est*0.5, 0.01, 1.99),
+                 np.clip(tau_e*2.0, 0.02, 4999.0),
+                 0.0)
         bnds  = ((-2, 0, 0.01, 0, 0.01, -0.1), (2, 2, 5000, 2, 5000, 0.1))
         names = ['Iinf', 'a1', 'tau1', 'a2', 'tau2', 'D']
     elif model_name == 'INFLUX-2EXP':
         fn = utils.influx_2exp
-        p0    = (y_start, A_est*0.5, tau_e*0.5, A_est*0.5, tau_e*2.0, 0.0)
+        p0    = (np.clip(y_start,  -1.99, 1.99),
+                 np.clip(A_est*0.5, 0.01, 1.99),
+                 np.clip(tau_e*0.5, 0.02, 4999.0),
+                 np.clip(A_est*0.5, 0.01, 1.99),
+                 np.clip(tau_e*2.0, 0.02, 4999.0),
+                 0.0)
         bnds  = ((-2, 0, 0.01, 0, 0.01, -0.1), (2, 2, 5000, 2, 5000, 0.1))
         names = ['I0', 'a1', 'tau1', 'a2', 'tau2', 'D']
     else:

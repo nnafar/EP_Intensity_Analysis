@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 GUV ANALYSIS CONFIGURATION
 
@@ -25,7 +24,7 @@ EXPERIMENT_BASE_NAME  = "DOPC_Empty_Experiment1-400V-500us-frame5"
 
 # --- NEW DIRECTORY ROUTING ---
 # Define the master parent directory where all analyses will be stored
-PARENT_OUTPUT_FOLDER = r"C:\GitHub\EP_Intensity_Analysis\Outputs"
+PARENT_OUTPUT_FOLDER = r"D:\EP\Outputs"
 
 # Extract the 6-digit YYMMDD date from the DATA_FOLDER name
 _data_dir_name = os.path.basename(os.path.normpath(DATA_FOLDER))
@@ -144,7 +143,17 @@ PULSE_DETECT_SMOOTH_SIGMA = 2.0
 # can be sanity-checked against real values from your own data. Raise it
 # if too many marginal-but-real GUVs are being kept; lower it if clearly
 # loaded GUVs are being excluded.
-MIN_PREPULSE_SEPARATION_SIGMA = 2.0
+#
+# TEMPORARY TEST VALUE for DOPC_Empty_Experiment1-400V-500us-frame5: this
+# file's dye-channel sep0/bg_std0 ratios cluster around a median of ~1.1
+# across all 42 GUVs with no natural pass/fail gap in the distribution
+# (see channel_diagnostic.py output) -- i.e. this is NOT a validated
+# general threshold, it's set to roughly match this file's own noise
+# floor so ~half its GUVs clear the bar. Compare against a known-good
+# experiment's ratio distribution before treating 1.1 as anything more
+# than a per-file test value; TODO revert to 2.0 (or set per-experiment)
+# once that comparison is done.
+MIN_PREPULSE_SEPARATION_SIGMA = 1.1
 
 # Maximum number of frames to evaluate for the pulse within the fast-acquisition window.
 # Set to None to search the entire fast window.
