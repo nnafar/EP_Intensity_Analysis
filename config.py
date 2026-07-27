@@ -74,15 +74,15 @@ MEMBRANE_DETECTION_MODE = 'LABELED'
 MEMBRANE_SEARCH_FACTOR    = 0.35
 
 # Half-width of the membrane mask in pixels (mask = peak ± this).
-MEMBRANE_FIXED_HALF_WIDTH = 3
+MEMBRANE_FIXED_HALF_WIDTH = 5   # Increased from 3
 
 # scipy.signal.find_peaks parameters
 PEAK_FIND_MIN_DISTANCE   = 5
 PEAK_FIND_MIN_PROMINENCE = 0.05
 
 # Background annulus geometry
-BG_BUFFER_PIXELS     = 1    # gap (px) between outer membrane edge and bg ring start
-BG_RING_WIDTH_PIXELS = 4    # width (px) of background sampling ring
+BG_BUFFER_PIXELS = 3        # Increased from 1   # gap (px) between outer membrane edge and bg ring start
+BG_RING_WIDTH_PIXELS = 2    # Decreased from 4   # width (px) of background sampling ring
 
 # Background neighbor-exclusion
 # When a second GUV's body (inner + membrane) overlaps this GUV's background

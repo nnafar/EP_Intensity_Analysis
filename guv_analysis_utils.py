@@ -855,16 +855,17 @@ def track_guv_across_frames(
             membrane_half_width, bg_buffer, bg_width
         )
 
-        # Extract dye intensity/background right away and let the
-        # full-frame masks go out of scope at the end of this iteration —
-        # never retained across frames (see memory note in the docstring).
+        # Extract dye intensity/background right away
         if dye_stack is not None:
             dye_frame = dye_stack[i]
             if dye_frame is not None:
-                inner_px = dye_frame[inner_mask]
+                # Apply Gaussian Blur (kernel size 5x5, sigma 1.5)
+                dye_frame_blurred = cv2.GaussianBlur(dye_frame, (5, 5), 1.5)
+                
+                inner_px = dye_frame_blurred[inner_mask]
                 if inner_px.size > 0:
                     intensity_trace[i] = float(np.mean(inner_px))
-                bg_px = dye_frame[bg_mask]
+                bg_px = dye_frame_blurred[bg_mask]
                 if bg_px.size > 0:
                     background_trace[i] = float(np.median(bg_px))
 
@@ -1066,9 +1067,12 @@ def recompute_background_traces(
         if el is None:
             continue
 
-        frame = dye_stack[i]
-        if frame is None:
+        raw_frame = dye_stack[i]
+        if raw_frame is None:
             continue
+
+        # Apply the identical Gaussian Blur
+        frame = cv2.GaussianBlur(raw_frame, (5, 5), 1.5)
 
         _, _, bg_mask = generate_vectorized_masks(
             img_shape, el['center'], el['axes'], el['angle'],
