@@ -20,8 +20,8 @@ import re
 
 INPUT_FORMAT = 'ND2' 
 
-DATA_FOLDER  = r"D:\EP\260507_InvE_Empty_Branched_Threshold"
-EXPERIMENT_BASE_NAME  = "DOPC_Empty_Experiment2-360V-500us-frame5"
+DATA_FOLDER  = r"D:\EP\260422_InvE_Empty_SRB_400V"
+EXPERIMENT_BASE_NAME  = "DOPC_Empty_Experiment1-400V-500us-frame5"
 
 # --- NEW DIRECTORY ROUTING ---
 # Define the master parent directory where all analyses will be stored
@@ -85,6 +85,35 @@ PEAK_FIND_MIN_PROMINENCE = 0.05
 BG_BUFFER_PIXELS     = 1    # gap (px) between outer membrane edge and bg ring start
 BG_RING_WIDTH_PIXELS = 4    # width (px) of background sampling ring
 
+# Background neighbor-exclusion
+# When a second GUV's body (inner + membrane) overlaps this GUV's background
+# annulus, those pixels are excluded from the background estimate before
+# computing the median/std. BG_EXCLUSION_PADDING_PX is added on top of
+# MEMBRANE_FIXED_HALF_WIDTH when defining the neighbor's excluded footprint,
+# as a safety margin against a slightly under-tracked neighbor edge.
+BG_EXCLUSION_PADDING_PX = 2   # px
+
+# Minimum number of background pixels that must remain after neighbor
+# exclusion. If fewer remain (e.g. a very crowded FOV), the exclusion falls
+# back to the full (unexcluded) annulus for that frame rather than
+# extracting background statistics from a near-empty sample.
+BG_EXCLUSION_MIN_PIXELS = 20
+
+# How many consecutive frames to keep excluding a tracked neighbor's last
+# known position after its ellipse goes missing (transient tracking loss,
+# not yet declared ruptured). Bridges brief tracking gaps without
+# indefinitely excluding a stale position once the neighbor has actually
+# ruptured/dispersed or drifted out of frame.
+BG_NEIGHBOR_HOLD_FRAMES = 5
+
+# MAD-based sigma-clip threshold applied to the background pixels AFTER
+# position-based neighbor exclusion. This is the only defense against a
+# neighboring vesicle the user never circled (no tracked position exists
+# to exclude it by) — pixels more than this many scaled-MADs from the
+# annulus median are dropped before computing background stats. Set to 0
+# to disable.
+BG_SIGMA_CLIP = 3.0
+
 # -----------------------------------------------------------------------------
 # --- 3. FITTING & MODELING ---
 # -----------------------------------------------------------------------------
@@ -102,6 +131,20 @@ PULSE_FRAME_OVERRIDE = None
 # Gaussian σ (frames) used to smooth the mean trace before differentiation.
 # Increase if the signal is noisy; decrease if pulses are very abrupt.
 PULSE_DETECT_SMOOTH_SIGMA = 2.0
+
+# Dead-GUV filter: a GUV is excluded from dye-channel analysis if its
+# pre-pulse interior signal is not separated from background by at least
+# this many multiples of the background's own RAW per-pixel std:
+#   |I_dye,0 - I_bg,0|  <  MIN_PREPULSE_SEPARATION_SIGMA * bg_std0
+# This is a plain amplitude check, NOT a statistical significance test —
+# it does not scale with the number of background pixels (that SEM-scaled
+# version was tried and over-excluded everything; see background
+# diagnostics discussion). bg_std0 is already exported per-GUV in
+# {experiment}_background_diagnostics.csv (bg_std_raw), so this threshold
+# can be sanity-checked against real values from your own data. Raise it
+# if too many marginal-but-real GUVs are being kept; lower it if clearly
+# loaded GUVs are being excluded.
+MIN_PREPULSE_SEPARATION_SIGMA = 2.0
 
 # Maximum number of frames to evaluate for the pulse within the fast-acquisition window.
 # Set to None to search the entire fast window.
@@ -167,6 +210,21 @@ RUPTURE_SCORE_THRESHOLD = 4.0
 # to declare rupture (reduces false positives from single bad frames).
 RUPTURE_DETECTION_CONSECUTIVE_FAILS = 3
 
+# GUV fate refinement: distinguishes gradual SHRINKAGE (deflation) from
+# abrupt RUPTURE. A GUV whose radius has declined by at least this fraction
+# from its own pre-pulse baseline is classified SHRUNK regardless of how
+# tracking ended — including overriding a raw RUPTURED tag, since a vesicle
+# that deflates below the ring-detector's minimum resolvable size will also
+# trip the tracker's rupture-score exit, but that's a shrinkage artifact of
+# detection, not a membrane burst. 0.15 = 15% radius loss.
+SHRINKAGE_FRACTION_THRESHOLD = 0.15
+
+# Number of the LAST valid tracked frames (per GUV) averaged to get its
+# terminal radius for the shrinkage check. Smooths single-frame ring
+# detection noise right at the endpoint rather than keying the whole
+# fate classification off one potentially noisy frame.
+SHRINKAGE_TERMINAL_N_FRAMES = 3
+
 # Tracking outputs
 # CSV: per-frame (guv_id, frame, x, y, radius, ring_score)
 EXPORT_TRACKING_DATA = True
@@ -215,6 +273,41 @@ EXPORT_ACTIN_TRACES = True
 
 # Smoothing sigma (frames) for the actin ratio plot; set 0 to disable
 ACTIN_PLOT_SMOOTH_SIGMA = 1.5
+
+# Electrode axis orientation, in degrees, in the IMAGE FRAME (0 = along +x /
+# horizontal, matching the angular sampling convention used for
+# 'angular_profiles'). The electrode-facing poles are drawn at this angle
+# and this angle + 180 on the actin angular kymograph. This is the
+# CODE-frame angle used internally for all pole/equator masking and the
+# polarization index — do not change this to relabel the plot axis; see
+# ANGLE_DISPLAY_OFFSET_DEG below for that.
+ELECTRODE_ANGLE_DEG = 0.0
+
+# Display-only rotation applied to the kymograph angle axis at plot time:
+#   display_angle = (code_angle + ANGLE_DISPLAY_OFFSET_DEG) mod 360
+# Does NOT affect pole/equator masking, the polarization index, or any other
+# computation — those stay in code-frame (0 deg = directly right of center,
+# 90 deg = directly below, matching standard image row/column axes).
+# Default 90 deg matches the lab convention: 0 deg at the top of the vesicle
+# (a reference point on the equator, not a pole), sweeping clockwise so that
+# 90 deg = cathode-facing pole (right) and 270 deg = anode-facing pole
+# (left) — i.e. code 270 -> display 0, code 0 -> display 90, code 180 ->
+# display 270. Must be a multiple of (360 / ACTIN_N_ANGLES) so the axis
+# roll lands exactly on a sampled angle.
+ANGLE_DISPLAY_OFFSET_DEG = 90.0
+
+# Generate per-GUV actin angular kymographs (angle vs. time post-pulse,
+# cortex intensity as color) plus one population-average kymograph per
+# experiment, to check whether cortex breakdown after electroporation is
+# directional (concentrated at the electrode-facing poles) or uniform
+# (all around the vesicle). Requires ANALYZE_ACTIN_CHANNEL = True.
+EXPORT_ACTIN_KYMOGRAPH = True
+
+# Half-width (degrees) of the angular window averaged around each pole and
+# each equator direction for the quantitative pole-vs-equator trace and
+# polarization index. 22.5 deg means the 4 windows (2 poles + 2 equator
+# points) exactly tile the full 360 deg with no gaps/overlap.
+POLE_EQUATOR_HALF_WIDTH_DEG = 22.5
 
 # -----------------------------------------------------------------------------
 # --- 6. ADVANCED ---

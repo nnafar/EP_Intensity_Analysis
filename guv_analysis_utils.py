@@ -166,6 +166,58 @@ def efflux_2exp(t, Iinf, a1, tau1, a2, tau2, D=0):
     return Iinf + a1 * np.exp(-t / tau1) + a2 * np.exp(-t / tau2) + D * t
 
 # -------------------------------------------------------------------
+# --- 2b. MODEL SELECTION (AIC/AICc/BIC) ---
+# -------------------------------------------------------------------
+
+def compute_information_criteria(rss: float, n: int, k: int) -> Tuple[float, float, float]:
+    """
+    AIC, AICc, and BIC for a least-squares fit, using the standard Gaussian-
+    likelihood form for i.i.d. residuals:
+
+        AIC  = n * ln(RSS / n) + 2 * k_eff
+        AICc = AIC + 2 * k_eff * (k_eff + 1) / (n - k_eff - 1)
+        BIC  = n * ln(RSS / n) + k_eff * ln(n)
+
+    where `k_eff = k + 1` includes the residual variance as an estimated
+    parameter (the conventional convention for comparing least-squares fits
+    with these criteria, e.g. as used by R's AIC() on an nls() object).
+
+    Lower values indicate a better trade-off between fit quality and model
+    complexity. AICc adds a small-sample correction over AIC and should be
+    preferred whenever n is not much larger than k_eff (as is typical here:
+    tens of frames vs. 4-6 fitted parameters) — it converges to AIC as
+    n → ∞. BIC penalises additional parameters more heavily than AICc for
+    the sample sizes typical of a single GUV trace, so it will tend to
+    favour the simpler (1EXP) model more often; treat agreement between
+    AICc and BIC as the stronger signal.
+
+    Parameters
+    ----------
+    rss : residual sum of squares of the fit
+    n   : number of data points fitted
+    k   : number of *mean-function* parameters (i.e. len(names) from the
+          model spec) — do NOT include the variance itself here.
+
+    Returns
+    -------
+    (aic, aicc, bic) — NaN for any quantity that is undefined (rss <= 0,
+    or, for AICc, when n - k_eff - 1 <= 0, i.e. too few points to support
+    the correction).
+    """
+    if not np.isfinite(rss) or rss <= 0 or n <= 0:
+        return np.nan, np.nan, np.nan
+
+    k_eff = k + 1
+    aic = float(n * np.log(rss / n) + 2 * k_eff)
+    bic = float(n * np.log(rss / n) + k_eff * np.log(n))
+
+    denom = n - k_eff - 1
+    aicc = float(aic + (2 * k_eff * (k_eff + 1)) / denom) if denom > 0 else np.nan
+
+    return aic, aicc, bic
+
+
+# -------------------------------------------------------------------
 # --- 3. PULSE-FRAME DETECTION ---
 # -------------------------------------------------------------------
 
@@ -565,7 +617,7 @@ def find_best_guv_center(
         search_factor: float,
         detect_bright: bool,
         grid_step_factor: float = 0.15,
-) -> Tuple[Tuple[int, int], float]:
+) -> Tuple[Tuple[int, int], float, bool]:
     """
     Translational search for the GUV centre using ring-quality scoring.
 
@@ -574,6 +626,17 @@ def find_best_guv_center(
     Evaluate the ring-score at every grid point inside a circle of radius
     `prev_radius × search_window_factor` around `prev_center`.  Return the
     highest-scoring candidate.
+
+    Returns
+    -------
+    (best_center, best_score, in_bounds)
+        in_bounds is False only when EVERY candidate in the search grid was
+        too close to the frame edge to fit a full radial profile — i.e. the
+        vesicle has drifted to (or past) the field-of-view boundary. This is
+        the signal used upstream to distinguish "lost because it left the
+        frame" from "lost because the ring genuinely disappeared" (rupture).
+        When True, at least one candidate was scored normally, even if the
+        best score is still low for other reasons (e.g. rupture).
     """
     cx, cy  = prev_center
     r       = prev_radius
@@ -594,6 +657,7 @@ def find_best_guv_center(
 
     best_score  = -1.0
     best_center = prev_center
+    in_bounds   = False
     
     # 2. Grid search over the local crop
     for dx in range(-search_r, search_r + step, step):
@@ -608,7 +672,8 @@ def find_best_guv_center(
             if local_cx - r_max < 0 or local_cx + r_max >= local_frame.shape[1] or \
                local_cy - r_max < 0 or local_cy + r_max >= local_frame.shape[0]:
                 continue
-                
+
+            in_bounds = True
             prof = radial_profile_local(local_frame, (local_cx, local_cy), r_max, 72)
             score = _ring_score_from_profile(prof, r, search_factor, detect_bright)
             
@@ -616,7 +681,7 @@ def find_best_guv_center(
                 best_score  = score
                 best_center = (ncx, ncy)
 
-    return best_center, best_score
+    return best_center, best_score, in_bounds
 
 
 def detect_membrane_ellipse(frame: np.ndarray, center: Tuple[float, float],
@@ -710,14 +775,24 @@ def track_guv_across_frames(
 
     consecutive_low = 0
     ruptured_at     = None
+    exit_reason     = None   # 'RUPTURED' | 'OUT_OF_FRAME' | None
     n_valid         = 0
+
+    # Flags for the CURRENT consecutive-low-score streak: True where that
+    # frame's failure was because the search grid fell outside the frame
+    # (find_best_guv_center found no evaluable candidate), False where a
+    # candidate WAS evaluated but scored poorly (consistent with rupture).
+    # Reset whenever a good-quality frame breaks the streak.
+    streak_boundary_flags: List[bool] = []
 
     for i in range(n_frames):
         frame = roi_stack[i]
         if frame is None:
             consecutive_low += 1
+            streak_boundary_flags.append(False)  # missing frame, not a boundary issue
             if consecutive_low >= rupture_consecutive_fails:
                 ruptured_at = i - consecutive_low + 1
+                exit_reason = 'RUPTURED'
                 break
             continue
 
@@ -725,7 +800,7 @@ def track_guv_across_frames(
         pred_cy = cy + vy
         avg_r = (axes[0] + axes[1]) / 2.0
 
-        (new_cx, new_cy), score = find_best_guv_center(
+        (new_cx, new_cy), score, in_bounds = find_best_guv_center(
             frame, (pred_cx, pred_cy), avg_r,
             search_window_factor, search_factor,
             detect_bright, grid_step_factor
@@ -734,11 +809,21 @@ def track_guv_across_frames(
 
         if score < rupture_score_threshold:
             consecutive_low += 1
+            streak_boundary_flags.append(not in_bounds)
             if consecutive_low >= rupture_consecutive_fails:
                 ruptured_at = i - consecutive_low + 1
+                # Majority vote over the streak: if most of the failing
+                # frames had no evaluable ring candidate at all (vesicle at
+                # or past the FOV edge), this is a tracking limitation, not
+                # a biological rupture.
+                n_boundary = sum(streak_boundary_flags)
+                exit_reason = ('OUT_OF_FRAME'
+                                if n_boundary > len(streak_boundary_flags) / 2.0
+                                else 'RUPTURED')
                 break
         else:
             consecutive_low = 0
+            streak_boundary_flags = []
 
         det_center, det_axes, det_angle, r_ok = detect_membrane_ellipse(
             frame, (new_cx, new_cy), axes, search_factor, detect_bright
@@ -778,6 +863,7 @@ def track_guv_across_frames(
         'ellipses':       ellipses,
         'ring_scores':    ring_scores,
         'ruptured_at':    ruptured_at,
+        'exit_reason':    exit_reason,   # 'RUPTURED' | 'OUT_OF_FRAME' | None
         'n_valid_frames': n_valid,
     }
 
@@ -815,6 +901,324 @@ def find_closest_frame(time_array: np.ndarray, target: float) -> Tuple[int, floa
     """Find the index and actual time value closest to the target time."""
     idx = int(np.abs(time_array - target).argmin())
     return idx, float(time_array[idx])
+
+
+def recompute_background_traces(
+        dye_stack: np.ndarray,
+        n_frames: int,
+        all_ellipses: List[List[Optional[Dict]]],
+        target_idx: int,
+        membrane_half_width,
+        bg_buffer: int,
+        bg_width: int,
+        img_shape: tuple,
+        exclusion_padding: int = 2,
+        min_bg_pixels: int = 20,
+        neighbor_hold_frames: int = 5,
+        sigma_clip: float = 3.0,
+        sigma_clip_candidates: Optional[List[float]] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
+    """
+    Re-extracts the background median AND std for one GUV, frame by frame,
+    excluding pixels that belong to a neighboring GUV.
+
+    Two independent lines of defense are used, because "neighboring GUV" can
+    mean a vesicle we know the position of or one we don't:
+
+    1. Position-based exclusion (tracked neighbors)
+       ------------------------------------------
+       For every OTHER GUV that has a valid tracked ellipse *this frame*,
+       its inner + membrane footprint (padded by `exclusion_padding`) is
+       removed from the annulus, as before. If a neighbor's ellipse is
+       momentarily missing (transient tracking loss, not yet declared
+       ruptured), its *last known* position is held and still excluded for
+       up to `neighbor_hold_frames` frames — a vesicle doesn't vanish just
+       because one frame's ring-score search failed. Beyond that grace
+       period the hold is dropped (either it ruptured and dispersed, or it
+       drifted out of frame, in which case continuing to exclude a stale
+       position would just shrink the usable background for no benefit).
+
+    2. Statistical outlier rejection (untracked or unselected neighbors)
+       -------------------------------------------------------------
+       Any vesicle the user never circled has no entry in `all_ellipses` at
+       all, so step 1 cannot know about it. After position-based exclusion,
+       a MAD-based sigma-clip is applied directly to the remaining annulus
+       pixel *values*: pixels more than `sigma_clip` scaled-MADs from the
+       median are dropped before computing statistics. This catches a
+       bright membrane rim or dark lumen from an untracked/unselected
+       neighbor sitting in the ring without needing to know where it is.
+
+    Diagnostics for tuning `sigma_clip`
+    ------------------------------------
+    While the raw (position-excluded, pre-statistical-clip) pixels for a
+    frame are still in memory, the median/MAD are recorded, and the
+    exclusion fraction that *would* result is computed for each value in
+    `sigma_clip_candidates` — not just the active `sigma_clip`. This makes
+    it possible to inspect, after the fact, how aggressive different
+    thresholds would have been on real data (e.g. "does sigma=2.5 already
+    exclude pixels even on frames with no neighbor overlap?") without
+    re-running the pipeline for every candidate value.
+
+    Parameters
+    ----------
+    all_ellipses : list of length n_guvs, each a list of length n_frames
+        of {'center','axes','angle'} dicts (or None) — the tracked GUVs'
+        light tracking['ellipses'] output. Vesicles never circled by the
+        user simply have no entry here and are only caught by step 2.
+    target_idx : index into all_ellipses for the GUV being processed.
+    neighbor_hold_frames : how many consecutive frames to keep excluding a
+        tracked neighbor's last known footprint after its ellipse goes
+        missing, before giving up on that neighbor for this frame.
+    sigma_clip : MAD-multiplier threshold for the statistical outlier
+        rejection step actually applied. Set to 0 or None to disable step 2
+        (diagnostics are still computed).
+    sigma_clip_candidates : list of MAD-multiplier values to evaluate for
+        diagnostic purposes only (does not affect the returned traces).
+        Defaults to [1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0].
+
+    Returns
+    -------
+    (bg_median_trace, bg_std_trace, n_excluded_pixels_trace, diagnostics)
+        bg_median_trace, bg_std_trace : (n_frames,) float arrays, NaN where
+            no ellipse/frame was available. Reflect the ACTIVE `sigma_clip`.
+        n_excluded_pixels_trace : (n_frames,) int array — total pixels
+            removed by either mechanism at the active threshold.
+        diagnostics : dict of (n_frames,) arrays —
+            'n_pixels_total'        : ring pixels remaining after position exclusion
+            'n_excluded_position'   : pixels removed by neighbor-position exclusion
+            'n_excluded_stats'      : pixels removed by the active sigma-clip
+            'bg_median_raw'         : median before statistical clipping
+            'bg_mean_raw'           : mean before statistical clipping
+            'bg_std_raw'            : std before statistical clipping
+            'bg_mad_raw'            : median absolute deviation (unscaled)
+            'bg_scaled_mad_raw'     : MAD * 1.4826 (normal-consistent scale)
+            'frac_excluded_sigma_{s}' : one array per candidate in
+                sigma_clip_candidates — fraction of raw pixels that would be
+                excluded at that threshold.
+    """
+    if sigma_clip_candidates is None:
+        sigma_clip_candidates = [1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0]
+
+    n_guvs = len(all_ellipses)
+    bg_median = np.full(n_frames, np.nan)
+    bg_std    = np.full(n_frames, np.nan)
+    n_excl    = np.zeros(n_frames, dtype=int)
+
+    n_pixels_total      = np.zeros(n_frames, dtype=int)
+    n_excluded_position = np.zeros(n_frames, dtype=int)
+    n_excluded_stats    = np.zeros(n_frames, dtype=int)
+    bg_median_raw       = np.full(n_frames, np.nan)
+    bg_mean_raw          = np.full(n_frames, np.nan)
+    bg_std_raw            = np.full(n_frames, np.nan)
+    bg_mad_raw            = np.full(n_frames, np.nan)
+    bg_scaled_mad_raw     = np.full(n_frames, np.nan)
+    frac_excluded_by_sigma = {
+        s: np.full(n_frames, np.nan) for s in sigma_clip_candidates
+    }
+
+    diagnostics = {
+        'n_pixels_total':      n_pixels_total,
+        'n_excluded_position': n_excluded_position,
+        'n_excluded_stats':    n_excluded_stats,
+        'bg_median_raw':       bg_median_raw,
+        'bg_mean_raw':         bg_mean_raw,
+        'bg_std_raw':          bg_std_raw,
+        'bg_mad_raw':          bg_mad_raw,
+        'bg_scaled_mad_raw':   bg_scaled_mad_raw,
+    }
+    for s in sigma_clip_candidates:
+        diagnostics[f'frac_excluded_sigma_{s}'] = frac_excluded_by_sigma[s]
+
+    if dye_stack is None:
+        return bg_median, bg_std, n_excl, diagnostics
+
+    target_ellipses = all_ellipses[target_idx]
+
+    # Per-neighbor "last known position" cache for the hold-frames mechanism.
+    last_known: Dict[int, Dict] = {}
+    missing_streak: Dict[int, int] = {}
+
+    for i in range(n_frames):
+        el = target_ellipses[i] if i < len(target_ellipses) else None
+        if el is None:
+            continue
+
+        frame = dye_stack[i]
+        if frame is None:
+            continue
+
+        _, _, bg_mask = generate_vectorized_masks(
+            img_shape, el['center'], el['axes'], el['angle'],
+            membrane_half_width, bg_buffer, bg_width,
+        )
+        if bg_mask is None or not bg_mask.any():
+            continue
+
+        # --- Step 1: position-based exclusion of tracked neighbors ---
+        occupied = np.zeros(img_shape[:2], dtype=bool)
+        pad_hw = membrane_half_width + exclusion_padding
+        for j in range(n_guvs):
+            if j == target_idx:
+                continue
+            other_list = all_ellipses[j]
+            other_el = other_list[i] if i < len(other_list) else None
+
+            if other_el is not None:
+                last_known[j] = other_el
+                missing_streak[j] = 0
+            else:
+                missing_streak[j] = missing_streak.get(j, 0) + 1
+                if j in last_known and missing_streak[j] <= neighbor_hold_frames:
+                    other_el = last_known[j]   # hold last known position
+                else:
+                    other_el = None            # gap too long — give up on it
+
+            if other_el is None:
+                continue
+
+            other_inner, other_mem, _ = generate_vectorized_masks(
+                img_shape, other_el['center'], other_el['axes'], other_el['angle'],
+                pad_hw, bg_buffer, bg_width,
+            )
+            if other_inner is not None:
+                occupied |= other_inner
+            if other_mem is not None:
+                occupied |= other_mem
+
+        effective_bg = bg_mask & ~occupied
+        excluded_by_position = int(bg_mask.sum() - effective_bg.sum())
+
+        if effective_bg.sum() < min_bg_pixels:
+            # Not enough clean pixels remain — fall back to the full
+            # annulus rather than computing stats on a near-empty sample.
+            effective_bg = bg_mask
+            excluded_by_position = 0
+
+        pixels = frame[effective_bg]
+        if len(pixels) == 0:
+            continue
+
+        n_pixels_total[i]      = len(pixels)
+        n_excluded_position[i] = excluded_by_position
+        bg_median_raw[i] = float(np.median(pixels))
+        bg_mean_raw[i]   = float(np.mean(pixels))
+        bg_std_raw[i]    = float(np.std(pixels))
+
+        med = bg_median_raw[i]
+        mad = float(np.median(np.abs(pixels - med)))
+        scaled_mad = mad * 1.4826   # normal-consistent scale estimate
+        bg_mad_raw[i]        = mad
+        bg_scaled_mad_raw[i] = scaled_mad
+
+        # --- Diagnostics: exclusion fraction at each candidate threshold ---
+        if scaled_mad > 0:
+            dev = np.abs(pixels - med)
+            for s in sigma_clip_candidates:
+                frac_excluded_by_sigma[s][i] = float(np.mean(dev > s * scaled_mad))
+        else:
+            for s in sigma_clip_candidates:
+                frac_excluded_by_sigma[s][i] = 0.0
+
+        # --- Step 2: statistical outlier rejection at the ACTIVE threshold
+        # (catches untracked/unselected neighbors that step 1 has no
+        # position for) ---
+        excluded_by_stats = 0
+        if sigma_clip and scaled_mad > 0 and len(pixels) >= max(min_bg_pixels, 10):
+            keep = np.abs(pixels - med) <= sigma_clip * scaled_mad
+            if keep.sum() >= min_bg_pixels:
+                excluded_by_stats = int(len(pixels) - keep.sum())
+                pixels = pixels[keep]
+
+        n_excluded_stats[i] = excluded_by_stats
+        n_excl[i] = excluded_by_position + excluded_by_stats
+        bg_median[i] = float(np.median(pixels))
+        bg_std[i]    = float(np.std(pixels))
+
+    return bg_median, bg_std, n_excl, diagnostics
+
+
+def export_background_diagnostics_csv(
+        diagnostics_per_guv: Dict[str, Dict[str, np.ndarray]],
+        time_array: np.ndarray,
+        output_folder: str,
+        experiment_name: str,
+        sigma_clip_active: float,
+        logger: Optional[logging.Logger] = None,
+) -> str:
+    """
+    Writes a tidy long-format CSV (one row per GUV per frame) of the raw
+    background statistics and candidate sigma-clip exclusion fractions
+    produced by `recompute_background_traces`, so `BG_SIGMA_CLIP` can be
+    tuned from real data instead of guessed.
+
+    How to use it to pick BG_SIGMA_CLIP
+    ------------------------------------
+    - `frac_excluded_sigma_X` columns show what fraction of ring pixels
+      would be dropped at threshold X, per frame. On a "clean" frame (no
+      neighbor nearby) this should be small and roughly constant across
+      candidates — if a low threshold (e.g. 2.0) is already excluding a
+      meaningful fraction on clean frames, it's too aggressive and will
+      eat into legitimate background pixels.
+    - On frames where `n_excluded_position` is 0 but you independently know
+      (e.g. by eye, from the ROI images) that an untracked neighbor is
+      present, look at which threshold first produces a large
+      `frac_excluded_sigma_X` jump — that's roughly the smallest threshold
+      that still catches it.
+    - `bg_std_raw` vs `bg_scaled_mad_raw` compares the ordinary std (pulled
+      up by contamination) against the outlier-robust MAD-based scale —
+      a large gap between them is itself a sign of contamination.
+
+    Also logs a one-line summary (mean raw background level, mean
+    scaled-MAD, and the average exclusion fraction at the currently
+    configured `sigma_clip_active`) if a logger is provided.
+    """
+    rows = []
+    for gid, diag in diagnostics_per_guv.items():
+        n_frames = len(diag['n_pixels_total'])
+        for i in range(n_frames):
+            t = float(time_array[i]) if i < len(time_array) else np.nan
+            row = {
+                'guv_id': gid,
+                'frame': i,
+                'time_s': t,
+                'n_pixels_total':      diag['n_pixels_total'][i],
+                'n_excluded_position': diag['n_excluded_position'][i],
+                'n_excluded_stats':    diag['n_excluded_stats'][i],
+                'bg_median_raw':       diag['bg_median_raw'][i],
+                'bg_mean_raw':         diag['bg_mean_raw'][i],
+                'bg_std_raw':          diag['bg_std_raw'][i],
+                'bg_mad_raw':          diag['bg_mad_raw'][i],
+                'bg_scaled_mad_raw':   diag['bg_scaled_mad_raw'][i],
+            }
+            for key in diag:
+                if key.startswith('frac_excluded_sigma_'):
+                    row[key] = diag[key][i]
+            rows.append(row)
+
+    df = pd.DataFrame(rows)
+    csv_path = os.path.join(
+        output_folder, f'{experiment_name}_background_diagnostics.csv'
+    )
+    df.to_csv(csv_path, index=False, float_format='%.6f', na_rep='NaN')
+
+    if logger is not None and not df.empty:
+        mean_raw   = np.nanmean(df['bg_median_raw'])
+        mean_mad   = np.nanmean(df['bg_scaled_mad_raw'])
+        active_col = f'frac_excluded_sigma_{sigma_clip_active}'
+        if active_col in df.columns:
+            mean_excl_active = np.nanmean(df[active_col])
+            logger.info(
+                f"Background diagnostics: mean raw background = {mean_raw:.2f}, "
+                f"mean scaled-MAD = {mean_mad:.2f}, average fraction excluded "
+                f"at sigma_clip={sigma_clip_active} = {mean_excl_active:.3%}."
+            )
+        else:
+            logger.info(
+                f"Background diagnostics: mean raw background = {mean_raw:.2f}, "
+                f"mean scaled-MAD = {mean_mad:.2f}."
+            )
+
+    return csv_path
 
 
 # -------------------------------------------------------------------
@@ -890,20 +1294,21 @@ def process_single_guv(guv_id: str,
 
     # --- 3. Diagnostics and Export ---
     ruptured_at = tracking['ruptured_at']
+    exit_reason = tracking.get('exit_reason')
     n_valid     = tracking['n_valid_frames']
     
     quality_entry = {
         'guv_id': guv_id, 'initial_radius': initial_radius, 'failed': ruptured_at is not None,
-        'ruptured_at_frame': ruptured_at, 'n_valid_frames': n_valid,
+        'ruptured_at_frame': ruptured_at, 'exit_reason': exit_reason, 'n_valid_frames': n_valid,
         'mean_ring_score': float(np.mean([s for s in tracking['ring_scores'] if s > 0])) if n_valid > 0 else 0.0,
-        'comments': f"RUPTURED_AT_F{ruptured_at}" if ruptured_at is not None else 'OK',
+        'comments': f"{exit_reason}_AT_F{ruptured_at}" if ruptured_at is not None else 'OK',
     }
 
     if getattr(cfg, 'EXPORT_TRACK_VISUALIZATION', True):
         export_track_visualization(
             cfg.FOLDER_TRACKING, cfg.EXPERIMENT_BASE_NAME, guv_id,
             roi_stack, tracking['centers'], tracking['ellipses'],
-            ruptured_at
+            ruptured_at, exit_reason
         )
 
     # --- 4. LIGHTWEIGHT RETURN (Discard heavy masks to prevent MemoryError) ---
@@ -939,7 +1344,8 @@ def create_mask_visualization(base_image, inner_mask, membrane_mask,
 
 
 def export_track_visualization(track_folder, experiment_name, guv_id,
-                                roi_stack, centers, ellipses, ruptured_at):
+                                roi_stack, centers, ellipses, ruptured_at,
+                                exit_reason=None):
     """Saves a diagnostic PNG showing the GUV trajectory."""
     valid_pairs = [(i, c) for i, c in enumerate(centers) if c is not None]
     if not valid_pairs:
@@ -966,13 +1372,26 @@ def export_track_visualization(track_folder, experiment_name, guv_id,
 
     _, cf = valid_pairs[-1]
     elf = ellipses[valid_pairs[-1][0]]
-    ec  = (0, 0, 220) if ruptured_at is not None else (0, 220, 220)
+    # Red = ruptured (biological event); blue = lost to FOV edge (tracking
+    # limitation, not a rupture); cyan = survived to the end of the movie.
+    if ruptured_at is None:
+        ec = (0, 220, 220)
+    elif exit_reason == 'OUT_OF_FRAME':
+        ec = (216, 125, 59)   # BGR blue, matches the #3B7DD8 used in plots
+    else:
+        ec = (0, 0, 220)
     if elf:
         cv2.ellipse(canvas, (int(elf['center'][0]), int(elf['center'][1])),
                     (int(elf['axes'][0]), int(elf['axes'][1])), elf['angle'], 0, 360, ec, 2, cv2.LINE_AA)
     cv2.circle(canvas, (int(cf[0]), int(cf[1])), 3, ec, -1)
 
-    label = f"GUV {guv_id}  {'RUPTURED @F'+str(ruptured_at) if ruptured_at is not None else 'SURVIVED'}"
+    if ruptured_at is None:
+        status_label = 'SURVIVED'
+    elif exit_reason == 'OUT_OF_FRAME':
+        status_label = f'OUT OF FRAME @F{ruptured_at}'
+    else:
+        status_label = f'RUPTURED @F{ruptured_at}'
+    label = f"GUV {guv_id}  {status_label}"
     cv2.putText(canvas, label, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, ec, 1, cv2.LINE_AA)
 
     cv2.imwrite(os.path.join(track_folder, f"{experiment_name}_track_GUV_{guv_id}.png"), canvas)
@@ -1000,6 +1419,110 @@ def normalize_tracking_data(df: pd.DataFrame, pulse_frame: int) -> pd.DataFrame:
             df.loc[mask, 'norm_circularity'] = df.loc[mask, 'circularity'] / mean_c
             
     return df
+
+
+def classify_guv_fates(
+        df_track: pd.DataFrame,
+        ruptured_guv_ids: set,
+        out_of_frame_guv_ids: set,
+        shrinkage_fraction_threshold: float = 0.15,
+        terminal_n_frames: int = 3,
+) -> Tuple[Dict[str, str], pd.DataFrame]:
+    """
+    Refines the tracker's binary RUPTURED/OUT_OF_FRAME exit classification
+    into four mutually exclusive fates, adding a SHRUNK category:
+
+      'OUT_OF_FRAME' - unchanged: tracking was lost because the vesicle
+                        drifted past the field-of-view edge. A tracking
+                        limitation, not a biological event.
+      'SHRUNK'       - the vesicle's radius declined by at least
+                        shrinkage_fraction_threshold from its own pre-pulse
+                        baseline (norm_radius, from normalize_tracking_data),
+                        regardless of how tracking ended. This deliberately
+                        overrides a raw 'RUPTURED' tag: a vesicle that
+                        deflates gradually and only THEN drops below the
+                        ring-detector's minimum resolvable size will also
+                        trigger the tracker's rupture-score exit condition,
+                        but that's a detection-limit artifact of shrinkage,
+                        not a membrane burst — lumping the two together
+                        would misrepresent slow deflation as catastrophic
+                        rupture.
+      'RUPTURED'     - ring score collapsed abruptly WITHOUT a preceding,
+                        sustained radius decline — i.e. the vesicle was
+                        still close to its pre-pulse size right up to the
+                        point tracking was lost. This is what's left of the
+                        tracker's raw 'RUPTURED' tag after shrinkage-driven
+                        exits are pulled out.
+      'SURVIVED'     - tracked through to the end of the movie with no
+                        meaningful (< threshold) radius loss.
+
+    terminal_n_frames : how many of a GUV's LAST valid tracked frames are
+        averaged (in norm_radius) to get its terminal size — smooths
+        single-frame ring-detection noise right at the endpoint rather than
+        keying the whole classification off one potentially noisy frame.
+
+    Requires df_track already have 'norm_radius' (radius / pre-pulse mean
+    radius per GUV) — i.e. normalize_tracking_data() must be called first.
+
+    Returns
+    -------
+    (fate_map, df_fate)
+        fate_map : dict of guv_id (str) -> fate label
+        df_fate  : one row per GUV with guv_id, fate, frac_radius_loss
+                   (positive = shrinkage, NaN if no valid radius data or
+                   OUT_OF_FRAME), terminal_norm_radius, exit_reason_raw
+                   (the tracker's original, pre-refinement tag)
+    """
+    fate_map: Dict[str, str] = {}
+    records = []
+
+    for gid_raw, g in df_track.groupby('guv_id'):
+        gid = str(gid_raw)
+        exit_reason_raw = (
+            'RUPTURED' if gid in ruptured_guv_ids else
+            'OUT_OF_FRAME' if gid in out_of_frame_guv_ids else
+            None
+        )
+
+        if exit_reason_raw == 'OUT_OF_FRAME':
+            fate_map[gid] = 'OUT_OF_FRAME'
+            records.append({
+                'guv_id': gid, 'fate': 'OUT_OF_FRAME',
+                'frac_radius_loss': np.nan, 'terminal_norm_radius': np.nan,
+                'exit_reason_raw': exit_reason_raw,
+            })
+            continue
+
+        norm_r = g.sort_values('frame')['norm_radius'].dropna().values
+        if len(norm_r) == 0:
+            fate = exit_reason_raw or 'SURVIVED'
+            fate_map[gid] = fate
+            records.append({
+                'guv_id': gid, 'fate': fate,
+                'frac_radius_loss': np.nan, 'terminal_norm_radius': np.nan,
+                'exit_reason_raw': exit_reason_raw,
+            })
+            continue
+
+        terminal_norm_r = float(np.mean(norm_r[-terminal_n_frames:]))
+        frac_loss = 1.0 - terminal_norm_r   # positive = net shrinkage
+
+        if frac_loss >= shrinkage_fraction_threshold:
+            fate = 'SHRUNK'
+        elif exit_reason_raw == 'RUPTURED':
+            fate = 'RUPTURED'
+        else:
+            fate = 'SURVIVED'
+
+        fate_map[gid] = fate
+        records.append({
+            'guv_id': gid, 'fate': fate,
+            'frac_radius_loss': frac_loss, 'terminal_norm_radius': terminal_norm_r,
+            'exit_reason_raw': exit_reason_raw,
+        })
+
+    df_fate = pd.DataFrame(records)
+    return fate_map, df_fate
 
 
 def export_tracking_summary_csv(df: pd.DataFrame, time_array: np.ndarray, output_folder: str, experiment_name: str):
@@ -1511,6 +2034,28 @@ def normalize_actin_curves(
     }
 
 
+def _guv_status_style(gid, ruptured_guv_ids: Optional[set] = None,
+                       out_of_frame_guv_ids: Optional[set] = None,
+                       shrunk_guv_ids: Optional[set] = None) -> Tuple[str, str]:
+    """
+    Returns (color, label_suffix) for one GUV based on how its tracking
+    ended. Rupture, shrinkage, and out-of-frame are kept visually and
+    categorically distinct everywhere a plot colors GUVs by status:
+    rupture is an abrupt biological event, shrinkage is a gradual one
+    (and should not be counted as rupture), and drifting out of the
+    tracked field of view is a tracking limitation that should never be
+    counted or read as either.
+    """
+    gid = str(gid)
+    if gid in (ruptured_guv_ids or set()):
+        return '#CC2222', ' (ruptured)'
+    if gid in (shrunk_guv_ids or set()):
+        return '#E08214', ' (shrunk)'
+    if gid in (out_of_frame_guv_ids or set()):
+        return '#3B7DD8', ' (lost, out of frame)'
+    return '#888888', ''
+
+
 def plot_actin_analysis(
         aligned_actin: dict,
         valid_guv_ids: list,
@@ -1518,6 +2063,8 @@ def plot_actin_analysis(
         experiment_name: str,
         smooth_sigma: float = 1.5,
         ruptured_guv_ids: Optional[set] = None,
+        out_of_frame_guv_ids: Optional[set] = None,
+        shrunk_guv_ids: Optional[set] = None,
 ):
     """
     2x2 actin summary figure:
@@ -1561,10 +2108,9 @@ def plot_actin_analysis(
 
     for gid, p_row, l_row, f_row, g_row in zip(
             valid_guv_ids, peak_arr, lumen_arr, fwhm_arr, gini_arr):
-        ruptured = str(gid) in (ruptured_guv_ids or set())
-        col      = C_RUPT if ruptured else C_SURV
-        lw       = 1.2 if ruptured else 0.9
-        label    = f'GUV {gid} (ruptured)' if ruptured else f'GUV {gid}'
+        col, suffix = _guv_status_style(gid, ruptured_guv_ids, out_of_frame_guv_ids, shrunk_guv_ids)
+        lw    = 1.2 if suffix else 0.9
+        label = f'GUV {gid}{suffix}'
         ax_cpeak.plot(t, _smooth(p_row), color=col, alpha=0.75, lw=lw, label=label)
         ax_lumen.plot(t, _smooth(l_row), color=col, alpha=0.75, lw=lw, label=label)
         ax_fwhm .plot(t, _smooth(f_row), color=col, alpha=0.75, lw=lw, label=label)
@@ -1657,6 +2203,383 @@ def export_actin_csv(
                             f'{experiment_name}_actin_cortex_traces.csv')
     df.to_csv(csv_path, index=False, float_format='%.6f', na_rep='NaN')
     return csv_path
+
+
+# -------------------------------------------------------------------
+# --- ACTIN ANGULAR KYMOGRAPH (directionality of cortex breakdown) ---
+# -------------------------------------------------------------------
+
+def build_actin_angular_kymograph(
+        ad: dict,
+        pulse_frame: int,
+        time_array: np.ndarray,
+        n_angles: int = 72,
+) -> Optional[dict]:
+    """
+    Stacks one GUV's per-frame angular actin profile (the 'angular_profiles'
+    entry from extract_actin_traces — one (n_angles,) array per frame,
+    sampled at fixed angles in ABSOLUTE IMAGE-FRAME coordinates around the
+    GUV centre, None where no cortex peak was detected that frame) into a
+    (n_frames_aligned, n_angles) kymograph: angle vs. time, aligned to
+    t = 0 at the pulse frame.
+
+    Because sampling is in image-frame coordinates (not rotated with the
+    fitted ellipse), angle 0 in the output is the same physical direction
+    for every frame and every GUV in one experiment — which is what makes
+    it meaningful to draw electrode-pole reference lines on the result.
+
+    Frames with no detected peak become an all-NaN row rather than being
+    dropped, so gaps show up as gaps in the kymograph instead of silently
+    compressing the time axis.
+
+    Two intensity representations are returned:
+      kymo_raw  : background-subtracted intensity per angle (AU). Only
+                  comparable within one GUV — absolute brightness differs
+                  GUV-to-GUV with labeling efficiency, so don't pool this
+                  across GUVs.
+      kymo_norm : each angle's own pre-pulse mean used as that angle's
+                  baseline (fold-change, 1 = unchanged). This IS comparable
+                  across GUVs, since it factors out per-GUV/per-angle
+                  brightness differences and isolates the relative loss
+                  pattern — this is what the population-average function
+                  pools.
+
+    Returns None if the GUV never had a detected peak in any frame.
+    """
+    profiles = ad.get('angular_profiles')
+    if profiles is None:
+        return None
+
+    bg = np.asarray(ad['bg_trace'], float)
+    n_frames = len(profiles)
+    kymo = np.full((n_frames, n_angles), np.nan)
+    for i, prof in enumerate(profiles):
+        if prof is None:
+            continue
+        bg_i = bg[i] if (i < len(bg) and np.isfinite(bg[i])) else 0.0
+        kymo[i, :] = np.asarray(prof, float) - bg_i
+
+    if not np.isfinite(kymo).any():
+        return None
+
+    safe_pre_end   = pulse_frame if pulse_frame > 0 else 1
+    safe_pre_start = max(0, safe_pre_end - 5)
+    baseline_per_angle = np.nanmean(kymo[safe_pre_start:safe_pre_end, :], axis=0)
+
+    # Angles whose pre-pulse baseline is non-positive or missing (peak never
+    # detected there before the pulse) can't be sensibly turned into a fold
+    # change — dividing by ~0 background noise would produce a spurious huge
+    # or negative ratio. Those angle columns are left as NaN in kymo_norm
+    # rather than showing a fabricated value.
+    safe_baseline = np.where(
+        np.isfinite(baseline_per_angle) & (baseline_per_angle > 0),
+        baseline_per_angle, np.nan
+    )
+
+    kymo_aligned = kymo[pulse_frame:, :]
+    t_aligned    = time_array[pulse_frame:] - time_array[pulse_frame]
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        kymo_norm = kymo_aligned / safe_baseline[None, :]
+
+    return {
+        't_aligned':          t_aligned,
+        'kymo_raw':           kymo_aligned,          # (n_frames_aligned, n_angles) AU
+        'kymo_norm':          kymo_norm,              # fold-change vs. pre-pulse, per angle
+        'baseline_per_angle': baseline_per_angle,
+        'angles_deg':         np.degrees(np.linspace(0, 2 * np.pi, n_angles, endpoint=False)),
+    }
+
+
+def _rotate_for_display(data_2d: np.ndarray, angles_deg: np.ndarray,
+                         offset_deg: float) -> np.ndarray:
+    """
+    Rolls a (n_frames, n_angles) array along its angle axis so that, when
+    plotted against the UNCHANGED angles_deg tick values (0, step, 2*step,
+    ...), row k now shows the data that was physically sampled at
+    code_angle = (k*step - offset_deg) mod 360.
+
+    In other words this implements display_angle = (code_angle + offset_deg)
+    mod 360 by moving data rather than relabeling ticks, which keeps the
+    axis monotonic (no wrap-around jump) and requires no change to how
+    angles_deg/masks are computed elsewhere (they stay in code-frame).
+
+    offset_deg must be an integer multiple of the angular step (360 /
+    n_angles) so the roll lands exactly on a sampled angle; a fractional
+    shift is rounded to the nearest valid step and a warning is not raised
+    here — the caller (plotting functions) is expected to pass a config
+    value that's already a clean multiple (e.g. 90 deg with 72 angles).
+    """
+    n_angles = len(angles_deg)
+    step = 360.0 / n_angles
+    shift = int(round(offset_deg / step)) % n_angles
+    return np.roll(data_2d, shift=shift, axis=1)
+
+
+def plot_actin_angular_kymograph(
+        kymo_data: dict,
+        guv_id: str,
+        output_folder: str,
+        experiment_name: str,
+        electrode_angle_deg: float = 0.0,
+        angle_display_offset_deg: float = 90.0,
+        vmax_percentile: float = 99.0,
+) -> str:
+    """
+    Two-panel angular kymograph for one GUV.
+      Left  - raw (background-subtracted) cortex intensity, angle vs. time
+      Right - normalised to this GUV's own pre-pulse angular baseline
+              (fold-change; 1 = unchanged, <1 = lost, >1 = gained)
+
+    The angle axis is shown in DISPLAY convention:
+        display_angle = (code_angle + angle_display_offset_deg) mod 360
+    Default 90 deg matches the lab diagram: 0 deg at the top of the vesicle
+    (an equator reference point, not a pole), increasing clockwise so that
+    90 deg = cathode-facing pole and 270 deg = anode-facing pole. This is
+    purely a rendering choice — electrode_angle_deg (and everything the
+    poles/equator are computed from) stays in code-frame.
+
+    Solid white lines mark the electrode-facing poles; dotted white lines
+    mark the equator. A uniform (all-over) breakdown shows a horizontal
+    band of loss spanning all angles; a directional (polar) breakdown shows
+    loss concentrated at/near the solid lines while the equator stays
+    bright.
+    """
+    t      = kymo_data['t_aligned']
+    angles = kymo_data['angles_deg']
+    raw    = _rotate_for_display(kymo_data['kymo_raw'],  angles, angle_display_offset_deg)
+    norm   = _rotate_for_display(kymo_data['kymo_norm'], angles, angle_display_offset_deg)
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6), sharey=True)
+
+    finite_raw = raw[np.isfinite(raw)]
+    vmax_raw = float(np.percentile(finite_raw, vmax_percentile)) if finite_raw.size else 1.0
+    im1 = ax1.pcolormesh(t, angles, raw.T, shading='nearest',
+                         cmap='inferno', vmin=0, vmax=max(vmax_raw, 1e-9))
+    fig.colorbar(im1, ax=ax1, label='Cortex intensity (bg-subtracted, AU)')
+    ax1.set_title('Raw')
+
+    finite_dev = np.abs(norm - 1.0)
+    finite_dev = finite_dev[np.isfinite(finite_dev)]
+    vlim = float(np.percentile(finite_dev, vmax_percentile)) if finite_dev.size else 1.0
+    vlim = max(vlim, 1e-9)
+    im2 = ax2.pcolormesh(t, angles, norm.T, shading='nearest',
+                         cmap='RdBu_r', vmin=1 - vlim, vmax=1 + vlim)
+    fig.colorbar(im2, ax=ax2, label='Fold change vs. pre-pulse (per angle)')
+    ax2.set_title('Normalised to pre-pulse baseline (per angle)')
+
+    pole1    = (electrode_angle_deg + angle_display_offset_deg) % 360
+    pole2    = (electrode_angle_deg + 180 + angle_display_offset_deg) % 360
+    equator1 = (electrode_angle_deg + 90 + angle_display_offset_deg) % 360
+    equator2 = (electrode_angle_deg + 270 + angle_display_offset_deg) % 360
+
+    for ax in (ax1, ax2):
+        ax.axvline(0, color='cyan', ls='--', lw=1.2, alpha=0.8)
+        for pole_ang in (pole1, pole2):
+            ax.axhline(pole_ang, color='white', ls='-', lw=1.0, alpha=0.7)
+        for eq_ang in (equator1, equator2):
+            ax.axhline(eq_ang, color='white', ls=':', lw=0.8, alpha=0.5)
+        ax.set_xlabel('Time relative to pulse (s)')
+        ax.set_ylim(0, 360)
+        ax.set_yticks([0, 90, 180, 270, 360])
+
+    ax1.set_ylabel(
+        'Angle (deg, 0\u00b0 = top, clockwise)\n'
+        'solid = electrode-facing poles, dotted = equator'
+    )
+
+    plt.suptitle(f'{experiment_name}  -  GUV {guv_id}  -  '
+                f'Actin cortex angular kymograph', fontsize=12)
+    plt.tight_layout()
+    out_path = os.path.join(
+        output_folder, f'{experiment_name}_GUV{guv_id}_actin_kymograph.png'
+    )
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+    return out_path
+
+
+def plot_actin_angular_kymograph_group(
+        kymo_data_list: list,
+        guv_ids: list,
+        output_folder: str,
+        experiment_name: str,
+        electrode_angle_deg: float = 0.0,
+        angle_display_offset_deg: float = 90.0,
+        vmax_percentile: float = 95.0,
+) -> Optional[str]:
+    """
+    Population-average angular kymograph across all actin-positive GUVs in
+    one experiment. Only the normalised (fold-change) representation is
+    pooled — raw AU is not comparable GUV-to-GUV (labeling efficiency,
+    cortex density, and detector settings differ), but each GUV's own
+    fold-change relative to its own pre-pulse baseline is.
+
+    Individual GUVs are truncated/padded (NaN) to a common time axis (the
+    shortest post-pulse trace among them) before averaging, so early
+    ruptures don't bias later time points toward whichever GUVs happen to
+    still be tracked.
+
+    Angle axis display convention matches plot_actin_angular_kymograph()
+    (see angle_display_offset_deg there) — the underlying averaging happens
+    in code-frame; the rotation is applied only for rendering.
+
+    Returns None if no GUV produced a usable kymogram.
+    """
+    valid = [(gid, kd) for gid, kd in zip(guv_ids, kymo_data_list) if kd is not None]
+    if not valid:
+        return None
+
+    min_len = min(len(kd['t_aligned']) for _, kd in valid)
+    t_common = valid[0][1]['t_aligned'][:min_len]
+    angles   = valid[0][1]['angles_deg']
+
+    stack = np.stack([kd['kymo_norm'][:min_len, :] for _, kd in valid], axis=0)
+    mean_norm = np.nanmean(stack, axis=0)   # (min_len, n_angles)
+    mean_norm = _rotate_for_display(mean_norm, angles, angle_display_offset_deg)
+    n_guvs = len(valid)
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    finite_dev = np.abs(mean_norm - 1.0)
+    finite_dev = finite_dev[np.isfinite(finite_dev)]
+    vlim = float(np.percentile(finite_dev, vmax_percentile)) if finite_dev.size else 1.0
+    vlim = max(vlim, 1e-9)
+    im = ax.pcolormesh(t_common, angles, mean_norm.T, shading='nearest',
+                       cmap='RdBu_r', vmin=1 - vlim, vmax=1 + vlim)
+    fig.colorbar(im, ax=ax, label='Mean fold change vs. pre-pulse (per angle)')
+
+    pole1    = (electrode_angle_deg + angle_display_offset_deg) % 360
+    pole2    = (electrode_angle_deg + 180 + angle_display_offset_deg) % 360
+    equator1 = (electrode_angle_deg + 90 + angle_display_offset_deg) % 360
+    equator2 = (electrode_angle_deg + 270 + angle_display_offset_deg) % 360
+
+    ax.axvline(0, color='cyan', ls='--', lw=1.2, alpha=0.8)
+    for pole_ang in (pole1, pole2):
+        ax.axhline(pole_ang, color='white', ls='-', lw=1.0, alpha=0.7)
+    for eq_ang in (equator1, equator2):
+        ax.axhline(eq_ang, color='white', ls=':', lw=0.8, alpha=0.5)
+    ax.set_xlabel('Time relative to pulse (s)')
+    ax.set_ylabel(
+        'Angle (deg, 0\u00b0 = top, clockwise)\n'
+        'solid = electrode-facing poles, dotted = equator'
+    )
+    ax.set_ylim(0, 360)
+    ax.set_yticks([0, 90, 180, 270, 360])
+    ax.set_title(
+        f'{experiment_name}  -  Population-average actin angular kymograph\n'
+        f'(n = {n_guvs} GUV(s) with a detected cortex)'
+    )
+    plt.tight_layout()
+    out_path = os.path.join(
+        output_folder, f'{experiment_name}_actin_kymograph_population_avg.png'
+    )
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+    return out_path
+
+
+def compute_pole_vs_equator_trace(
+        kymo_data: dict,
+        electrode_angle_deg: float = 0.0,
+        angular_half_width_deg: float = 22.5,
+) -> dict:
+    """
+    Collapses a 2-D angular kymogram (from build_actin_angular_kymograph) into
+    two direct per-frame scalars, so "does the pole lose actin faster than
+    the equator" can be read off a line plot instead of judged by eye on a
+    heatmap.
+
+    pole_mean(t)     : mean fold-change (kymo_norm) within
+                        +/- angular_half_width_deg of EITHER electrode-facing
+                        pole (electrode_angle_deg and +180 deg)
+    equator_mean(t)   : same, but within +/- angular_half_width_deg of either
+                        equator direction (electrode_angle_deg +/- 90 deg)
+    polarization_index(t) : (equator_mean - pole_mean) / (equator_mean + pole_mean)
+                        ~ 0 when pole and equator lose actin at the same rate
+                          (uniform breakdown)
+                        > 0 and growing when the pole loses faster than the
+                          equator (directional breakdown at the poles)
+                        < 0 if, unexpectedly, the equator loses faster —
+                          worth a second look rather than assuming poles.
+                        NaN for a frame where both windows are NaN or the
+                        pole+equator sum is ~0 (nothing to compare).
+
+    angular_half_width_deg : half-width of the angular window averaged around
+        each pole/equator direction. 22.5 deg (default) means each of the 4
+        windows spans 45 deg total, so all 4 windows together cover the full
+        360 deg with no gaps and no overlap.
+    """
+    norm   = kymo_data['kymo_norm']
+    angles = kymo_data['angles_deg']
+    t      = kymo_data['t_aligned']
+
+    def _circ_dist(a, b):
+        return np.abs((a - b + 180) % 360 - 180)
+
+    pole1, pole2 = electrode_angle_deg % 360, (electrode_angle_deg + 180) % 360
+    eq1, eq2     = (electrode_angle_deg + 90) % 360, (electrode_angle_deg + 270) % 360
+
+    pole_mask = (_circ_dist(angles, pole1) <= angular_half_width_deg) | \
+                (_circ_dist(angles, pole2) <= angular_half_width_deg)
+    eq_mask   = (_circ_dist(angles, eq1)   <= angular_half_width_deg) | \
+                (_circ_dist(angles, eq2)   <= angular_half_width_deg)
+
+    with np.errstate(invalid='ignore'):
+        pole_mean = np.nanmean(norm[:, pole_mask], axis=1)
+        eq_mean   = np.nanmean(norm[:, eq_mask],   axis=1)
+
+    denom = eq_mean + pole_mean
+    with np.errstate(divide='ignore', invalid='ignore'):
+        pol_index = np.where(np.abs(denom) > 1e-9, (eq_mean - pole_mean) / denom, np.nan)
+
+    return {
+        't':                  t,
+        'pole_mean':          pole_mean,
+        'equator_mean':       eq_mean,
+        'polarization_index': pol_index,
+    }
+
+
+def plot_pole_vs_equator(
+        pe_data: dict,
+        guv_id: str,
+        output_folder: str,
+        experiment_name: str,
+) -> str:
+    """
+    Two-panel line plot from compute_pole_vs_equator_trace():
+      Top    - pole_mean vs. equator_mean fold-change over time (the direct
+               comparison: do the two lines separate, and which one drops?)
+      Bottom - polarization_index over time (single number: 0 = uniform,
+               rising positive = increasingly pole-concentrated loss)
+    """
+    t   = pe_data['t']
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 7), sharex=True,
+                                   gridspec_kw={'height_ratios': [2, 1]})
+
+    ax1.plot(t, pe_data['pole_mean'],    color='#CC3333', lw=2.0, label='Pole (electrode-facing)')
+    ax1.plot(t, pe_data['equator_mean'], color='#3366CC', lw=2.0, label='Equator')
+    ax1.axhline(1.0, color='gray', ls=':', lw=0.8)
+    ax1.axvline(0.0, color='cyan', ls='--', lw=1.2, alpha=0.8, label='Pulse (t = 0)')
+    ax1.set_ylabel('Fold change vs. pre-pulse\n(mean within angular window)')
+    ax1.set_title(f'GUV {guv_id} — pole vs. equator actin retention')
+    ax1.legend(fontsize=9)
+    ax1.grid(True, alpha=0.25)
+
+    ax2.plot(t, pe_data['polarization_index'], color='black', lw=1.8)
+    ax2.axhline(0.0, color='gray', ls=':', lw=0.8)
+    ax2.axvline(0.0, color='cyan', ls='--', lw=1.2, alpha=0.8)
+    ax2.set_ylabel('Polarization index\n(equator−pole)/(equator+pole)')
+    ax2.set_xlabel('Time relative to pulse (s)')
+    ax2.grid(True, alpha=0.25)
+
+    plt.tight_layout()
+    out_path = os.path.join(
+        output_folder, f'{experiment_name}_GUV{guv_id}_pole_vs_equator.png'
+    )
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+    return out_path
 
 
 def plot_actin_pre_post(
@@ -1887,6 +2810,8 @@ def plot_dye_actin_overlay(
         experiment_name: str,
         smooth_sigma: float = 1.5,
         ruptured_guv_ids: Optional[set] = None,
+        out_of_frame_guv_ids: Optional[set] = None,
+        shrunk_guv_ids: Optional[set] = None,
 ):
     """
     Per-GUV dual-axis figure correlating dye efflux with actin cortex dynamics.
@@ -1936,15 +2861,13 @@ def plot_dye_actin_overlay(
 
     DYE_COLOR = '#1f77b4'    # blue  (kept for dual-axis lines)
     ACT_COLOR = '#ff7f0e'    # orange (kept for dual-axis lines)
-    C_SURV    = '#888888'
-    C_RUPT    = '#CC2222'
 
-    def _draw_panel(ax, t_d, dye_row, t_a, act_row, title, ruptured=False):
+    def _draw_panel(ax, t_d, dye_row, t_a, act_row, title, status_color=None):
         ax2 = ax.twinx()
 
-        trace_col = C_RUPT if ruptured else DYE_COLOR
+        trace_col = status_color or DYE_COLOR
         ax .plot(t_d, _sm(dye_row), color=trace_col, lw=1.6, label='Dye (ret.)')
-        ax2.plot(t_a, _sm(act_row), color=ACT_COLOR if not ruptured else C_RUPT,
+        ax2.plot(t_a, _sm(act_row), color=status_color or ACT_COLOR,
                  lw=1.6, label='Cortex (norm.)')
 
         ax .axvline(0, color='crimson', ls='--', lw=1.2, zorder=3)
@@ -1973,8 +2896,9 @@ def plot_dye_actin_overlay(
         dye_row = dye_arr[i] if i < len(dye_arr) else np.full_like(t_dye, np.nan)
         act_row = act_arr[i] if i < len(act_arr) else np.full_like(t_act, np.nan)
 
-        _draw_panel(ax, t_dye, dye_row, t_act, act_row, f'GUV {gid}',
-                    ruptured=str(gid) in (ruptured_guv_ids or set()))
+        col, suffix = _guv_status_style(gid, ruptured_guv_ids, out_of_frame_guv_ids, shrunk_guv_ids)
+        _draw_panel(ax, t_dye, dye_row, t_act, act_row, f'GUV {gid}{suffix}',
+                    status_color=col if suffix else None)
 
     # Population summary panel (last)
     summary_idx  = n_guvs
@@ -2023,6 +2947,8 @@ def plot_dye_fits_grid(
         experiment_name: str,
         model_name: str,
         ruptured_guv_ids: Optional[set] = None,
+        out_of_frame_guv_ids: Optional[set] = None,
+        shrunk_guv_ids: Optional[set] = None,
 ) -> str:
     """
     Multigrid plot of per-GUV kinetic fits — one subplot per GUV plus a
@@ -2030,15 +2956,21 @@ def plot_dye_fits_grid(
 
     Colour scheme
     -------------
-    Surviving GUVs : medium grey (#888888) data dots, dark grey (#444444) fit line.
-    Ruptured GUVs  : red (#CC2222) data dots and fit line.
+    Surviving GUVs   : medium grey (#888888) data dots, dark grey (#444444) fit line.
+    Ruptured GUVs    : red (#CC2222) data dots and fit line — abrupt membrane
+        burst while the vesicle was still close to its pre-pulse size.
+    Shrunk GUVs      : orange (#E08214) data dots and fit line — gradual
+        radius decline (deflation), not a burst.
+    Out-of-frame GUVs: blue (#3B7DD8) data dots and fit line — tracking was lost
+        because the vesicle drifted beyond the field of view, NOT a rupture.
     Population mean panel: grey individual fits, bold black mean, light grey ±1 SD band.
 
     Parameters
     ----------
     fit_data : list of dicts, one per GUV, each containing:
         'guv_id', 't_data', 'y_data', 'y_fit', 'r_um', 'param_str'
-    ruptured_guv_ids : set of guv_id strings that ruptured (coloured red)
+    ruptured_guv_ids     : set of guv_id strings that ruptured (coloured red)
+    out_of_frame_guv_ids : set of guv_id strings lost to the FOV edge (coloured blue)
     """
     n = len(fit_data)
     if n == 0:
@@ -2046,10 +2978,11 @@ def plot_dye_fits_grid(
 
     if ruptured_guv_ids is None:
         ruptured_guv_ids = set()
+    if out_of_frame_guv_ids is None:
+        out_of_frame_guv_ids = set()
 
     C_DATA_SURV = '#888888'   # mid-grey  — surviving data points
     C_FIT_SURV  = '#444444'   # dark grey — surviving fit line
-    C_RUPT      = '#CC2222'   # red       — ruptured GUV (data + fit)
     C_SD_BAND   = '#BBBBBB'   # light grey — ±1 SD shading (distinct from traces)
 
     n_panels = n + 1
@@ -2061,11 +2994,12 @@ def plot_dye_fits_grid(
                              squeeze=False)
 
     for k, d in enumerate(fit_data):
-        ax       = axes[k // ncols][k % ncols]
-        ruptured = str(d['guv_id']) in ruptured_guv_ids
-        c_data   = C_RUPT if ruptured else C_DATA_SURV
-        c_fit    = C_RUPT if ruptured else C_FIT_SURV
-        suffix   = ' (ruptured)' if ruptured else ''
+        ax = axes[k // ncols][k % ncols]
+        status_col, suffix = _guv_status_style(
+            d['guv_id'], ruptured_guv_ids, out_of_frame_guv_ids, shrunk_guv_ids
+        )
+        c_data = status_col if suffix else C_DATA_SURV
+        c_fit  = status_col if suffix else C_FIT_SURV
 
         ax.plot(d['t_data'], d['y_data'], '.', color=c_data,
                 alpha=0.55, ms=3, label='Data' + suffix)
@@ -2073,7 +3007,7 @@ def plot_dye_fits_grid(
                 lw=2.0, label='Fit')
         ax.axvline(0, color='dimgray', ls='--', lw=1.0, label='Pulse', zorder=0)
 
-        title_color = C_RUPT if ruptured else 'black'
+        title_color = status_col if suffix else 'black'
         ax.set_title(
             rf"GUV {d['guv_id']}  (R={d['r_um']:.1f} µm){suffix}"
             f"\n{d['param_str']}",
@@ -2095,8 +3029,10 @@ def plot_dye_fits_grid(
 
     y_stack = []
     for d in fit_data:
-        ruptured = str(d['guv_id']) in ruptured_guv_ids
-        c_fit    = C_RUPT if ruptured else C_FIT_SURV
+        status_col, suffix = _guv_status_style(
+            d['guv_id'], ruptured_guv_ids, out_of_frame_guv_ids, shrunk_guv_ids
+        )
+        c_fit = status_col if suffix else C_FIT_SURV
         mean_ax.plot(d['t_data'], d['y_data'], '.', color=c_fit,
                      alpha=0.18, ms=2)
         mean_ax.plot(d['t_data'], d['y_fit'],  '-', color=c_fit,
@@ -2142,23 +3078,22 @@ def plot_dye_summary(
         experiment_name: str,
         smooth_sigma: float = 0.0,
         ruptured_guv_ids: Optional[set] = None,
+        out_of_frame_guv_ids: Optional[set] = None,
+        shrunk_guv_ids: Optional[set] = None,
 ) -> str:
     """
     Single-panel summary of all normalised dye traces + population mean.
 
     Colour scheme: surviving GUVs in medium grey (#888888), ruptured GUVs
-    in red (#CC2222), bold black mean, light grey (#BBBBBB) ±1 SD band.
+    in red (#CC2222) — a real biological event — out-of-frame GUVs in blue
+    (#3B7DD8) — tracking lost to the vesicle drifting beyond the field of
+    view, NOT a rupture — bold black mean, light grey (#BBBBBB) ±1 SD band.
     """
     t       = aligned['t_aligned']
     arr     = aligned['all_curves_aligned']
     avg     = aligned['average_curve']
     ids     = aligned['valid_guv_ids']
 
-    if ruptured_guv_ids is None:
-        ruptured_guv_ids = set()
-
-    C_SURV  = '#888888'
-    C_RUPT  = '#CC2222'
     C_SD    = '#BBBBBB'
 
     def _smooth(x):
@@ -2174,10 +3109,9 @@ def plot_dye_summary(
     fig, ax = plt.subplots(figsize=(9, 5))
 
     for gid, row in zip(ids, arr):
-        ruptured = str(gid) in ruptured_guv_ids
-        col      = C_RUPT if ruptured else C_SURV
-        lw       = 1.2 if ruptured else 0.9
-        label    = f'GUV {gid} (ruptured)' if ruptured else f'GUV {gid}'
+        col, suffix = _guv_status_style(gid, ruptured_guv_ids, out_of_frame_guv_ids, shrunk_guv_ids)
+        lw    = 1.2 if suffix else 0.9
+        label = f'GUV {gid}{suffix}'
         ax.plot(t, _smooth(row), color=col, alpha=0.70, lw=lw, label=label)
 
     sd       = np.nanstd(arr, axis=0)
