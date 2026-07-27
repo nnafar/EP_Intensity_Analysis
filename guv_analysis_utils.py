@@ -1056,11 +1056,13 @@ def export_background_diagnostics_csv(
     df.to_csv(csv_path, index=False, float_format='%.6f', na_rep='NaN')
 
     if logger is not None and not df.empty:
-        mean_raw   = np.nanmean(df['bg_median_raw'])
-        mean_mad   = np.nanmean(df['bg_scaled_mad_raw'])
+        # Use pandas .mean() to safely handle all-NaN columns without RuntimeWarnings
+        mean_raw   = float(df['bg_median_raw'].mean())
+        mean_mad   = float(df['bg_scaled_mad_raw'].mean())
         active_col = f'frac_excluded_sigma_{sigma_clip_active}'
+        
         if active_col in df.columns:
-            mean_excl_active = np.nanmean(df[active_col])
+            mean_excl_active = float(df[active_col].mean())
             logger.info(
                 f"Background diagnostics: mean raw background = {mean_raw:.2f}, "
                 f"mean scaled-MAD = {mean_mad:.2f}, average fraction excluded "
