@@ -24,6 +24,7 @@ from typing import List, Dict, Any, Optional, Tuple
 import tifffile
 from scipy.signal import find_peaks
 from scipy.ndimage import gaussian_filter1d, map_coordinates
+from scipy.stats import norm as _scipy_norm
 import matplotlib.pyplot as plt
 
 import config as cfg
@@ -52,6 +53,110 @@ def setup_logging(output_folder: str, experiment_name: str,
 # -------------------------------------------------------------------
 # --- 1. TIMESTAMP EXTRACTION ---
 # -------------------------------------------------------------------
+
+def validate_channel_config(logger: Optional[logging.Logger] = None) -> Dict[str, int]:
+    """
+    Resolve and sanity-check the channel roles for the configured input
+    format. Raises rather than silently defaulting.
+
+    Rationale: the ND2 and TIFF branches use DIFFERENT channel orders
+    (ND2 is actin/dye/membrane; TIFF prefixes are membrane/actin/dye), so
+    switching INPUT_FORMAT remaps every channel. Worse, the previous code
+    used `getattr(cfg, 'ND2_CHANNEL_IDX_MEMBRANE', 0)` in several places —
+    a fallback of 0 silently selects the ACTIN channel, which for an Empty
+    (no-cortex) sample is featureless noise. Circles would then be drawn on
+    an empty channel and the run would fail as though tracking were bad.
+
+    Returns a {role: index} dict for ND2 input, or {} for TIFF.
+    """
+    fmt = getattr(cfg, 'INPUT_FORMAT', 'TIFF').upper()
+
+    if fmt == 'ND2':
+        required = {
+            'actin':    'ND2_CHANNEL_IDX_ACTIN',
+            'dye':      'ND2_CHANNEL_IDX_DYE',
+            'membrane': 'ND2_CHANNEL_IDX_MEMBRANE',
+        }
+        roles = {}
+        for role, attr in required.items():
+            if not hasattr(cfg, attr):
+                raise ValueError(
+                    f"config.{attr} is not defined. Channel indices must be "
+                    f"stated explicitly — there is deliberately no default, "
+                    f"because a default of 0 would select the actin channel."
+                )
+            val = getattr(cfg, attr)
+            if not isinstance(val, (int, np.integer)) or val < 0:
+                raise ValueError(f"config.{attr} must be a non-negative int, got {val!r}")
+            roles[role] = int(val)
+
+        if len(set(roles.values())) != len(roles):
+            raise ValueError(
+                f"ND2 channel indices must be distinct, got {roles}. "
+                f"Two roles pointing at the same channel means at least one "
+                f"measurement is reading the wrong data."
+            )
+        if logger:
+            logger.info(f"Channel roles (ND2): {roles}")
+        return roles
+
+    required_tiff = ['ROI_CHANNEL_PREFIX', 'ACTIN_CHANNEL_PREFIX', 'DYE_CHANNEL_PREFIX']
+    for attr in required_tiff:
+        if not getattr(cfg, attr, None):
+            raise ValueError(f"config.{attr} is not defined for INPUT_FORMAT='TIFF'.")
+    prefixes = [getattr(cfg, a) for a in required_tiff]
+    if len(set(prefixes)) != len(prefixes):
+        raise ValueError(f"TIFF channel prefixes must be distinct, got {prefixes}")
+    if logger:
+        logger.info(
+            f"Channel roles (TIFF): roi/membrane={cfg.ROI_CHANNEL_PREFIX}, "
+            f"actin={cfg.ACTIN_CHANNEL_PREFIX}, dye={cfg.DYE_CHANNEL_PREFIX}"
+        )
+    return {}
+
+
+def check_channel_assignment(stack_by_role: Dict[str, np.ndarray],
+                             logger: Optional[logging.Logger] = None) -> None:
+    """
+    Cheap empirical check that the channel nominated as 'membrane' really is
+    the one with ring-like structure. Warns; does not raise, because a faint
+    membrane label is a legitimate (if unhappy) experimental condition.
+
+    Uses spatial contrast on frame 0 as a proxy: a ring channel has a much
+    heavier bright tail than a featureless one.
+    """
+    scores = {}
+    for role, stack in stack_by_role.items():
+        if stack is None:
+            continue
+        f0 = np.asarray(stack[0], dtype=np.float64)
+        med = np.median(f0)
+        mad = np.median(np.abs(f0 - med)) * 1.4826
+        if mad <= 0:
+            scores[role] = 0.0
+            continue
+        scores[role] = float((np.percentile(f0, 99.9) - med) / mad)
+
+    if not scores or 'membrane' not in scores:
+        return
+
+    best = max(scores, key=scores.get)
+    msg = "Channel structure scores (higher = more ring/point structure): " + \
+          ", ".join(f"{r}={s:.1f}" for r, s in sorted(scores.items(), key=lambda kv: -kv[1]))
+    if logger:
+        logger.info(msg)
+    if best != 'membrane':
+        warn = (
+            f"CHANNEL ASSIGNMENT WARNING: '{best}' has stronger ring-like "
+            f"structure than the channel configured as 'membrane'. Verify "
+            f"ND2_CHANNEL_IDX_* against your acquisition order before trusting "
+            f"this run."
+        )
+        if logger:
+            logger.warning(warn)
+        else:
+            print(warn)
+
 
 def _apply_fallback_schedule(num_frames: int) -> Tuple[np.ndarray, float]:
     """Fallback routine: applies config schedule, or defaults to constant FPS."""
@@ -151,19 +256,47 @@ def create_manual_timestamps(num_frames: int, fallback_fps: float = 1.0) -> Tupl
 # --- 2. KINETIC MODELS ---
 # -------------------------------------------------------------------
 
-# Dye Influx
+# ---------------------------------------------------------------------
+# Amplitude-parameterised forms (PREFERRED — these are what the fitter
+# uses). Writing the models in terms of an explicit amplitude A >= 0
+# rather than an endpoint pair (I0, Iinf) is what makes the 1EXP model a
+# strict special case of the 2EXP model: set a2 = 0 and the two are
+# identical. That guarantees RSS_2EXP <= RSS_1EXP at a true optimum, which
+# is the precondition for AICc/BIC model selection to mean anything.
+#
+# The endpoint-parameterised forms below are retained for backwards
+# compatibility with saved results, but must not be used for new fits:
+# with (I0, Iinf) free and independently bounded, the "amplitude"
+# (I0 - Iinf) can go negative, admitting a rising exponential for an
+# efflux — a branch the 2EXP form (a1, a2 >= 0) cannot reach.
+# ---------------------------------------------------------------------
+
+def efflux_1exp_amp(t, Iinf, A, tau, D=0):
+    """Efflux, amplitude form: decays from Iinf + A down to Iinf. A >= 0."""
+    return Iinf + A * np.exp(-t / tau) + D * t
+
+def efflux_2exp(t, Iinf, a1, tau1, a2, tau2, D=0):
+    """Efflux, two components. a2 = 0 reproduces efflux_1exp_amp exactly."""
+    return Iinf + a1 * np.exp(-t / tau1) + a2 * np.exp(-t / tau2) + D * t
+
+def influx_1exp_amp(t, Iinf, A, tau, D=0):
+    """Influx, amplitude form: rises from Iinf - A up to Iinf. A >= 0."""
+    return Iinf - A * np.exp(-t / tau) + D * t
+
+def influx_2exp_amp(t, Iinf, a1, tau1, a2, tau2, D=0):
+    """Influx, two components. a2 = 0 reproduces influx_1exp_amp exactly."""
+    return Iinf - a1 * np.exp(-t / tau1) - a2 * np.exp(-t / tau2) + D * t
+
+# --- Deprecated endpoint-parameterised forms (do not use for new fits) ---
+
 def influx_1exp(t, I0, Iinf, tau, D=0):
     return I0 + (Iinf - I0) * (1 - np.exp(-t / tau)) + D * t
 
 def influx_2exp(t, I0, a1, tau1, a2, tau2, D=0):
     return I0 + a1 * (1 - np.exp(-t / tau1)) + a2 * (1 - np.exp(-t / tau2)) + D * t
 
-# Dye Efflux
 def efflux_1exp(t, I0, Iinf, tau, D=0):
     return Iinf + (I0 - Iinf) * np.exp(-t / tau) + D * t
-
-def efflux_2exp(t, Iinf, a1, tau1, a2, tau2, D=0):
-    return Iinf + a1 * np.exp(-t / tau1) + a2 * np.exp(-t / tau2) + D * t
 
 # -------------------------------------------------------------------
 # --- 2b. MODEL SELECTION (AIC/AICc/BIC) ---
@@ -773,7 +906,7 @@ def track_guv_across_frames(
     """
 
     centers:     List[Optional[Tuple]]      = [None] * n_frames
-    radii:       List[Optional[int]]        = [None] * n_frames
+    radii:       List[Optional[float]]      = [None] * n_frames
     ellipses:    List[Optional[Dict]]       = [None] * n_frames 
     ring_scores: List[float]                = [0.0]  * n_frames
     intensity_trace  = np.full(n_frames, np.nan)
@@ -846,7 +979,7 @@ def track_guv_across_frames(
         new_a  = max(3.0, np.clip(det_axes[0], axes[0] - max_da, axes[0] + max_da))
         new_b  = max(3.0, np.clip(det_axes[1], axes[1] - max_db, axes[1] + max_db))
         new_axes = (new_a, new_b)
-        new_avg_r = int((new_a + new_b) / 2.0)
+        new_avg_r = float((new_a + new_b) / 2.0)
 
         img_shape = frame.shape[:2]
 
@@ -855,21 +988,35 @@ def track_guv_across_frames(
             membrane_half_width, bg_buffer, bg_width
         )
 
-        # Extract dye intensity/background right away
+        # Extract dye intensity/background right away.
+        # NOTE: this is a provisional estimate. recompute_background_traces()
+        # overwrites background_trace later with the neighbour-excluded,
+        # sigma-clipped version. Both use the same estimator and the same
+        # blur setting so the provisional and final values are comparable.
         if dye_stack is not None:
             dye_frame = dye_stack[i]
             if dye_frame is not None:
-                # Apply Gaussian Blur (kernel size 5x5, sigma 1.5)
-                dye_frame_blurred = cv2.GaussianBlur(dye_frame, (5, 5), 1.5)
-                
-                inner_px = dye_frame_blurred[inner_mask]
+                if getattr(cfg, 'PHOTOMETRY_BLUR', False):
+                    k = int(getattr(cfg, 'PHOTOMETRY_BLUR_KERNEL', 5))
+                    s = float(getattr(cfg, 'PHOTOMETRY_BLUR_SIGMA', 1.5))
+                    dye_frame_px = cv2.GaussianBlur(dye_frame, (k, k), s)
+                else:
+                    dye_frame_px = dye_frame
+
+                inner_px = dye_frame_px[inner_mask]
                 if inner_px.size > 0:
                     intensity_trace[i] = float(np.mean(inner_px))
-                bg_px = dye_frame_blurred[bg_mask]
+                bg_px = dye_frame_px[bg_mask]
                 if bg_px.size > 0:
-                    background_trace[i] = float(np.median(bg_px))
+                    # Same low-quantile anchor as recompute_background_traces,
+                    # so the provisional and final estimates are comparable.
+                    background_trace[i] = float(np.percentile(
+                        bg_px, float(getattr(cfg, 'BG_PERCENTILE', 15.0))))
 
         centers[i]  = det_center
+        # Keep sub-pixel precision. Previously int(), which quantised radius
+        # to whole pixels (0.11 um) — 5% in r and ~16% in volume for the
+        # smallest vesicles, and the float value was already available here.
         radii[i]    = new_avg_r
         ellipses[i] = {'center': det_center, 'axes': new_axes, 'angle': det_angle}
         n_valid    += 1
@@ -936,13 +1083,90 @@ def recompute_background_traces(
         bg_buffer: int,
         bg_width: int,
         img_shape: tuple,
-        **kwargs  # Absorbs legacy arguments like sigma_clip
+        **kwargs,   # accepted and ignored; see note on deprecated knobs below
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
-    
-    bg_median = np.full(n_frames, np.nan)
-    bg_std    = np.full(n_frames, np.nan)
-    n_excl    = np.zeros(n_frames, dtype=int)
-    
+    """
+    Per-frame background estimate for ONE GUV's annulus, using a low-quantile
+    anchor rather than neighbour exclusion.
+
+    METHOD AND WHY
+    --------------
+    The background level is taken as the BG_PERCENTILE-th percentile (default
+    15th) of the annulus pixels. The dark interstitial medium occupies the
+    lowest part of the intensity distribution, so as long as at least that
+    fraction of the annulus is genuine background, the estimate stays inside
+    the background distribution.
+
+    This deliberately replaces position-based neighbour exclusion. Exclusion
+    masks can only remove vesicles that were manually circled and are being
+    tracked; untracked GUVs, debris and out-of-plane halo are invisible to
+    them by construction, and in a crowded field those are the dominant
+    contaminants. An order statistic does not need to know the contaminant is
+    there. Simulation (400-px annulus, background N(102, 3), contaminants
+    N(120, 8)) gives a p15 bias of -1.04 sigma at zero contamination rising
+    to only +0.85 sigma at 84% contamination.
+
+    NOTE ON THE LEVEL
+    -----------------
+    A percentile is robust but is not an unbiased estimate of the background
+    MEAN: for Gaussian background the p-th percentile sits |z(p)|*sigma below
+    it (1.036 sigma at p15). This shifts the normalised curve by an affine
+    constant, so the fitted TAU is unaffected — only the apparent plateau
+    Iinf is offset upward. Do not read a fitted Iinf as "fraction of dye
+    retained" without accounting for this.
+
+    DEPRECATED ARGUMENTS
+    --------------------
+    exclusion_padding / min_bg_pixels / neighbor_hold_frames / sigma_clip are
+    accepted for call-site compatibility and ignored. They belonged to the
+    position-exclusion method. They are ignored LOUDLY (logged once) rather
+    than silently, which is how the previous `**kwargs  # absorbs legacy
+    arguments` version hid the fact that four documented config knobs had no
+    effect.
+
+    Returns
+    -------
+    (bg_estimate, bg_std, n_excluded, diagnostics)
+        bg_estimate : per-frame background level (the low quantile)
+        bg_std      : per-pixel std of the background, estimated from the
+                      LOW-QUANTILE SPREAD so it is not inflated by the bright
+                      contaminating tail:
+                          sigma = (p50_lo - p_anchor) / (z(0.50_lo) - z(p))
+                      computed on UNBLURRED pixels. This is a real per-pixel
+                      sigma, comparable to shot noise, and is what
+                      MIN_PREPULSE_SEPARATION_SIGMA divides by.
+        n_excluded  : always zeros (no exclusion is performed by this method)
+    """
+    if kwargs:
+        _log = logging.getLogger(__name__)
+        _log.debug(
+            "recompute_background_traces: ignoring deprecated argument(s) %s "
+            "- the low-quantile method does not use neighbour exclusion.",
+            sorted(kwargs.keys()),
+        )
+
+    bg_estimate = np.full(n_frames, np.nan)
+    bg_std      = np.full(n_frames, np.nan)
+    n_excl      = np.zeros(n_frames, dtype=int)
+
+    n_total_arr  = np.zeros(n_frames, dtype=int)
+    bg_p_anchor  = np.full(n_frames, np.nan)
+    bg_p_lower   = np.full(n_frames, np.nan)
+    bg_median_a  = np.full(n_frames, np.nan)
+
+    pct    = float(getattr(cfg, 'BG_PERCENTILE', 15.0))
+    pct_lo = float(getattr(cfg, 'BG_SIGMA_UPPER_PERCENTILE', 40.0))
+
+    # Gaussian z-scores of the two quantiles used for the scale estimate.
+    from scipy.stats import norm as _norm
+    z_anchor = float(_norm.ppf(pct / 100.0))       # negative, e.g. -1.0364 at p15
+    z_lower  = float(_norm.ppf(pct_lo / 100.0))    # negative, e.g. -0.2533 at p40
+    dz = z_lower - z_anchor
+
+    use_blur = bool(getattr(cfg, 'PHOTOMETRY_BLUR', False))
+    k_blur   = int(getattr(cfg, 'PHOTOMETRY_BLUR_KERNEL', 5))
+    s_blur   = float(getattr(cfg, 'PHOTOMETRY_BLUR_SIGMA', 1.5))
+
     target_ellipses = all_ellipses[target_idx]
 
     for i in range(n_frames):
@@ -954,8 +1178,8 @@ def recompute_background_traces(
         if raw_frame is None:
             continue
 
-        # Retain the identical Gaussian Blur
-        frame = cv2.GaussianBlur(raw_frame, (5, 5), 1.5)
+        frame = (cv2.GaussianBlur(raw_frame, (k_blur, k_blur), s_blur)
+                 if use_blur else raw_frame)
 
         _, _, bg_mask = generate_vectorized_masks(
             img_shape, el['center'], el['axes'], el['angle'],
@@ -964,31 +1188,144 @@ def recompute_background_traces(
         if bg_mask is None or not bg_mask.any():
             continue
 
-        pixels = frame[bg_mask]
-        if len(pixels) > 0:
-            # Anchor the background to the dark interstitial space (15th percentile)
-            bg_median[i] = float(np.percentile(pixels, 15))
-            
-            # Approximate standard deviation using only the dark half of the distribution
-            dark_pixels = pixels[pixels <= np.median(pixels)]
-            if len(dark_pixels) > 0:
-                bg_std[i] = float(np.std(dark_pixels))
+        pixels = frame[bg_mask].astype(np.float64)
+        if pixels.size == 0:
+            continue
 
-    # Dummy diagnostics to prevent breaking the export_background_diagnostics_csv function
-    dummy_int = np.zeros(n_frames, dtype=int)
-    dummy_float = np.full(n_frames, np.nan)
+        n_total_arr[i] = int(pixels.size)
+
+        # --- background level: low-quantile anchor -------------------------
+        q_anchor, q_lower = np.percentile(pixels, [pct, pct_lo])
+        bg_p_anchor[i] = float(q_anchor)
+        bg_p_lower[i]  = float(q_lower)
+        med_ann = float(np.median(pixels))
+        bg_median_a[i] = med_ann
+
+        # --- background LEVEL ------------------------------------------------
+        # 'median'     : the annulus median. On an uncontaminated ring this
+        #                equals the true bath mean, which is the level a
+        #                fully-emptied vesicle equilibrates to — so the
+        #                normalisation runs correctly from 1 down to 0.
+        # 'percentile' : the low quantile itself. Maximally robust, but it
+        #                targets a low quantile of the background rather than
+        #                its level, placing the normalisation's zero point
+        #                roughly |z(p)|*sigma too low. In the 260422 Empty run
+        #                that put the apparent floor at 0.34 for vesicles that
+        #                had in fact emptied completely.
+        # sigma is estimated from the low-quantile spread either way, so the
+        # scale estimate stays robust regardless of this choice.
+        if str(getattr(cfg, 'BG_LEVEL_ESTIMATOR', 'median')).lower() == 'median':
+            bg_estimate[i] = med_ann
+        else:
+            bg_estimate[i] = float(q_anchor)
+
+        # --- background scale: spread between two LOW quantiles ------------
+        # Both quantiles sit in the dark part of the distribution, so the
+        # bright contaminating tail does not enter. Contrast this with the
+        # previous estimator, np.std(pixels[pixels <= median]) on a blurred
+        # frame, which understated sigma several-fold: the blur suppresses
+        # per-pixel variance and the half-truncation costs a further ~0.4x.
+        if dz > 0:
+            sigma = (q_lower - q_anchor) / dz
+            if np.isfinite(sigma) and sigma > 0:
+                bg_std[i] = float(sigma)
+
     diagnostics = {
-        'n_pixels_total': np.full(n_frames, 100),
-        'n_excluded_position': dummy_int,
-        'n_excluded_stats': dummy_int,
-        'bg_median_raw': bg_median,
-        'bg_mean_raw': dummy_float,
-        'bg_std_raw': bg_std,
-        'bg_mad_raw': dummy_float,
-        'bg_scaled_mad_raw': dummy_float,
+        'n_pixels_total':      n_total_arr,
+        'bg_estimate':         bg_estimate,
+        'bg_percentile_raw':   bg_p_anchor,
+        'bg_percentile_upper': bg_p_lower,
+        'bg_median_raw':       bg_median_a,
+        'bg_std_raw':          bg_std,
     }
 
-    return bg_median, bg_std, n_excl, diagnostics
+    return bg_estimate, bg_std, n_excl, diagnostics
+
+
+def measure_far_field_background(
+        dye_stack: np.ndarray,
+        n_frames: int,
+        all_ellipses: List[List[Optional[Dict]]],
+        img_shape: tuple,
+        exclusion_factor: float = 2.5,
+        n_sample_frames: int = 12,
+        logger: Optional[logging.Logger] = None,
+) -> Dict[str, Any]:
+    """
+    Estimate the bath level FAR from any tracked vesicle, to test whether the
+    per-GUV annulus is locally elevated.
+
+    WHY THIS EXISTS
+    ---------------
+    The plateau model predicted that a fully-emptied vesicle would settle at
+    the annulus MEAN, i.e. |z(p)|*sigma above the p-quantile anchor, giving an
+    apparent residual of delta/sep0. The 260422 Empty run measured plateaus at
+    ~0 instead: the lumen mean falls to the annulus p15 exactly, 1.04 sigma
+    below where the model said it would stop. Two explanations fit:
+
+      (a) the annulus is locally ELEVATED by out-of-focus haze and PSF tails
+          from the vesicle itself and its neighbours, by roughly delta. The
+          quantile anchor then happens to land on the true bath level and the
+          normalisation is accidentally right; or
+      (b) the interior measurement is biased low by roughly delta.
+
+    Comparing the annulus statistics against a far-field region separates
+    them. If far-field p15 is well BELOW annulus p15, the annulus is elevated
+    and (a) holds. If they agree, the discrepancy is on the interior side and
+    (b) holds.
+
+    Note the far field in a crowded FOV still contains untracked vesicles, so
+    its mean is an overestimate of the bath; the p15 and median are the
+    meaningful comparisons.
+    """
+    h, w = img_shape[:2]
+    idx = np.unique(np.linspace(0, max(n_frames - 1, 0),
+                                min(n_sample_frames, n_frames)).astype(int))
+    yy, xx = np.ogrid[0:h, 0:w]
+
+    rows = []
+    for i in idx:
+        frame = dye_stack[i]
+        if frame is None:
+            continue
+        keep = np.ones((h, w), dtype=bool)
+        for ell_list in all_ellipses:
+            el = ell_list[i] if i < len(ell_list) else None
+            if el is None:
+                continue
+            cx, cy = el['center']
+            rad = max(el['axes']) * exclusion_factor
+            keep &= ((xx - cx) ** 2 + (yy - cy) ** 2) > rad ** 2
+        px = np.asarray(frame, dtype=np.float64)[keep]
+        if px.size < 500:
+            continue
+        rows.append({
+            'frame': int(i),
+            'n_pixels': int(px.size),
+            'far_p15':    float(np.percentile(px, 15)),
+            'far_median': float(np.median(px)),
+            'far_mean':   float(np.mean(px)),
+        })
+
+    if not rows:
+        if logger:
+            logger.warning("Far-field background: no frame had enough pixels "
+                           "clear of tracked vesicles; diagnostic skipped.")
+        return {}
+
+    df = pd.DataFrame(rows)
+    out = {k: float(df[k].median()) for k in ('far_p15', 'far_median', 'far_mean')}
+    out['n_frames_used'] = len(df)
+    out['mean_n_pixels'] = float(df['n_pixels'].mean())
+
+    if logger:
+        logger.info(
+            f"Far-field background ({len(df)} frames, "
+            f"{out['mean_n_pixels']:.0f} px clear of tracked GUVs): "
+            f"p15={out['far_p15']:.2f}, median={out['far_median']:.2f}, "
+            f"mean={out['far_mean']:.2f}"
+        )
+    return out
 
 
 def export_background_diagnostics_csv(
@@ -996,56 +1333,48 @@ def export_background_diagnostics_csv(
         time_array: np.ndarray,
         output_folder: str,
         experiment_name: str,
-        sigma_clip_active: float,
+        sigma_clip_active: float = 0.0,   # deprecated, retained for call compat
         logger: Optional[logging.Logger] = None,
 ) -> str:
     """
-    Writes a tidy long-format CSV (one row per GUV per frame) of the raw
-    background statistics and candidate sigma-clip exclusion fractions
-    produced by `recompute_background_traces`, so `BG_SIGMA_CLIP` can be
-    tuned from real data instead of guessed.
+    Long-format CSV (one row per GUV per frame) of the background statistics
+    produced by `recompute_background_traces`.
 
-    How to use it to pick BG_SIGMA_CLIP
-    ------------------------------------
-    - `frac_excluded_sigma_X` columns show what fraction of ring pixels
-      would be dropped at threshold X, per frame. On a "clean" frame (no
-      neighbor nearby) this should be small and roughly constant across
-      candidates — if a low threshold (e.g. 2.0) is already excluding a
-      meaningful fraction on clean frames, it's too aggressive and will
-      eat into legitimate background pixels.
-    - On frames where `n_excluded_position` is 0 but you independently know
-      (e.g. by eye, from the ROI images) that an untracked neighbor is
-      present, look at which threshold first produces a large
-      `frac_excluded_sigma_X` jump — that's roughly the smallest threshold
-      that still catches it.
-    - `bg_std_raw` vs `bg_scaled_mad_raw` compares the ordinary std (pulled
-      up by contamination) against the outlier-robust MAD-based scale —
-      a large gap between them is itself a sign of contamination.
+    Every column here is MEASURED. The previous version emitted a block of
+    placeholder columns -- n_pixels_total hardcoded to 100, exclusion counts
+    filled with zeros, and three columns that were entirely NaN -- which made
+    the export look like it was reporting on machinery that did not exist.
+    Columns tied to the abandoned neighbour-exclusion method
+    (n_excluded_position, n_excluded_stats, frac_excluded_sigma_*,
+    bg_mad_raw, bg_scaled_mad_raw) have been removed rather than zero-filled.
 
-    Also logs a one-line summary (mean raw background level, mean
-    scaled-MAD, and the average exclusion fraction at the currently
-    configured `sigma_clip_active`) if a logger is provided.
+    Columns
+    -------
+    n_pixels_total      actual number of annulus pixels sampled
+    bg_estimate         background level used downstream (the low quantile)
+    bg_percentile_raw   the anchor quantile itself (== bg_estimate)
+    bg_percentile_upper the upper of the two low quantiles used for sigma
+    bg_median_raw       annulus median, for reference. A LARGE gap between
+                        bg_median_raw and bg_estimate indicates heavy
+                        contamination of the annulus: the median has been
+                        pulled up by neighbours while the quantile anchor
+                        has not. This is the diagnostic for "how crowded is
+                        this GUV's neighbourhood".
+    bg_std_raw          per-pixel background sigma from the low-quantile
+                        spread. This is what MIN_PREPULSE_SEPARATION_SIGMA
+                        divides by.
     """
     rows = []
+    optional = ('bg_estimate', 'bg_percentile_raw', 'bg_percentile_upper',
+                'bg_median_raw', 'bg_std_raw')
     for gid, diag in diagnostics_per_guv.items():
         n_frames = len(diag['n_pixels_total'])
         for i in range(n_frames):
             t = float(time_array[i]) if i < len(time_array) else np.nan
-            row = {
-                'guv_id': gid,
-                'frame': i,
-                'time_s': t,
-                'n_pixels_total':      diag['n_pixels_total'][i],
-                'n_excluded_position': diag['n_excluded_position'][i],
-                'n_excluded_stats':    diag['n_excluded_stats'][i],
-                'bg_median_raw':       diag['bg_median_raw'][i],
-                'bg_mean_raw':         diag['bg_mean_raw'][i],
-                'bg_std_raw':          diag['bg_std_raw'][i],
-                'bg_mad_raw':          diag['bg_mad_raw'][i],
-                'bg_scaled_mad_raw':   diag['bg_scaled_mad_raw'][i],
-            }
-            for key in diag:
-                if key.startswith('frac_excluded_sigma_'):
+            row = {'guv_id': gid, 'frame': i, 'time_s': t,
+                   'n_pixels_total': diag['n_pixels_total'][i]}
+            for key in optional:
+                if key in diag:
                     row[key] = diag[key][i]
             rows.append(row)
 
@@ -1056,23 +1385,37 @@ def export_background_diagnostics_csv(
     df.to_csv(csv_path, index=False, float_format='%.6f', na_rep='NaN')
 
     if logger is not None and not df.empty:
-        # Use pandas .mean() to safely handle all-NaN columns without RuntimeWarnings
-        mean_raw   = float(df['bg_median_raw'].mean())
-        mean_mad   = float(df['bg_scaled_mad_raw'].mean())
-        active_col = f'frac_excluded_sigma_{sigma_clip_active}'
-        
-        if active_col in df.columns:
-            mean_excl_active = float(df[active_col].mean())
-            logger.info(
-                f"Background diagnostics: mean raw background = {mean_raw:.2f}, "
-                f"mean scaled-MAD = {mean_mad:.2f}, average fraction excluded "
-                f"at sigma_clip={sigma_clip_active} = {mean_excl_active:.3%}."
-            )
-        else:
-            logger.info(
-                f"Background diagnostics: mean raw background = {mean_raw:.2f}, "
-                f"mean scaled-MAD = {mean_mad:.2f}."
-            )
+        mean_bg  = float(df['bg_estimate'].mean()) if 'bg_estimate' in df else np.nan
+        mean_sig = float(df['bg_std_raw'].mean())  if 'bg_std_raw' in df else np.nan
+        mean_n   = float(df['n_pixels_total'].mean())
+        logger.info(
+            f"Background diagnostics: mean level = {mean_bg:.2f}, "
+            f"mean per-pixel sigma = {mean_sig:.2f}, "
+            f"mean annulus size = {mean_n:.0f} px."
+        )
+        # Crowding = how far the annulus MEDIAN sits above its own low
+        # QUANTILE, in sigma. This must reference bg_percentile_raw, not
+        # bg_estimate: under the default BG_LEVEL_ESTIMATOR = 'median',
+        # bg_estimate IS bg_median_raw, so the old form subtracted a column
+        # from itself and reported exactly 0.00 for every frame of every
+        # dataset — a diagnostic that could never fire, and whose 0.00 looked
+        # reassuring next to the stated 1.04 reference when it meant nothing.
+        if 'bg_median_raw' in df and 'bg_percentile_raw' in df:
+            gap = (df['bg_median_raw'] - df['bg_percentile_raw']) / df['bg_std_raw']
+            gap = gap.replace([np.inf, -np.inf], np.nan).dropna()
+            if len(gap):
+                expect = -float(_scipy_norm.ppf(
+                    getattr(cfg, 'BG_PERCENTILE', 15.0) / 100.0))
+                logger.info(
+                    f"Annulus crowding: (median - p{getattr(cfg, 'BG_PERCENTILE', 15.0):.0f})/sigma "
+                    f"has median {gap.median():.2f}, 90th pct "
+                    f"{gap.quantile(0.9):.2f}. For an uncontaminated Gaussian "
+                    f"annulus this should sit near {expect:.2f}; substantially "
+                    f"larger values mean neighbours are filling the ring, "
+                    f"substantially smaller values mean the annulus pixel "
+                    f"distribution is degenerate (saturated, masked out, or "
+                    f"too coarsely quantised to estimate a spread from)."
+                )
 
     return csv_path
 
@@ -1284,19 +1627,34 @@ def classify_guv_fates(
         ruptured_guv_ids: set,
         out_of_frame_guv_ids: set,
         shrinkage_fraction_threshold: float = 0.15,
+        growth_fraction_threshold: float = 0.15,
         terminal_n_frames: int = 3,
+        growth_use_peak_radius: bool = False,
+        pulse_frame: Optional[int] = None,
 ) -> Tuple[Dict[str, str], pd.DataFrame]:
     """
     Refines the tracker's binary RUPTURED/OUT_OF_FRAME exit classification
-    into four mutually exclusive fates, adding a SHRUNK category:
+    into five mutually exclusive fates, adding SHRUNK and GROWN categories.
 
-      'OUT_OF_FRAME' - unchanged: tracking was lost because the vesicle
-                        drifted past the field-of-view edge. A tracking
-                        limitation, not a biological event.
-      'SHRUNK'       - the vesicle's radius declined by at least
-                        shrinkage_fraction_threshold from its own pre-pulse
-                        baseline (norm_radius, from normalize_tracking_data),
-                        regardless of how tracking ended. This deliberately
+    The five fates are assigned by a STRICT PRIORITY ORDER, because the
+    underlying criteria are not mutually exclusive on their own (a vesicle
+    can deflate 20 % and then drift off the edge of the frame; a vesicle can
+    swell 20 % and then burst).  The order below encodes which observation
+    is the more reliable statement about that vesicle:
+
+      1. 'OUT_OF_FRAME' - the ring score stayed stable right up to the point
+                        the vesicle crossed the field-of-view boundary, so
+                        tracking ended for a purely geometric reason.  This
+                        takes absolute priority because the vesicle's
+                        eventual fate is UNOBSERVED — it may well have gone
+                        on to shrink or rupture outside the FOV, and
+                        assigning it any biological fate would fabricate an
+                        observation.  A tracking limitation, not an event.
+
+      2. 'SHRUNK'      - the radius declined by at least
+                        shrinkage_fraction_threshold from the vesicle's own
+                        pre-pulse baseline (norm_radius, from
+                        normalize_tracking_data).  This deliberately
                         overrides a raw 'RUPTURED' tag: a vesicle that
                         deflates gradually and only THEN drops below the
                         ring-detector's minimum resolvable size will also
@@ -1305,19 +1663,66 @@ def classify_guv_fates(
                         not a membrane burst — lumping the two together
                         would misrepresent slow deflation as catastrophic
                         rupture.
-      'RUPTURED'     - ring score collapsed abruptly WITHOUT a preceding,
-                        sustained radius decline — i.e. the vesicle was
-                        still close to its pre-pulse size right up to the
-                        point tracking was lost. This is what's left of the
-                        tracker's raw 'RUPTURED' tag after shrinkage-driven
-                        exits are pulled out.
-      'SURVIVED'     - tracked through to the end of the movie with no
-                        meaningful (< threshold) radius loss.
 
+      3. 'RUPTURED'    - ring score collapsed abruptly WITHOUT a preceding,
+                        sustained radius decline — i.e. the vesicle was
+                        still close to (or above) its pre-pulse size right
+                        up to the point tracking was lost.  Note this
+                        outranks GROWN, unlike SHRUNK: the shrinkage
+                        override exists because deflation can MASQUERADE as
+                        a rupture-score exit, whereas swelling cannot.
+                        Swell-then-burst is a genuine, and in fact the
+                        canonical, electroporation failure mode, so a
+                        vesicle that expands and then bursts is scored as
+                        the rupture it is.
+
+      4. 'GROWN'       - the radius increased by at least
+                        growth_fraction_threshold above the pre-pulse
+                        baseline, with tracking intact throughout.
+
+      5. 'SURVIVED'    - tracked through to the end of the movie with no
+                        meaningful (< either threshold) radius change.
+
+    A caution on interpreting GROWN, since it is the fate most vulnerable to
+    artifact: a lipid bilayer cannot be stretched by more than a few percent
+    in AREA before lysis, so a >15 % radius gain (~32 % area, ~52 % volume)
+    is NOT achievable by osmotic inflation of an already-taut vesicle.  Real
+    growth of this magnitude therefore implies either (i) an initially
+    floppy/deflated vesicle with stored excess membrane area rounding up as
+    it tenses — the physically plausible and biologically interesting case —
+    or (ii) fusion with a neighbour, or (iii) the ring detector jumping onto
+    an adjacent object or a diffraction halo.  Because case (i) is
+    accompanied by a rise in circularity toward 1 while cases (ii) and (iii)
+    generally are not, 'terminal_norm_circularity' is exported alongside the
+    radius metrics so GROWN calls can be triaged rather than trusted blind.
+
+    Parameters
+    ----------
+    shrinkage_fraction_threshold : fractional radius LOSS at or above which a
+        vesicle is called SHRUNK (0.15 = 15 % radius loss).
+    growth_fraction_threshold : fractional radius GAIN at or above which a
+        vesicle is called GROWN (0.15 = 15 % radius gain).  Kept as a
+        separate parameter from the shrinkage threshold rather than reusing
+        one symmetric value, because equal fractional radius changes are not
+        equivalent in area or volume (-15 % radius = -39 % volume, but
+        +15 % radius = +52 % volume) and the two directions have different
+        noise floors and different physical ceilings.
     terminal_n_frames : how many of a GUV's LAST valid tracked frames are
         averaged (in norm_radius) to get its terminal size — smooths
         single-frame ring-detection noise right at the endpoint rather than
         keying the whole classification off one potentially noisy frame.
+    growth_use_peak_radius : if True, the growth criterion is evaluated on
+        the PEAK post-pulse norm_radius instead of the terminal value.
+        Post-electroporation swelling is often transient — a vesicle can
+        inflate, reseal, and re-equilibrate back toward baseline — so a
+        terminal-frame criterion will miss it.  Set True to capture
+        transient swelling as GROWN; leave False to require the expansion to
+        be persistent (the more conservative, symmetric-with-SHRUNK
+        definition).  Requires pulse_frame; silently falls back to the
+        terminal criterion if pulse_frame is None.
+    pulse_frame : frame index of the electroporation pulse.  Only used to
+        restrict the peak-radius search to post-pulse frames when
+        growth_use_peak_radius is True.
 
     Requires df_track already have 'norm_radius' (radius / pre-pulse mean
     radius per GUV) — i.e. normalize_tracking_data() must be called first.
@@ -1326,13 +1731,34 @@ def classify_guv_fates(
     -------
     (fate_map, df_fate)
         fate_map : dict of guv_id (str) -> fate label
-        df_fate  : one row per GUV with guv_id, fate, frac_radius_loss
-                   (positive = shrinkage, NaN if no valid radius data or
-                   OUT_OF_FRAME), terminal_norm_radius, exit_reason_raw
-                   (the tracker's original, pre-refinement tag)
+        df_fate  : one row per GUV with
+                   guv_id, fate,
+                   frac_radius_change   (signed; positive = net growth,
+                                         negative = net shrinkage),
+                   frac_radius_loss     (positive = shrinkage; kept for
+                                         backward compatibility),
+                   terminal_norm_radius,
+                   peak_norm_radius_post, min_norm_radius_post
+                                        (post-pulse extremes — diagnostics
+                                         for transient swelling/deflation
+                                         that the terminal value misses),
+                   terminal_norm_circularity
+                                        (QC handle for GROWN calls),
+                   growth_metric_norm_radius
+                                        (the value the growth test actually
+                                         used, so the call is auditable),
+                   exit_reason_raw      (the tracker's original,
+                                         pre-refinement tag)
+
+        Radius metrics are now exported for OUT_OF_FRAME vesicles too
+        (previously NaN).  Their FATE is still OUT_OF_FRAME regardless — the
+        numbers are recorded only so a partial trajectory can be inspected,
+        not so it can be reclassified.
     """
     fate_map: Dict[str, str] = {}
     records = []
+
+    has_circ = 'norm_circularity' in df_track.columns
 
     for gid_raw, g in df_track.groupby('guv_id'):
         gid = str(gid_raw)
@@ -1342,40 +1768,65 @@ def classify_guv_fates(
             None
         )
 
-        if exit_reason_raw == 'OUT_OF_FRAME':
-            fate_map[gid] = 'OUT_OF_FRAME'
-            records.append({
-                'guv_id': gid, 'fate': 'OUT_OF_FRAME',
-                'frac_radius_loss': np.nan, 'terminal_norm_radius': np.nan,
-                'exit_reason_raw': exit_reason_raw,
-            })
-            continue
+        gs = g.sort_values('frame')
+        norm_r = gs['norm_radius'].dropna().values
 
-        norm_r = g.sort_values('frame')['norm_radius'].dropna().values
+        # --- terminal size ------------------------------------------------
         if len(norm_r) == 0:
+            terminal_norm_r = np.nan
+            frac_change = np.nan
+        else:
+            terminal_norm_r = float(np.mean(norm_r[-terminal_n_frames:]))
+            frac_change = terminal_norm_r - 1.0   # signed: + = growth
+
+        # --- post-pulse extremes (diagnostics + optional growth metric) ---
+        if pulse_frame is not None:
+            post = gs[gs['frame'] >= pulse_frame]['norm_radius'].dropna().values
+        else:
+            post = norm_r
+        peak_post = float(np.max(post)) if len(post) else np.nan
+        min_post = float(np.min(post)) if len(post) else np.nan
+
+        # --- terminal circularity (GROWN triage handle) -------------------
+        if has_circ:
+            norm_c = gs['norm_circularity'].dropna().values
+            terminal_norm_c = (float(np.mean(norm_c[-terminal_n_frames:]))
+                               if len(norm_c) else np.nan)
+        else:
+            terminal_norm_c = np.nan
+
+        # --- which value the growth test uses -----------------------------
+        if growth_use_peak_radius and pulse_frame is not None and np.isfinite(peak_post):
+            growth_metric = peak_post
+        else:
+            growth_metric = terminal_norm_r
+
+        # --- fate assignment, in strict priority order --------------------
+        if exit_reason_raw == 'OUT_OF_FRAME':
+            fate = 'OUT_OF_FRAME'
+        elif not np.isfinite(frac_change):
+            # No usable radius data at all: fall back to the tracker's tag.
             fate = exit_reason_raw or 'SURVIVED'
-            fate_map[gid] = fate
-            records.append({
-                'guv_id': gid, 'fate': fate,
-                'frac_radius_loss': np.nan, 'terminal_norm_radius': np.nan,
-                'exit_reason_raw': exit_reason_raw,
-            })
-            continue
-
-        terminal_norm_r = float(np.mean(norm_r[-terminal_n_frames:]))
-        frac_loss = 1.0 - terminal_norm_r   # positive = net shrinkage
-
-        if frac_loss >= shrinkage_fraction_threshold:
+        elif -frac_change >= shrinkage_fraction_threshold:
             fate = 'SHRUNK'
         elif exit_reason_raw == 'RUPTURED':
             fate = 'RUPTURED'
+        elif np.isfinite(growth_metric) and (growth_metric - 1.0) >= growth_fraction_threshold:
+            fate = 'GROWN'
         else:
             fate = 'SURVIVED'
 
         fate_map[gid] = fate
         records.append({
-            'guv_id': gid, 'fate': fate,
-            'frac_radius_loss': frac_loss, 'terminal_norm_radius': terminal_norm_r,
+            'guv_id': gid,
+            'fate': fate,
+            'frac_radius_change': frac_change,
+            'frac_radius_loss': (-frac_change if np.isfinite(frac_change) else np.nan),
+            'terminal_norm_radius': terminal_norm_r,
+            'peak_norm_radius_post': peak_post,
+            'min_norm_radius_post': min_post,
+            'terminal_norm_circularity': terminal_norm_c,
+            'growth_metric_norm_radius': growth_metric,
             'exit_reason_raw': exit_reason_raw,
         })
 
@@ -1892,23 +2343,30 @@ def normalize_actin_curves(
 
 def _guv_status_style(gid, ruptured_guv_ids: Optional[set] = None,
                        out_of_frame_guv_ids: Optional[set] = None,
-                       shrunk_guv_ids: Optional[set] = None) -> Tuple[str, str]:
+                       shrunk_guv_ids: Optional[set] = None,
+                       grown_guv_ids: Optional[set] = None) -> Tuple[str, str]:
     """
     Returns (color, label_suffix) for one GUV based on how its tracking
-    ended. Rupture, shrinkage, and out-of-frame are kept visually and
-    categorically distinct everywhere a plot colors GUVs by status:
-    rupture is an abrupt biological event, shrinkage is a gradual one
-    (and should not be counted as rupture), and drifting out of the
-    tracked field of view is a tracking limitation that should never be
-    counted or read as either.
+    ended. Rupture, shrinkage, growth, and out-of-frame are kept visually
+    and categorically distinct everywhere a plot colors GUVs by status:
+    rupture is an abrupt biological event, shrinkage and growth are gradual
+    ones in opposite directions (neither should be counted as rupture), and
+    drifting out of the tracked field of view is a tracking limitation that
+    should never be read as any of them.
+
+    The test order here mirrors the priority order in classify_guv_fates()
+    so that colouring and classification can never disagree, even if a GUV
+    id is accidentally passed in more than one set.
     """
     gid = str(gid)
-    if gid in (ruptured_guv_ids or set()):
-        return '#CC2222', ' (ruptured)'
-    if gid in (shrunk_guv_ids or set()):
-        return '#E08214', ' (shrunk)'
     if gid in (out_of_frame_guv_ids or set()):
         return '#3B7DD8', ' (lost, out of frame)'
+    if gid in (shrunk_guv_ids or set()):
+        return '#E08214', ' (shrunk)'
+    if gid in (ruptured_guv_ids or set()):
+        return '#CC2222', ' (ruptured)'
+    if gid in (grown_guv_ids or set()):
+        return '#2E9E6B', ' (grown)'
     return '#888888', ''
 
 
@@ -1921,6 +2379,7 @@ def plot_actin_analysis(
         ruptured_guv_ids: Optional[set] = None,
         out_of_frame_guv_ids: Optional[set] = None,
         shrunk_guv_ids: Optional[set] = None,
+        grown_guv_ids: Optional[set] = None,
 ):
     """
     2x2 actin summary figure:
@@ -1964,7 +2423,7 @@ def plot_actin_analysis(
 
     for gid, p_row, l_row, f_row, g_row in zip(
             valid_guv_ids, peak_arr, lumen_arr, fwhm_arr, gini_arr):
-        col, suffix = _guv_status_style(gid, ruptured_guv_ids, out_of_frame_guv_ids, shrunk_guv_ids)
+        col, suffix = _guv_status_style(gid, ruptured_guv_ids, out_of_frame_guv_ids, shrunk_guv_ids, grown_guv_ids)
         lw    = 1.2 if suffix else 0.9
         label = f'GUV {gid}{suffix}'
         ax_cpeak.plot(t, _smooth(p_row), color=col, alpha=0.75, lw=lw, label=label)
@@ -2668,6 +3127,7 @@ def plot_dye_actin_overlay(
         ruptured_guv_ids: Optional[set] = None,
         out_of_frame_guv_ids: Optional[set] = None,
         shrunk_guv_ids: Optional[set] = None,
+        grown_guv_ids: Optional[set] = None,
 ):
     """
     Per-GUV dual-axis figure correlating dye efflux with actin cortex dynamics.
@@ -2752,7 +3212,7 @@ def plot_dye_actin_overlay(
         dye_row = dye_arr[i] if i < len(dye_arr) else np.full_like(t_dye, np.nan)
         act_row = act_arr[i] if i < len(act_arr) else np.full_like(t_act, np.nan)
 
-        col, suffix = _guv_status_style(gid, ruptured_guv_ids, out_of_frame_guv_ids, shrunk_guv_ids)
+        col, suffix = _guv_status_style(gid, ruptured_guv_ids, out_of_frame_guv_ids, shrunk_guv_ids, grown_guv_ids)
         _draw_panel(ax, t_dye, dye_row, t_act, act_row, f'GUV {gid}{suffix}',
                     status_color=col if suffix else None)
 
@@ -2805,6 +3265,7 @@ def plot_dye_fits_grid(
         ruptured_guv_ids: Optional[set] = None,
         out_of_frame_guv_ids: Optional[set] = None,
         shrunk_guv_ids: Optional[set] = None,
+        grown_guv_ids: Optional[set] = None,
 ) -> str:
     """
     Multigrid plot of per-GUV kinetic fits — one subplot per GUV plus a
@@ -2817,6 +3278,8 @@ def plot_dye_fits_grid(
         burst while the vesicle was still close to its pre-pulse size.
     Shrunk GUVs      : orange (#E08214) data dots and fit line — gradual
         radius decline (deflation), not a burst.
+    Grown GUVs       : green (#2E9E6B) data dots and fit line — sustained
+        radius increase above the pre-pulse baseline.
     Out-of-frame GUVs: blue (#3B7DD8) data dots and fit line — tracking was lost
         because the vesicle drifted beyond the field of view, NOT a rupture.
     Population mean panel: grey individual fits, bold black mean, light grey ±1 SD band.
@@ -2852,7 +3315,8 @@ def plot_dye_fits_grid(
     for k, d in enumerate(fit_data):
         ax = axes[k // ncols][k % ncols]
         status_col, suffix = _guv_status_style(
-            d['guv_id'], ruptured_guv_ids, out_of_frame_guv_ids, shrunk_guv_ids
+            d['guv_id'], ruptured_guv_ids, out_of_frame_guv_ids, shrunk_guv_ids,
+            grown_guv_ids
         )
         c_data = status_col if suffix else C_DATA_SURV
         c_fit  = status_col if suffix else C_FIT_SURV
@@ -2886,7 +3350,8 @@ def plot_dye_fits_grid(
     y_stack = []
     for d in fit_data:
         status_col, suffix = _guv_status_style(
-            d['guv_id'], ruptured_guv_ids, out_of_frame_guv_ids, shrunk_guv_ids
+            d['guv_id'], ruptured_guv_ids, out_of_frame_guv_ids, shrunk_guv_ids,
+            grown_guv_ids
         )
         c_fit = status_col if suffix else C_FIT_SURV
         mean_ax.plot(d['t_data'], d['y_data'], '.', color=c_fit,
@@ -2936,12 +3401,14 @@ def plot_dye_summary(
         ruptured_guv_ids: Optional[set] = None,
         out_of_frame_guv_ids: Optional[set] = None,
         shrunk_guv_ids: Optional[set] = None,
+        grown_guv_ids: Optional[set] = None,
 ) -> str:
     """
     Single-panel summary of all normalised dye traces + population mean.
 
     Colour scheme: surviving GUVs in medium grey (#888888), ruptured GUVs
-    in red (#CC2222) — a real biological event — out-of-frame GUVs in blue
+    in red (#CC2222) — a real biological event — grown GUVs in green
+    (#2E9E6B), out-of-frame GUVs in blue
     (#3B7DD8) — tracking lost to the vesicle drifting beyond the field of
     view, NOT a rupture — bold black mean, light grey (#BBBBBB) ±1 SD band.
     """
@@ -2964,11 +3431,24 @@ def plot_dye_summary(
 
     fig, ax = plt.subplots(figsize=(9, 5))
 
+    # Per-GUV traces are drawn WITHOUT individual legend entries. Listing
+    # every GUV made the legend cover roughly a third of the axes at n=42,
+    # and included GUVs whose trace is entirely NaN (e.g. a vesicle that
+    # ruptured on the first post-pulse frame) as empty legend rows. One
+    # proxy handle per fate category is added afterwards instead.
+    seen_categories: dict = {}
+    n_skipped_empty = 0
+
     for gid, row in zip(ids, arr):
-        col, suffix = _guv_status_style(gid, ruptured_guv_ids, out_of_frame_guv_ids, shrunk_guv_ids)
+        if not np.isfinite(row).any():
+            # Nothing to draw: no valid frames for this GUV.
+            n_skipped_empty += 1
+            continue
+        col, suffix = _guv_status_style(gid, ruptured_guv_ids, out_of_frame_guv_ids, shrunk_guv_ids, grown_guv_ids)
         lw    = 1.2 if suffix else 0.9
-        label = f'GUV {gid}{suffix}'
-        ax.plot(t, _smooth(row), color=col, alpha=0.70, lw=lw, label=label)
+        ax.plot(t, _smooth(row), color=col, alpha=0.70, lw=lw)
+        cat = suffix.strip(' ()').capitalize() if suffix else 'Intact'
+        seen_categories.setdefault(cat, col)
 
     sd       = np.nanstd(arr, axis=0)
     sm       = _smooth(avg)
@@ -2985,10 +3465,28 @@ def plot_dye_summary(
         fontsize=11
     )
     ax.grid(True, alpha=0.25)
+
+    # Compact legend: one proxy line per GUV fate category, plus the
+    # mean/SD/pulse handles already registered above.
+    from matplotlib.lines import Line2D
+    n_drawn = sum(1 for row in arr if np.isfinite(row).any())
+    proxies = [
+        Line2D([0], [0], color=col, lw=1.4,
+               label=f'{cat} (n={sum(1 for gid in ids if (_guv_status_style(gid, ruptured_guv_ids, out_of_frame_guv_ids, shrunk_guv_ids, grown_guv_ids)[1].strip(" ()").capitalize() or "Intact") == cat)})')
+        for cat, col in seen_categories.items()
+    ]
     handles, labels_leg = ax.get_legend_handles_labels()
-    ncols_leg = 3 if len(handles) > 10 else 2
-    ax.legend(handles, labels_leg, fontsize=8, ncol=ncols_leg,
+    handles = proxies + list(handles)
+    labels_leg = [h.get_label() for h in proxies] + list(labels_leg)
+    ax.legend(handles, labels_leg, fontsize=8, ncol=2,
               loc='upper right' if avg[-1] < avg[0] else 'lower right')
+
+    if n_skipped_empty:
+        ax.text(0.01, 0.01,
+                f'{n_skipped_empty} GUV(s) with no valid frames not shown '
+                f'({n_drawn} plotted)',
+                transform=ax.transAxes, fontsize=7, color='#666666',
+                ha='left', va='bottom')
     plt.tight_layout()
     out_path = os.path.join(output_folder, f'{experiment_name}_dye_summary.png')
     fig.savefig(out_path, dpi=300)

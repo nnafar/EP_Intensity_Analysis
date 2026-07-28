@@ -19,8 +19,8 @@ import re
 
 INPUT_FORMAT = 'ND2' 
 
-DATA_FOLDER  = r"D:\EP\260422_InvE_Empty_SRB_400V"
-EXPERIMENT_BASE_NAME  = "DOPC_Empty_Experiment1-400V-500us-frame5"
+DATA_FOLDER  = r"D:\EP\260726_InvE_Empty_SRB_775V"
+EXPERIMENT_BASE_NAME  = "DOPC_Empty_Experiment1-775V-500us-frame5"
 
 # --- NEW DIRECTORY ROUTING ---
 # Define the master parent directory where all analyses will be stored
@@ -40,16 +40,34 @@ CIRCLES_JSON_PATH = os.path.join(OUTPUT_IMAGE_FOLDER, f"{EXPERIMENT_BASE_NAME}_g
 # Required if INPUT_FORMAT = 'ND2'
 ND2_FILE_NAME = f"{EXPERIMENT_BASE_NAME}.nd2"
 
-# ND2 dimensions (typically T, C, Y, X)
-# 488=Membrane, 561=Dye, 640=Actin
+# --- CHANNEL IDENTITY -------------------------------------------------------
+# WARNING: the ND2 and TIFF branches use DIFFERENT channel orders. Switching
+# INPUT_FORMAT therefore remaps every channel. A silent off-by-one here is
+# unrecoverable and does not announce itself: for an Empty (no-cortex)
+# sample the actin channel is featureless noise, so mistaking it for the
+# membrane channel looks like a tracking failure, not a config error.
+#
+# These are validated at startup by utils.validate_channel_config(), which
+# raises rather than falling back to a default. Do NOT reintroduce
+# getattr(cfg, 'ND2_CHANNEL_IDX_*', 0) style defaults anywhere — a default
+# of 0 silently selects the ACTIN channel.
+#
+# ND2 dimensions (typically T, C, Y, X). Acquisition order here is
+# DESCENDING wavelength: 640=Actin, 561=Dye, 488=Membrane.
 ND2_CHANNEL_IDX_ACTIN    = 0
 ND2_CHANNEL_IDX_DYE      = 1
 ND2_CHANNEL_IDX_MEMBRANE = 2
 
-# TIFF Prefixes (typically T, C, Y, X)
+# TIFF Prefixes (typically T, C, Y, X). NOTE the different order to ND2.
 ROI_CHANNEL_PREFIX    = "C1_"    # Guide / membrane channel (used for tracking)
 ACTIN_CHANNEL_PREFIX  = "C2_"    # Actin channel (for future implementation)
 DYE_CHANNEL_PREFIX    = "C3_"    # Dye / measurement channel
+
+# Optional startup sanity check on the ND2 channel assignment. When True the
+# pipeline inspects frame 0 of each ND2 channel and warns if the channel
+# nominated as MEMBRANE is not the one with the strongest ring-like radial
+# structure. Catches a transposed acquisition order before it costs a run.
+VALIDATE_CHANNEL_ASSIGNMENT = True
 
 # The new frame index pattern
 TIF_SUFFIX            = "-f*.tif"
@@ -80,47 +98,201 @@ MEMBRANE_FIXED_HALF_WIDTH = 5   # Increased from 3
 PEAK_FIND_MIN_DISTANCE   = 5
 PEAK_FIND_MIN_PROMINENCE = 0.05
 
+# Photometry smoothing
+# Whether to Gaussian-blur (5x5, sigma=1.5) each frame before sampling the
+# lumen and background masks.
+#
+# Default is now False. Blurring before a MEAN over a large mask is close to
+# a no-op, but blurring before a PERCENTILE or a STD is not: it destroys the
+# per-pixel noise statistic that the dead-GUV filter divides by. Whatever
+# denoising is wanted should happen after photometry, on the trace, not on
+# the pixels feeding a variance estimate. Set True only to reproduce the
+# historical (pre-fix) numbers.
+PHOTOMETRY_BLUR = False
+PHOTOMETRY_BLUR_KERNEL = 5
+PHOTOMETRY_BLUR_SIGMA  = 1.5
+
 # Background annulus geometry
-BG_BUFFER_PIXELS = 3        # Increased from 1   # gap (px) between outer membrane edge and bg ring start
-BG_RING_WIDTH_PIXELS = 2    # Decreased from 4   # width (px) of background sampling ring
+# NOTE ON THE CURRENT VALUES: with MEMBRANE_FIXED_HALF_WIDTH = 5 these place
+# the sampling ring at r+8 to r+10 px, i.e. 0.88-1.10 um outside the
+# membrane and only 2 px wide. Confocal PSF tails deposit lumen signal at
+# that distance, so the ring is expected to carry some vesicle signal and
+# the background is biased HIGH (which biases the normalisation denominator
+# |I_bg - I_dye,0| LOW, amplifying its noise).
+# These are left at their historical values so this fix does not silently
+# change your numbers. Recommended: widen to BG_BUFFER_PIXELS = 6 and
+# BG_RING_WIDTH_PIXELS = 6, then confirm on a sparse field that the
+# background median stops depending on the buffer distance.
+BG_BUFFER_PIXELS = 3        # gap (px) between outer membrane edge and bg ring start
+BG_RING_WIDTH_PIXELS = 2    # width (px) of background sampling ring
 
-# Background neighbor-exclusion
-# When a second GUV's body (inner + membrane) overlaps this GUV's background
-# annulus, those pixels are excluded from the background estimate before
-# computing the median/std. BG_EXCLUSION_PADDING_PX is added on top of
-# MEMBRANE_FIXED_HALF_WIDTH when defining the neighbor's excluded footprint,
-# as a safety margin against a slightly under-tracked neighbor edge.
-BG_EXCLUSION_PADDING_PX = 2   # px
+# One-off QC: measures the bath level far from any tracked vesicle, to confirm
+# the annulus is not sitting in a locally bright region. Off by default — it
+# costs ~50 s per run and tells you nothing about kinetics. Worth running once
+# per new imaging condition.
+# One-off QC: measures the bath level far from any tracked vesicle, to
+# confirm the annulus is not sitting in a locally bright region. Off by
+# default - it costs ~50 s per run and tells you nothing about kinetics.
+# Worth running once per new imaging condition.
+# NOTE ON THE LEVEL (affects plateaus, NOT timescales)
+# A percentile is robust but is not an unbiased estimate of the background
+# MEAN: it sits |z(p)|*sigma below it (1.036 sigma at p15). This shifts the
+# normalised curve by an affine constant, so the fitted TAU is unaffected -
+# only the apparent plateau Iinf is offset upward. Measured on the 260422
+# Empty run: annulus p15 = 97.0 vs far-field mean = 102.1, i.e. 5.1 counts
+# = 1.00 sigma, matching theory. A fully-emptied vesicle therefore reads
+# about delta/sep0 (~0.4 there) rather than 0. Do NOT read a fitted Iinf as
+# 'fraction of dye retained' without accounting for this.
 
-# Minimum number of background pixels that must remain after neighbor
-# exclusion. If fewer remain (e.g. a very crowded FOV), the exclusion falls
-# back to the full (unexcluded) annulus for that frame rather than
-# extracting background statistics from a near-empty sample.
-BG_EXCLUSION_MIN_PIXELS = 20
-
-# How many consecutive frames to keep excluding a tracked neighbor's last
-# known position after its ellipse goes missing (transient tracking loss,
-# not yet declared ruptured). Bridges brief tracking gaps without
-# indefinitely excluding a stale position once the neighbor has actually
-# ruptured/dispersed or drifted out of frame.
-BG_NEIGHBOR_HOLD_FRAMES = 5
-
-# MAD-based sigma-clip threshold applied to the background pixels AFTER
-# position-based neighbor exclusion. This is the only defense against a
-# neighboring vesicle the user never circled (no tracked position exists
-# to exclude it by) — pixels more than this many scaled-MADs from the
-# annulus median are dropped before computing background stats. Set to 0
-# to disable.
-BG_SIGMA_CLIP = 3.0
-
-# -----------------------------------------------------------------------------
+# A fitted Iinf therefore mixes genuine trapped dye with this offset and the
+# curve alone cannot separate them. No correction is applied: do not read a
+# fitted Iinf as 'fraction of dye retained'.
 # --- 3. FITTING & MODELING ---
 # -----------------------------------------------------------------------------
 
 # Dye Efflux: ['EFFLUX-1EXP' or 'EFFLUX-2EXP'] 
 # Dye Influx: ['INFLUX-1EXP' or 'INFLUX-2EXP']
 MODEL_TO_USE        = 'EFFLUX-1EXP' 
-FIT_DATA_PERCENTAGE = 0.9
+
+# Fraction of the post-pulse record actually passed to the fitter, measured
+# in TIME (not frame count), so the variable frame-rate schedule doesn't
+# make this mean different things in different segments.
+# 1.0 = fit the whole post-pulse record.
+# NOTE: this knob existed previously but was never read by any code path —
+# every fit silently used 100% of the record. It is now honoured. Leave it
+# at 1.0 to reproduce the historical behaviour.
+FIT_DATA_PERCENTAGE = 1.0
+
+# --- Kinetic model parameter bounds -----------------------------------------
+# The efflux models are parameterised as
+#     1EXP:  I(t) = Iinf + A  * exp(-t/tau)                [+ D*t]
+#     2EXP:  I(t) = Iinf + a1 * exp(-t/tau1) + a2 * exp(-t/tau2)  [+ D*t]
+# with A, a1, a2 >= 0 and Iinf >= 0. Under these bounds the 1EXP feasible
+# set is a strict SUBSET of the 2EXP feasible set, so RSS_2EXP <= RSS_1EXP
+# holds by construction and the nesting assertion below can only ever be
+# tripped by an optimiser failure.
+#
+# Historical note: the old bounds allowed Iinf in [-2, 2] with a free I0,
+# which admitted a *rising* exponential (Iinf > I0, i.e. negative
+# amplitude) for an efflux model, while the 2EXP amplitudes were pinned
+# >= 0. That asymmetry broke nesting and let ~half of all GUVs settle on
+# a degenerate "rise toward Iinf=2, cancelled by a negative linear drift"
+# solution with tau far longer than the recording.
+FIT_IINF_MAX     = 1.2     # upper bound on the plateau (1.0 + headroom for noise)
+FIT_AMPLITUDE_MAX = 2.0    # upper bound on each exponential amplitude
+FIT_TAU_MIN      = 0.01    # s
+FIT_TAU_MAX      = 5000.0  # s
+
+# --- Linear drift term D ----------------------------------------------------
+# Set True to include a +D*t term in every kinetic model.
+#
+# Default is now False. D was previously always active with bounds of
+# +/-0.1 per second, i.e. +/-72 over a 725 s record on data that spans 0-1 —
+# not a drift correction but a free linear ramp able to cancel almost any
+# curvature. Measured drift in non-responding GUVs (which by definition
+# have no efflux to explain) is ~1.5% over a full record, so there is
+# nothing for D to absorb. Only enable this if you have independently
+# demonstrated bleaching in YOUR data, and if you do, keep the bound tight.
+FIT_INCLUDE_DRIFT = False
+FIT_DRIFT_ABS_MAX = 5e-5   # per second; used only when FIT_INCLUDE_DRIFT
+
+# --- Multi-start ------------------------------------------------------------
+# Number of additional randomised initial guesses tried per model, on top of
+# the deterministic heuristic guess. The best (lowest-RSS) converged fit is
+# kept. Guards against curve_fit stalling at a bound, which previously left
+# a subset of 2EXP fits returning their starting point unchanged.
+FIT_N_MULTISTART = 6
+FIT_MULTISTART_SEED = 0     # set for reproducible fits; None for nondeterministic
+
+# --- Nesting assertion ------------------------------------------------------
+# A 2EXP fit whose RSS exceeds the 1EXP RSS by more than this tolerance is
+# mathematically impossible at a true optimum and indicates the optimiser
+# failed. Such GUVs get their model comparison written as NaN with a
+# 'FIT_FAILED' flag rather than a spurious "1EXP preferred" verdict.
+FIT_NESTING_TOLERANCE = 1e-6
+
+# --- Identifiability gate ---------------------------------------------------
+# tau cannot be recovered from a record that ends long before the decay
+# completes: the data then constrain only the initial slope, and Iinf/tau
+# trade off freely. Fits violating either criterion below are retained in
+# the output but flagged `tau_identifiable = False`, and their tau/Iinf are
+# NOT to be used for population statistics. Use the model-free metrics
+# (t50, frac_remaining_*) exported alongside them instead.
+TAU_SE_RATIO_MAX          = 0.5   # reject if tau_SE/tau exceeds this
+TAU_MAX_FRACTION_OF_RECORD = 1/3  # reject if tau > this fraction of the record
+
+# --- Normalisation denominator guard ----------------------------------------
+# I_retained(t) = (I_bg,t - I_dye,t) / (I_bg,t - I_dye,0)
+# The denominator is a DIFFERENCE OF TWO SIMILAR NUMBERS, so it must be
+# guarded against noise pushing it through zero and flipping the sign.
+#
+# THE RELEVANT SCALE IS THE STANDARD ERROR OF THE BACKGROUND ESTIMATE,
+# NOT PER-PIXEL SIGMA. I_bg,t is a percentile of ~700 annulus pixels, so its
+# sampling error is
+#       SE = sqrt(p(1-p)/n) / phi(z_p) * sigma
+# which is 0.058*sigma at p=0.15, n=696 — about 17x smaller than sigma itself.
+#
+# An earlier version of this guard compared |denominator| against per-pixel
+# sigma and demanded > 3 sigma. The measured contrast in the 260422 Empty run
+# is sep0/sigma ~= 2.3, so that condition blanked 120-166 of 166 frames on
+# most GUVs and removed 17 vesicles from the analysis entirely — despite
+# those denominators sitting roughly 40 standard errors clear of zero.
+# Frames are now blanked only when the denominator is genuinely unresolvable.
+NORM_DENOM_MIN_SE = 5.0
+
+# --- Size grouping ----------------------------------------------------------
+# Bin edges (um) used for the parameter boxplots and the size_group column.
+# NOTE: a single field of view will not give balanced bins at any choice of
+# edges. For size-dependence claims, pool across experiments in
+# process_bulk_data.py and use quantile bins, or better, regress the
+# parameter against continuous radius and skip binning entirely — bin edges
+# are an arbitrary analysis choice that has to be defended.
+SIZE_GROUP_BINS   = [0, 5.0, 8.0, 11.0, 100.0]
+SIZE_GROUP_LABELS = ['<5.0', '5.0-8.0', '8.0-11.0', '>11.0']
+
+# Warn when a size bin holds fewer than this many GUVs. A bin of n=1 is not
+# a population and should not be presented as a box.
+SIZE_GROUP_MIN_N = 3
+
+# Times (s, relative to pulse) at which model-free fractional dye retention
+# is reported for every GUV, identifiable or not.
+MODEL_FREE_REPORT_TIMES_S = [10, 30, 60, 120, 300, 600]
+
+# --- Response detection -----------------------------------------------------
+# A GUV below the permeabilisation threshold has a FLAT trace: the fit drives
+# the amplitude to ~0, at which point tau is arbitrary and its standard error
+# can come out deceptively small, sneaking a meaningless tau past the
+# identifiability gate. Such GUVs are valid data points — locating the voltage
+# threshold is the point of the experiment — they simply do not carry a tau.
+# A fit counts as responding when its total exponential amplitude exceeds both
+# an absolute floor and a multiple of its own residual scatter, so the test
+# adapts to each trace's noise instead of using one fixed cutoff.
+FIT_RESPONSE_AMPLITUDE_SIGMA = 3.0
+FIT_MIN_RESPONSE_AMPLITUDE   = 0.05
+
+# --- Stepwise traces --------------------------------------------------------
+# The efflux formula assumes ONE permeabilisation event followed by a
+# monotonic relaxation. Some traces instead decline slowly and then drop
+# abruptly partway through — a second event, or a tracking/mask artefact.
+# Neither a 1EXP nor a 2EXP can describe that: the fit compromises between the
+# segments and returns a tau belonging to neither. Steps are detected from the
+# time-normalised derivative (robust MAD scale) and flagged in the fit table
+# as has_step / n_steps / first_step_t_s / largest_step_drop.
+STEP_DETECT_SIGMA    = 6.0    # drops beyond this many robust sigmas of dI/dt
+STEP_DETECT_MIN_DROP = 0.10   # and at least this much normalised intensity
+
+# Restrict the fit to data BEFORE the first detected step, so the efflux
+# formula describes a single relaxation. Off by default because it silently
+# shortens the record; turn on once you have looked at which GUVs are flagged.
+FIT_TRUNCATE_AT_FIRST_STEP = False
+
+# --- z-drift / swelling -----------------------------------------------------
+# A vesicle whose equatorial radius GROWS over the record is either genuinely
+# swelling or drifting through the confocal plane toward its equator. Either
+# way the interior mask samples a changing volume and an apparent intensity
+# change is not necessarily efflux. Shrinkage is already handled by the fate
+# classifier; growth was not flagged anywhere.
+RADIUS_GROWTH_FLAG_FRACTION = 0.10
 
 # Pulse-frame detection
 # Set to an integer to hard-pin the pulse frame and skip auto-detection.
@@ -133,27 +305,44 @@ PULSE_DETECT_SMOOTH_SIGMA = 2.0
 
 # Dead-GUV filter: a GUV is excluded from dye-channel analysis if its
 # pre-pulse interior signal is not separated from background by at least
-# this many multiples of the background's own RAW per-pixel std:
+# this many multiples of the background per-pixel std:
 #   |I_dye,0 - I_bg,0|  <  MIN_PREPULSE_SEPARATION_SIGMA * bg_std0
-# This is a plain amplitude check, NOT a statistical significance test —
-# it does not scale with the number of background pixels (that SEM-scaled
-# version was tried and over-excluded everything; see background
-# diagnostics discussion). bg_std0 is already exported per-GUV in
-# {experiment}_background_diagnostics.csv (bg_std_raw), so this threshold
-# can be sanity-checked against real values from your own data. Raise it
-# if too many marginal-but-real GUVs are being kept; lower it if clearly
-# loaded GUVs are being excluded.
 #
-# TEMPORARY TEST VALUE for DOPC_Empty_Experiment1-400V-500us-frame5: this
-# file's dye-channel sep0/bg_std0 ratios cluster around a median of ~1.1
-# across all 42 GUVs with no natural pass/fail gap in the distribution
-# (see channel_diagnostic.py output) -- i.e. this is NOT a validated
-# general threshold, it's set to roughly match this file's own noise
-# floor so ~half its GUVs clear the bar. Compare against a known-good
-# experiment's ratio distribution before treating 1.1 as anything more
-# than a per-file test value; TODO revert to 2.0 (or set per-experiment)
-# once that comparison is done.
-MIN_PREPULSE_SEPARATION_SIGMA = 1.1
+# Set to None to disable exclusion entirely and only REPORT the distribution.
+# That is the default, deliberately: see below.
+#
+# WHY THE OLD VALUE OF 1.1 WAS NOT A DATA PROPERTY
+# ------------------------------------------------
+# 1.1 was tuned against a bg_std0 that was not a per-pixel sigma. The old
+# estimator was np.std(pixels[pixels <= median]) on a GAUSSIAN-BLURRED frame,
+# which understates sigma twice over (the blur suppresses per-pixel variance;
+# the lower-half truncation costs a further ~0.6x). The observed "no natural
+# pass/fail gap around 1.1" was a property of that broken statistic, not of
+# the vesicles.
+#
+# Independent check from your own refitted data: with the p15 anchor the
+# apparent plateau floor is  artefact = |z(0.15)| / (sep0/sigma) = 1.0364 /
+# (sep0/sigma). A measured Iinf is artefact PLUS any genuine retained dye, so
+# Iinf >= artefact, hence sep0/sigma >= 1.0364/Iinf. The four identifiable
+# responders refit to Iinf = 0.085-0.133, which forces
+#       sep0/sigma  >=  7.8   (and >= 12 for the cleanest vesicle)
+# A ratio of 1.1 would imply a 94% plateau floor -- curves could not fall to
+# 0.1 at all. So the true contrast is ~7-11x higher than the old number said.
+#
+# HOW TO CALIBRATE (2 minutes, once)
+# ----------------------------------
+# Every run now writes {experiment}_dye_qc.csv containing sep0, bg_std0 and
+# sep0_over_sigma for EVERY GUV -- including the ones the filter rejects, which
+# previously never reached any export, so the distribution you needed to
+# threshold on was invisible. The log also prints the quantiles and the largest
+# gap in the sorted ratios.
+#   1. run one known-good experiment with this set to None,
+#   2. open dye_qc.csv and look at sep0_over_sigma,
+#   3. if there is a clean gap, put the threshold in it;
+#      if the distribution is smooth, use the artefact table below instead.
+#
+MIN_PREPULSE_SEPARATION_SIGMA = None
+
 
 # Maximum number of frames to evaluate for the pulse within the fast-acquisition window.
 # Set to None to search the entire fast window.
@@ -229,10 +418,87 @@ RUPTURE_DETECTION_CONSECUTIVE_FAILS = 3
 SHRINKAGE_FRACTION_THRESHOLD = 0.15
 
 # Number of the LAST valid tracked frames (per GUV) averaged to get its
-# terminal radius for the shrinkage check. Smooths single-frame ring
+# terminal radius for the shrinkage/growth check. Smooths single-frame ring
 # detection noise right at the endpoint rather than keying the whole
 # fate classification off one potentially noisy frame.
 SHRINKAGE_TERMINAL_N_FRAMES = 3
+
+# GUV fate: GROWTH threshold. A GUV whose radius has increased by at least
+# this fraction above its own pre-pulse baseline, with tracking intact
+# throughout, is classified GROWN. 0.15 = 15% radius gain.
+#
+# Kept as a SEPARATE constant from SHRINKAGE_FRACTION_THRESHOLD rather than
+# reusing one symmetric value: equal fractional radius changes are not
+# equivalent in area or volume (-15% radius = -39% volume, but +15% radius =
+# +52% volume), and the two directions have different physical ceilings.
+# A bilayer cannot stretch more than a few percent in AREA before lysing, so
+# a >15% radius gain (~32% area) is impossible by inflation of an already-
+# taut vesicle. Real GROWN calls therefore mean an initially floppy vesicle
+# with excess membrane area rounding up as it tenses (the interesting case),
+# fusion with a neighbour, or the ring detector jumping to another object.
+# Cross-check the terminal_norm_circularity column in the fate CSV: case one
+# is accompanied by circularity rising toward 1, the artifacts usually not.
+GROWTH_FRACTION_THRESHOLD = 0.15
+
+# Whether the growth test uses the PEAK post-pulse radius (True) instead of
+# the terminal radius (False). Post-electroporation swelling is often
+# transient — a vesicle can inflate, reseal, and re-equilibrate back toward
+# baseline, which a terminal-frame criterion misses entirely. Set True to
+# count transient swelling as GROWN; leave False to require the expansion to
+# persist to the end of the movie (the conservative definition, symmetric
+# with how SHRUNK is scored). Either way, peak_norm_radius_post is exported
+# in the fate CSV, so transient swelling can be checked without re-running.
+GROWTH_USE_PEAK_RADIUS = False
+
+# -----------------------------------------------------------------------------
+# Parameter boxplots: which FITTED parameters get a panel.
+# -----------------------------------------------------------------------------
+# Deliberately an explicit shortlist, not "everything numeric in
+# fit_parameters.csv". The sweep it replaces produced ~24 panels — flags,
+# backing diagnostics, rss, model-free metrics — in one 36000 px-wide figure,
+# burying the three quantities the model actually estimates among bookkeeping
+# columns. Everything else stays in fit_parameters.csv, which is where
+# per-GUV numbers belong; this figure exists only to show how the fitted
+# parameters vary with vesicle size.
+#
+# For a 2EXP model the parameters are named differently, so use
+#   ['Iinf', 'a1', 'tau1', 'a2', 'tau2']
+# Names not present for the active model are skipped with a log note.
+BOXPLOT_PARAMS = ['Iinf', 'A', 'tau']
+
+# -----------------------------------------------------------------------------
+# --- RESPONSE PHENOTYPE CLASSIFICATION ---
+# -----------------------------------------------------------------------------
+# Sorts responding GUVs into EXPONENTIAL / DELAYED / GRADUAL. The point of the
+# split is that "it went down" covers at least three physically different
+# things, and only one of them supports a tau.
+#
+# EXPONENTIAL threshold: exp_vs_linear = RSS(straight line) / RSS(model),
+# both fitted to the same window. An exponential whose tau far exceeds the
+# record is, within that record, a straight line — the fit still returns a
+# tau and the panel still looks like a decay, but the data do not contain the
+# curvature that would justify calling it one.
+#
+# On the 260422 Empty 400 V run the distribution of exp_vs_linear has a clean
+# gap: fifteen GUVs at 0.61-1.98, then four at 5.17-11.26 and nothing in
+# between. Any threshold in 2.0-5.0 gives the identical split, so 3.0 sits in
+# the middle of the gap rather than on the edge of it. Re-check that gap on a
+# new imaging condition before trusting the number.
+RESPONSE_SHAPE_MIN_RSS_RATIO = 3.0
+
+# DELAYED threshold: onset_lag_frac = t10 / t90, where t10 and t90 are the
+# times at which the trace has completed 10 % and 90 % of its OWN total
+# decline. A vesicle permeabilised by the pulse itself starts leaking at once
+# (ratio ~0.00); one that sits flat and only then falls gives a large ratio.
+#
+# Same dataset: fourteen GUVs at 0.001-0.037, then six at 0.096-0.469. The
+# gap runs 0.04-0.09, so 0.07 is its midpoint.
+#
+# NOTE this is NOT the same thing as STEP_DETECT_* below. A step is one abrupt
+# frame-to-frame drop; a delayed onset can be a perfectly smooth decline that
+# simply begins late. On this dataset the two flag almost disjoint sets of
+# GUVs, so both are worth keeping.
+RESPONSE_ONSET_LAG_FRAC = 0.07
 
 # Tracking outputs
 # CSV: per-frame (guv_id, frame, x, y, radius, ring_score)

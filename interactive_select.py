@@ -231,8 +231,15 @@ def _main():
         nd2_path = os.path.join(cfg.DATA_FOLDER, getattr(cfg, 'ND2_FILE_NAME', f"{cfg.EXPERIMENT_BASE_NAME}.nd2"))
         if not os.path.exists(nd2_path):
             sys.exit(f"ERROR: ND2 file not found: {nd2_path}")
+        # NO getattr DEFAULT HERE. A fallback of 0 silently selects the
+        # ACTIN channel, which for an Empty (no-cortex) sample is featureless
+        # noise -- you would draw circles on nothing and the run would fail
+        # later as though tracking were bad. validate_channel_config() raises
+        # if the index is missing or the roles collide.
+        import guv_analysis_utils as _utils
+        _utils.validate_channel_config()
         with nd2.ND2File(nd2_path) as f:
-            idx_mem = getattr(cfg, 'ND2_CHANNEL_IDX_MEMBRANE', 0)
+            idx_mem = cfg.ND2_CHANNEL_IDX_MEMBRANE
             data = f.asarray()
             frame = data[0, idx_mem, :, :] if data.ndim == 4 else data[0, :, :]
         print(f"Opening selector on ND2: {nd2_path}")

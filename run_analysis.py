@@ -34,7 +34,14 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 import cv2
+import warnings
 import scipy.optimize as sc
+from scipy.stats import norm as _scipy_norm
+
+
+def _norm_ppf(q: float) -> float:
+    """Gaussian quantile function; wrapped so the import stays local to use."""
+    return float(_scipy_norm.ppf(q))
 import pandas as pd
 import tempfile
 from tqdm import tqdm
@@ -75,7 +82,7 @@ def get_guv_circles(logger: logging.Logger) -> list[dict]:
             return []
             
         with nd2.ND2File(nd2_path) as f:
-            idx_mem = getattr(cfg, 'ND2_CHANNEL_IDX_MEMBRANE', 0)
+            idx_mem = cfg.ND2_CHANNEL_IDX_MEMBRANE   # no default: 0 would be ACTIN
             data = f.asarray()
             # Extract first frame, membrane channel. Handle 3D or 4D ND2 arrays.
             if data.ndim == 4:
@@ -170,9 +177,9 @@ def load_input_data(circles: list[dict], logger: logging.Logger) -> dict | None:
             ch_names = [c.channel.name for c in f.metadata.channels]
             logger.info(f"ND2 Channels found: {ch_names}")
 
-            idx_mem = getattr(cfg, 'ND2_CHANNEL_IDX_MEMBRANE', 0)
-            idx_dye = getattr(cfg, 'ND2_CHANNEL_IDX_DYE', 1)
-            idx_act = getattr(cfg, 'ND2_CHANNEL_IDX_ACTIN', 2)
+            idx_mem = cfg.ND2_CHANNEL_IDX_MEMBRANE   # no default: 0 would be ACTIN
+            idx_dye = cfg.ND2_CHANNEL_IDX_DYE
+            idx_act = cfg.ND2_CHANNEL_IDX_ACTIN      # old default of 2 was MEMBRANE
 
             logger.info(f"Compiling ND2 channels into local memory-mapped stacks at {mmap_dir}...")
             roi_mmap_info = utils.create_memmap_from_nd2_channel(f, idx_mem, roi_mmap_path, "ROI Stack")
@@ -186,6 +193,25 @@ def load_input_data(circles: list[dict], logger: logging.Logger) -> dict | None:
                 actin_mmap_info = utils.create_memmap_from_nd2_channel(f, idx_act, actin_mmap_path, "Actin Stack")
             else:
                 actin_mmap_info = (None, None, None)
+
+            # Empirical sanity check on the channel assignment: warns if the
+            # channel nominated as MEMBRANE is not the one with the strongest
+            # ring-like structure. Catches a transposed acquisition order
+            # before it costs a full run.
+            if getattr(cfg, 'VALIDATE_CHANNEL_ASSIGNMENT', True):
+                try:
+                    _probe = {'membrane': np.memmap(roi_mmap_info[0], dtype=roi_mmap_info[2],
+                                                    mode='r', shape=roi_mmap_info[1])}
+                    if dye_mmap_info[0] is not None:
+                        _probe['dye'] = np.memmap(dye_mmap_info[0], dtype=dye_mmap_info[2],
+                                                  mode='r', shape=dye_mmap_info[1])
+                    if actin_mmap_info[0] is not None:
+                        _probe['actin'] = np.memmap(actin_mmap_info[0], dtype=actin_mmap_info[2],
+                                                    mode='r', shape=actin_mmap_info[1])
+                    utils.check_channel_assignment(_probe, logger)
+                    del _probe
+                except Exception as _e:
+                    logger.warning(f"Channel assignment check skipped: {_e}")
 
             time_array, frame_interval = utils.extract_timestamps_nd2(f)
             dye_files = [f"nd2_frame_{i}" for i in range(roi_mmap_info[1][0])]
@@ -469,7 +495,14 @@ def normalize_and_align_curves(guv_results: dict,
     dye_list    = guv_results['all_intensity_curves']
     bg_list     = guv_results['all_background_curves']
     bg_std_list = guv_results.get('all_background_std_curves', [None] * len(dye_list))
-    min_sep_sigma = getattr(cfg, 'MIN_PREPULSE_SEPARATION_SIGMA', 2.0)
+    bg_n_list   = guv_results.get('all_background_n_curves',   [None] * len(dye_list))
+    min_sep_sigma = getattr(cfg, 'MIN_PREPULSE_SEPARATION_SIGMA', None)
+    if min_sep_sigma is None:
+        logger.info(
+            "Dead-GUV filter DISABLED (MIN_PREPULSE_SEPARATION_SIGMA = None): "
+            "all GUVs retained, contrast reported only. Calibrate from "
+            "{experiment}_dye_qc.csv before enabling — see config notes."
+        )
 
     # Baseline window = the 5 frames immediately preceding the ACTUAL
     # detected/configured pulse_frame — not a hardcoded "first 5 frame
@@ -485,8 +518,14 @@ def normalize_and_align_curves(guv_results: dict,
     normalised          = []
     kept_local_indices  = []
     excluded_dead_ids    = []
+    # QC rows for EVERY GUV, including those the dead-GUV filter rejects.
+    # Without this the excluded vesicles never reach any export, so the
+    # sep0/sigma distribution that MIN_PREPULSE_SEPARATION_SIGMA is supposed
+    # to be calibrated against is invisible — you can only ever see the half
+    # that already passed whatever threshold was in force.
+    qc_rows: list = []
 
-    for local_i, (dye, bg, bg_std) in enumerate(zip(dye_list, bg_list, bg_std_list)):
+    for local_i, (dye, bg, bg_std, bg_n) in enumerate(zip(dye_list, bg_list, bg_std_list, bg_n_list)):
         if pulse_frame >= len(dye):
             continue
 
@@ -499,34 +538,146 @@ def normalize_and_align_curves(guv_results: dict,
         gid      = str(circles[orig_idx]['id'])
 
         bg_std0 = float(np.nanmean(bg_std[safe_pre_start:safe_pre_end])) if bg_std is not None else np.nan
-        if np.isfinite(bg_std0) and bg_std0 > 0:
+        sep0_all = abs(bg0 - dye0)
+        # Pre-pulse contrast expressed in units of the raw per-pixel
+        # background std — the quantity MIN_PREPULSE_SEPARATION_SIGMA is
+        # compared against, and the one the QC CSV is sorted and quantiled
+        # on downstream. Computed for EVERY GUV, before the filter branch,
+        # so both the kept and the excluded QC rows can report it: the
+        # excluded half is precisely the part of the distribution the
+        # threshold needs to be calibrated against.
+        # NaN when there is no usable noise scale (bg_std missing or zero),
+        # which is also exactly the case in which the dead-GUV filter below
+        # cannot fire — so such GUVs are retained by default and show up as
+        # NaN in the QC CSV rather than being silently scored as high
+        # contrast.
+        ratio_all = (sep0_all / bg_std0
+                     if np.isfinite(bg_std0) and bg_std0 > 0 else np.nan)
+
+        if min_sep_sigma is not None and np.isfinite(bg_std0) and bg_std0 > 0:
             min_sep = min_sep_sigma * bg_std0
-            sep0 = abs(bg0 - dye0)
-            if sep0 < min_sep:
+            if sep0_all < min_sep:
+                qc_rows.append({'guv_id': gid, 'dye0': dye0, 'bg0': bg0,
+                                'bg_std0': bg_std0, 'sep0': sep0_all,
+                                'sep0_over_sigma': ratio_all,
+                                'kept': False})
                 excluded_dead_ids.append(gid)
                 logger.warning(
                     f"  GUV {gid}: excluded — pre-pulse interior signal "
                     f"indistinguishable from background "
-                    f"(|Idye,0 - Ibg,0| = {sep0:.2f} AU < "
-                    f"{min_sep_sigma}x background std = {min_sep:.2f} AU)."
+                    f"(|Idye,0 - Ibg,0| = {sep0_all:.2f} AU < "
+                    f"{min_sep_sigma}x background std = {min_sep:.2f} AU, "
+                    f"sep0/sigma = {ratio_all:.2f})."
                 )
                 continue
 
         den = bg - dye0   # time-varying: I_bg,t - I_dye,0, one value per frame
-        eps = 1e-9
+
+        # Denominator guard.
+        # den is a DIFFERENCE OF TWO SIMILAR NUMBERS: the per-frame background
+        # and the pre-pulse lumen level. When the two are within a few counts
+        # of each other — which is exactly the low-contrast regime the
+        # dead-GUV filter is meant to catch — noise in bg,t can push den
+        # through zero, flipping the sign of the normalised value and sending
+        # it to +/-infinity. The previous guard was |den| > 1e-9, which only
+        # catches exact zero and let those excursions through as real data
+        # points (visible as spikes above 1.2 and dips near 0 in the summary
+        # plot). Require den to be a genuine multiple of the background noise.
+        # The relevant scale is the standard error of the BACKGROUND ESTIMATE,
+        # not the per-pixel noise. bg is a percentile of ~700 annulus pixels;
+        # its sampling error is
+        #     SE = sqrt(p(1-p)/n) / phi(z_p) * sigma
+        # which for p=0.15 and n=696 is 0.058*sigma — about 17x smaller than
+        # sigma itself. Guarding against per-pixel sigma (as an earlier version
+        # of this code did) blanks frames whose denominator is in fact tens of
+        # standard errors away from zero, and destroys most of the dataset
+        # whenever the contrast happens to be a few sigma.
+        k_guard = float(getattr(cfg, 'NORM_DENOM_MIN_SE', 5.0))
+        if bg_std is not None:
+            sigma_px = np.where(np.isfinite(bg_std) & (bg_std > 0), bg_std, np.nan)
+            n_px = np.asarray(bg_n, dtype=float) if bg_n is not None else None
+            if n_px is None or not np.any(np.isfinite(n_px)):
+                n_px = np.full_like(sigma_px, 100.0)
+            n_px = np.where(np.isfinite(n_px) & (n_px > 1), n_px, 100.0)
+            # The sampling error of a quantile estimate depends on WHICH
+            # quantile was actually used for bg. With BG_LEVEL_ESTIMATOR =
+            # 'median' (the default) bg is the annulus median, not the
+            # BG_PERCENTILE quantile, so plugging p = 0.15 in here computes
+            # the SE of an estimator that was never used — it overstates the
+            # true SE by ~20% and makes this guard correspondingly stricter
+            # than intended. Match p to the estimator in force.
+            if str(getattr(cfg, 'BG_LEVEL_ESTIMATOR', 'median')).lower() == 'median':
+                p_q = 0.5
+            else:
+                p_q = float(getattr(cfg, 'BG_PERCENTILE', 15.0)) / 100.0
+            phi_z = float(_scipy_norm.pdf(_norm_ppf(p_q)))
+            se_bg = np.sqrt(p_q * (1 - p_q) / n_px) / max(phi_z, 1e-9) * sigma_px
+            floor = k_guard * se_bg
+        else:
+            floor = np.full_like(den, 1e-9, dtype=float)
+        floor = np.where(np.isfinite(floor) & (floor > 0), floor, 1e-9)
+
         with np.errstate(divide='ignore', invalid='ignore'):
-            norm = np.where(np.abs(den) > eps, (bg - dye) / den, np.nan)
+            norm = np.where(np.abs(den) > floor, (bg - dye) / den, np.nan)
+
+        n_blanked = int(np.sum(~np.isfinite(norm) & np.isfinite(dye)))
+        if n_blanked:
+            logger.info(
+                f"  GUV {gid}: {n_blanked} frame(s) blanked — "
+                f"|I_bg,t - I_dye,0| fell below {k_guard}x the background "
+                f"noise, so the normalisation denominator was not resolvable."
+            )
+
+        qc_rows.append({'guv_id': gid, 'dye0': dye0, 'bg0': bg0,
+                        'bg_std0': bg_std0, 'sep0': sep0_all,
+                        'sep0_over_sigma': ratio_all,
+                        'kept': True})
 
         normalised.append(norm)
         kept_local_indices.append(local_i)
+
+    if qc_rows:
+        df_qc = pd.DataFrame(qc_rows).sort_values('sep0_over_sigma')
+        qc_path = os.path.join(cfg.FOLDER_DYE,
+                               f"{cfg.EXPERIMENT_BASE_NAME}_dye_qc.csv")
+        df_qc.to_csv(qc_path, index=False, float_format='%.6f', na_rep='NaN')
+        logger.info(f"Saved pre-pulse contrast QC (all GUVs) -> {qc_path}")
+
+        rr = df_qc['sep0_over_sigma'].dropna()
+        if len(rr) >= 3:
+            qs = rr.quantile([0.05, 0.25, 0.5, 0.75, 0.95])
+            logger.info(
+                "Pre-pulse contrast sep0/sigma: "
+                f"min={rr.min():.1f}, p05={qs[0.05]:.1f}, p25={qs[0.25]:.1f}, "
+                f"median={qs[0.5]:.1f}, p75={qs[0.75]:.1f}, max={rr.max():.1f}"
+            )
+            # Largest gap in the sorted ratios = candidate natural threshold.
+            srt = np.sort(rr.values)
+            if len(srt) > 3:
+                gaps = np.diff(srt)
+                k = int(np.argmax(gaps))
+                logger.info(
+                    f"  Largest gap in the sorted distribution: {srt[k]:.1f} -> "
+                    f"{srt[k+1]:.1f}. If that gap is clean, a threshold in "
+                    f"between separates loaded from unloaded vesicles; if the "
+                    f"distribution is smooth there is no natural cut and the "
+                    f"threshold is a judgement call."
+                )
 
     if not normalised:
         logger.error("Normalisation failed for all GUVs.")
         return None
 
-    # Align curves to start at t=0 on the pulse frame
-    arr   = np.array(normalised)[:, pulse_frame:]
-    t_al  = time_array[pulse_frame:] - time_array[pulse_frame]
+    # Align curves so t=0 is the pulse frame. Fitting still uses only the
+    # post-pulse segment, but the FULL curve (including the pre-pulse frames
+    # at negative t) is carried through as well, so the baseline that dye0,
+    # bg0 and bg_std0 were derived from is visible in the exports instead of
+    # being discarded at this line.
+    full_arr = np.array(normalised)
+    t_full   = time_array - time_array[pulse_frame]
+
+    arr   = full_arr[:, pulse_frame:]
+    t_al  = t_full[pulse_frame:]
     avg   = np.nanmean(arr, axis=0)
 
     valid_ids = [
@@ -538,6 +689,11 @@ def normalize_and_align_curves(guv_results: dict,
         't_aligned':                t_al,
         'average_curve':            avg,
         'all_curves_aligned':       arr,
+        # Full record including pre-pulse frames (negative times). Used for
+        # the CSV export and baseline QC; NOT passed to the fitter.
+        't_full':                   t_full,
+        'all_curves_full':          full_arr,
+        'pulse_frame':              pulse_frame,
         'valid_guv_ids':            valid_ids,
         'median_jump_frame':        pulse_frame,
         'excluded_dead_guv_ids':    excluded_dead_ids,
@@ -555,42 +711,62 @@ def _get_kinetic_model_spec(model_name: str, y_start: float, y_end: float,
     the same initial-guess/bounds conventions for all four model variants.
     Returns None for an unrecognised model_name.
     """
+    IINF_MAX = float(getattr(cfg, 'FIT_IINF_MAX', 1.2))
+    AMP_MAX  = float(getattr(cfg, 'FIT_AMPLITUDE_MAX', 2.0))
+    TAU_MIN  = float(getattr(cfg, 'FIT_TAU_MIN', 0.01))
+    TAU_MAX  = float(getattr(cfg, 'FIT_TAU_MAX', 5000.0))
+
+    use_D  = bool(getattr(cfg, 'FIT_INCLUDE_DRIFT', False))
+    D_MAX  = float(getattr(cfg, 'FIT_DRIFT_ABS_MAX', 5e-5))
+    # curve_fit needs a strictly-positive-width interval on every parameter.
+    # When drift is disabled we keep D in the signature (the model functions
+    # default it to 0) but pin it to a numerically negligible window.
+    d_lo, d_hi = (-D_MAX, D_MAX) if use_D else (-1e-12, 1e-12)
+
+    tau_g = float(np.clip(tau_e, TAU_MIN * 2, TAU_MAX * 0.999))
+    amp_g = float(np.clip(abs(A_est), 1e-3, AMP_MAX * 0.999))
+
     if model_name == 'EFFLUX-1EXP':
-        fn = utils.efflux_1exp
-        p0 = (np.clip(y_start, 0.01, 1.99),
-              np.clip(y_end,   -1.99, 1.99),
-              np.clip(tau_e,   0.02, 4999.0),
-              0.0)
-        bnds  = ((0, -2, 0.01, -0.1), (2, 2, 5000, 0.1))
-        names = ['I0', 'Iinf', 'tau', 'D']
-    elif model_name == 'INFLUX-1EXP':
-        fn = utils.influx_1exp
-        p0 = (np.clip(y_start, -1.99, 1.99),
-              np.clip(y_end,    0.01, 1.99),
-              np.clip(tau_e,   0.02, 4999.0),
-              0.0)
-        bnds  = ((-2, 0, 0.01, -0.1), (2, 2, 5000, 0.1))
-        names = ['I0', 'Iinf', 'tau', 'D']
+        # I(t) = Iinf + A*exp(-t/tau) [+ D*t],  A >= 0, Iinf >= 0.
+        # A >= 0 forbids a *rising* efflux; Iinf >= 0 forbids negative
+        # fluorescence. Together they close the degenerate branch in which
+        # the fit rose toward Iinf = 2 while a negative D dragged it back
+        # down — the branch that pinned 21/41 GUVs at the old bound.
+        fn = utils.efflux_1exp_amp
+        p0 = (float(np.clip(y_end, 0.0, IINF_MAX)),
+              amp_g, tau_g, 0.0)
+        bnds  = ((0.0, 0.0, TAU_MIN, d_lo), (IINF_MAX, AMP_MAX, TAU_MAX, d_hi))
+        names = ['Iinf', 'A', 'tau', 'D']
     elif model_name == 'EFFLUX-2EXP':
+        # I(t) = Iinf + a1*exp(-t/tau1) + a2*exp(-t/tau2) [+ D*t]
+        # Same bounds on Iinf and on each amplitude as 1EXP, so setting
+        # a2 = 0 reproduces 1EXP exactly. The 1EXP feasible set is now a
+        # strict SUBSET of the 2EXP feasible set and RSS_2EXP <= RSS_1EXP
+        # holds by construction.
         fn = utils.efflux_2exp
-        p0    = (np.clip(y_end,   -1.99, 1.99),
-                 np.clip(A_est*0.5, 0.01, 1.99),
-                 np.clip(tau_e*0.5, 0.02, 4999.0),
-                 np.clip(A_est*0.5, 0.01, 1.99),
-                 np.clip(tau_e*2.0, 0.02, 4999.0),
+        p0    = (float(np.clip(y_end, 0.0, IINF_MAX)),
+                 amp_g * 0.5, max(tau_g * 0.25, TAU_MIN * 2),
+                 amp_g * 0.5, min(tau_g * 4.0, TAU_MAX * 0.999),
                  0.0)
-        bnds  = ((-2, 0, 0.01, 0, 0.01, -0.1), (2, 2, 5000, 2, 5000, 0.1))
+        bnds  = ((0.0, 0.0, TAU_MIN, 0.0, TAU_MIN, d_lo),
+                 (IINF_MAX, AMP_MAX, TAU_MAX, AMP_MAX, TAU_MAX, d_hi))
         names = ['Iinf', 'a1', 'tau1', 'a2', 'tau2', 'D']
+    elif model_name == 'INFLUX-1EXP':
+        # I(t) = Iinf - A*exp(-t/tau) [+ D*t],  A >= 0, Iinf >= 0.
+        fn = utils.influx_1exp_amp
+        p0 = (float(np.clip(y_end, 0.0, IINF_MAX)),
+              amp_g, tau_g, 0.0)
+        bnds  = ((0.0, 0.0, TAU_MIN, d_lo), (IINF_MAX, AMP_MAX, TAU_MAX, d_hi))
+        names = ['Iinf', 'A', 'tau', 'D']
     elif model_name == 'INFLUX-2EXP':
-        fn = utils.influx_2exp
-        p0    = (np.clip(y_start,  -1.99, 1.99),
-                 np.clip(A_est*0.5, 0.01, 1.99),
-                 np.clip(tau_e*0.5, 0.02, 4999.0),
-                 np.clip(A_est*0.5, 0.01, 1.99),
-                 np.clip(tau_e*2.0, 0.02, 4999.0),
+        fn = utils.influx_2exp_amp
+        p0    = (float(np.clip(y_end, 0.0, IINF_MAX)),
+                 amp_g * 0.5, max(tau_g * 0.25, TAU_MIN * 2),
+                 amp_g * 0.5, min(tau_g * 4.0, TAU_MAX * 0.999),
                  0.0)
-        bnds  = ((-2, 0, 0.01, 0, 0.01, -0.1), (2, 2, 5000, 2, 5000, 0.1))
-        names = ['I0', 'a1', 'tau1', 'a2', 'tau2', 'D']
+        bnds  = ((0.0, 0.0, TAU_MIN, 0.0, TAU_MIN, d_lo),
+                 (IINF_MAX, AMP_MAX, TAU_MAX, AMP_MAX, TAU_MAX, d_hi))
+        names = ['Iinf', 'a1', 'tau1', 'a2', 'tau2', 'D']
     else:
         return None
     return fn, p0, bnds, names
@@ -608,21 +784,352 @@ def _fit_kinetic_model(model_name: str, t_c: np.ndarray, y_c: np.ndarray,
         return None
     fn, p0, bnds, names = spec
 
-    try:
-        params, pcov = sc.curve_fit(fn, t_c, y_c, p0=p0, bounds=bnds, maxfev=10000)
-    except RuntimeError:
+    lo = np.asarray(bnds[0], dtype=float)
+    hi = np.asarray(bnds[1], dtype=float)
+    use_drift = bool(getattr(cfg, 'FIT_INCLUDE_DRIFT', False))
+
+    # --- Multi-start ---------------------------------------------------------
+    # curve_fit's trust-region solver can stall when a starting value sits on
+    # a bound, which previously left a subset of 2EXP fits returning their
+    # initial guess unchanged (identical RSS to 1EXP, to the last bit). We try
+    # the deterministic heuristic guess plus a handful of randomised starts
+    # drawn log-uniformly for the tau parameters, and keep the best.
+    n_extra = int(getattr(cfg, 'FIT_N_MULTISTART', 6))
+    seed    = getattr(cfg, 'FIT_MULTISTART_SEED', 0)
+    rng     = np.random.default_rng(seed)
+
+    t_span = float(t_c[-1] - t_c[0]) if len(t_c) > 1 else 1.0
+    starts = [np.clip(np.asarray(p0, dtype=float), lo, hi)]
+    for _ in range(max(0, n_extra)):
+        cand = np.empty_like(lo)
+        for j, nm in enumerate(names):
+            if nm.startswith('tau'):
+                # log-uniform between a fast fraction of the record and the record
+                a = max(lo[j], t_span * 1e-3)
+                b = min(hi[j], max(t_span, a * 10))
+                cand[j] = float(np.exp(rng.uniform(np.log(a), np.log(b))))
+            elif nm == 'D':
+                cand[j] = 0.0
+            else:
+                cand[j] = float(rng.uniform(lo[j], hi[j]))
+        starts.append(np.clip(cand, lo, hi))
+
+    best = None
+    for start in starts:
+        try:
+            # A multistart point can land somewhere the Jacobian is singular;
+            # curve_fit still returns usable parameters but warns about the
+            # covariance. That start is simply discarded if its RSS is not the
+            # best, so the warning is noise rather than information.
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', sc.OptimizeWarning)
+                params, pcov = sc.curve_fit(fn, t_c, y_c, p0=start,
+                                            bounds=(lo, hi), maxfev=200000)
+        except (RuntimeError, ValueError):
+            continue
+        resid = y_c - fn(t_c, *params)
+        rss = float(np.sum(resid ** 2))
+        if not np.isfinite(rss):
+            continue
+        if best is None or rss < best[0]:
+            best = (rss, params, pcov)
+
+    if best is None:
         return None
 
+    rss, params, pcov = best
     perr = np.sqrt(np.clip(np.diag(pcov), 0, None))
     y_fit = fn(t_c, *params)
-    rss = float(np.sum((y_c - y_fit) ** 2))
     aic, aicc, bic = utils.compute_information_criteria(rss, n=len(t_c), k=len(names))
+
+    # --- Is the decline actually EXPONENTIAL, or merely a decline? -----------
+    # An exponential whose tau greatly exceeds the record is, over the observed
+    # window, a straight line: exp(-t/tau) ~ 1 - t/tau. The fit still returns a
+    # tau, and the panel still looks like "a decay", but nothing in the data
+    # distinguishes it from linear leakage. Comparing the model's RSS against a
+    # plain straight line fitted to the SAME window separates a resolved
+    # exponential relaxation from a slow drift that an exponential was merely
+    # draped over.
+    #
+    #   exp_vs_linear >> 1  : curvature is real and resolved within the record
+    #   exp_vs_linear ~  1  : indistinguishable from a straight line
+    #   exp_vs_linear <  1  : a straight line fits BETTER than the model
+    #
+    # This is a shape descriptor, not a model-selection test: the two have
+    # different parameter counts, so it is not an F-test and no p-value is
+    # implied. It is used only to bin traces by phenotype.
+    if len(t_c) >= 3:
+        lin_coef = np.polyfit(t_c, y_c, 1)
+        rss_linear = float(np.sum((y_c - np.polyval(lin_coef, t_c)) ** 2))
+    else:
+        rss_linear = np.nan
+    exp_vs_linear = (rss_linear / rss
+                     if (np.isfinite(rss_linear) and rss > 0) else np.nan)
+
+    # --- Identifiability -----------------------------------------------------
+    # tau cannot be recovered from a record that ends long before the decay
+    # completes: the data then constrain only the initial slope, and Iinf/tau
+    # trade off freely along a flat valley. Such fits are kept (they still
+    # carry an initial-rate estimate) but flagged so they can be excluded from
+    # population statistics on tau.
+    tau_idx = names.index('tau') if 'tau' in names else (
+        names.index('tau1') if 'tau1' in names else None)
+    tau_val = float(params[tau_idx]) if tau_idx is not None else np.nan
+    tau_se  = float(perr[tau_idx])   if tau_idx is not None else np.nan
+
+    se_ratio_max = float(getattr(cfg, 'TAU_SE_RATIO_MAX', 0.5))
+    frac_max     = float(getattr(cfg, 'TAU_MAX_FRACTION_OF_RECORD', 1/3))
+
+    se_ratio = tau_se / tau_val if (np.isfinite(tau_se) and tau_val > 0) else np.inf
+    tau_too_long = tau_val > frac_max * t_span if np.isfinite(tau_val) else True
+    # Bound check ignores D when drift is disabled: it is pinned to a
+    # degenerate +/-1e-12 window by design, so it is trivially "at bound"
+    # and would otherwise flag every single fit.
+    check = [j for j, nm in enumerate(names)
+             if not (nm == 'D' and not use_drift)]
+    at_bound = bool(
+        any(np.isclose(params[j], lo[j], rtol=0, atol=1e-9) for j in check) or
+        any(np.isclose(params[j], hi[j], rtol=0, atol=1e-9) for j in check)
+    )
+
+    # --- Responding? ---------------------------------------------------------
+    # A flat trace (a GUV below the permeabilisation threshold) has no decay to
+    # measure. Such a GUV is a perfectly valid DATA POINT -- finding the
+    # voltage threshold is the whole experiment -- but it does not carry a tau.
+    #
+    # This test is deliberately MODEL-FREE: whether a vesicle responded is an
+    # observation, not a fit output. The previous version gated on the fitted
+    # amplitude sum, sum|A|, which fails in two ways:
+    #
+    #   (i)  sum|A| is the amplitude the model would express over INFINITE
+    #        time, not the drop realised inside the record. With tau free up
+    #        to FIT_TAU_MAX (5000 s) and a record of ~700 s, the optimiser can
+    #        park tau at the upper bound and carry a large A while the fitted
+    #        curve is, over the observed window, a flat line: exp(-t/tau) only
+    #        moves from 1 to 0.87. On the 260422 Empty 400 V run this called
+    #        GUV 5 (realised drop 0.03) and GUV 10 (realised drop 0.01, trace
+    #        dead flat) 'responding'.
+    #   (ii) the absolute value discards direction, so a trace drifting the
+    #        WRONG way scored the same as one that emptied. The EFFLUX bounds
+    #        (A >= 0) mean a rising trace cannot even be represented, so its
+    #        fitted A is an artefact of the feasible set, not a measurement.
+    #
+    # Instead: compare the SIGNED decline actually observed in the data to
+    # that trace's own high-frequency noise. A robust median of the first and
+    # last few samples sets the endpoints (so one bad frame cannot create or
+    # destroy a response), and the noise scale comes from the MAD of
+    # successive differences, which is insensitive to the slow trend itself.
+    resp_drop, resp_noise = _observed_response(
+        t_c, y_c, efflux=model_name.startswith('EFFLUX'))
+    k_resp = float(getattr(cfg, 'FIT_RESPONSE_AMPLITUDE_SIGMA', 3.0))
+    min_amp = float(getattr(cfg, 'FIT_MIN_RESPONSE_AMPLITUDE', 0.05))
+    responding = bool(np.isfinite(resp_drop) and np.isfinite(resp_noise)
+                      and resp_drop > max(min_amp, k_resp * resp_noise))
+
+    # Retained purely as a diagnostic, no longer a gate: a LARGE amp_total
+    # next to a SMALL resp_drop is the signature of the tau-at-bound
+    # degeneracy described above, so keeping both columns makes that
+    # failure visible in the parameter table instead of silent.
+    amp_idx = [j for j, nm in enumerate(names) if nm in ('A', 'a1', 'a2')]
+    amp_total = float(np.sum(np.abs(params[amp_idx]))) if amp_idx else np.nan
+    resid_std = float(np.std(y_c - y_fit)) if len(y_c) > 2 else np.nan
+
+    # tau is only meaningful for a GUV that actually responded AND whose decay
+    # resolved inside the record.
+    identifiable = bool(responding
+                        and np.isfinite(se_ratio) and se_ratio <= se_ratio_max
+                        and not tau_too_long)
 
     return {
         'model_name': model_name, 'fn': fn, 'params': params, 'names': names,
         'perr': perr, 'y_fit': y_fit, 'rss': rss, 'n_points': len(t_c),
         'aic': aic, 'aicc': aicc, 'bic': bic,
+        'tau_se_ratio': float(se_ratio) if np.isfinite(se_ratio) else np.nan,
+        'tau_over_record': float(tau_val / t_span) if t_span > 0 else np.nan,
+        'tau_identifiable': identifiable,
+        'is_responding': responding,
+        'response_drop': resp_drop,
+        'response_noise': resp_noise,
+        'rss_linear': rss_linear,
+        'exp_vs_linear': exp_vs_linear,
+        'amplitude_total': amp_total,
+        'residual_std': resid_std,
+        'param_at_bound': at_bound,
+        'n_starts_tried': len(starts),
     }
+
+
+def _observed_response(t_c: np.ndarray, y_c: np.ndarray,
+                       efflux: bool = True) -> tuple:
+    """
+    Model-free measure of whether a dye trace actually moved, and by how much.
+
+    Returns (change, noise), both in normalised-intensity units:
+
+      change : SIGNED response amplitude, oriented so that POSITIVE always
+               means "in the expected direction" — a fall for EFFLUX, a rise
+               for INFLUX. A flat trace gives ~0; a trace drifting the wrong
+               way gives a negative value and can therefore never be scored
+               as responding, which a magnitude-only test cannot achieve.
+               Endpoints are MEDIANS of the first and last few samples rather
+               than single points, so one bad frame at either end cannot
+               manufacture or erase a response.
+
+      noise  : robust high-frequency scatter, from the MAD of SUCCESSIVE
+               DIFFERENCES divided by sqrt(2). Differencing removes the slow
+               trend before the scale is estimated, so a genuine smooth decay
+               does not inflate its own rejection threshold — which is what
+               happens if the fit's residual standard deviation is used, since
+               that conflates measurement noise with model misfit.
+    """
+    fin = np.isfinite(y_c)
+    y = np.asarray(y_c, dtype=float)[fin]
+    if y.size < 6:
+        return np.nan, np.nan
+
+    k = int(max(3, min(5, y.size // 10)))
+    y_start = float(np.median(y[:k]))
+    y_end   = float(np.median(y[-k:]))
+    change  = (y_start - y_end) if efflux else (y_end - y_start)
+
+    d = np.diff(y)
+    noise = float(1.4826 * np.median(np.abs(d - np.median(d))) / np.sqrt(2.0))
+    if not np.isfinite(noise) or noise <= 0:
+        noise = float(np.std(d) / np.sqrt(2.0)) if d.size else np.nan
+    return change, noise
+
+
+def _model_free_metrics(t_c: np.ndarray, y_c: np.ndarray) -> dict:
+    """
+    Fit-independent descriptors of a dye trace. These are always reported,
+    including for GUVs whose tau is not identifiable, because they are
+    constrained directly by the data rather than by an extrapolated model.
+
+      t50               : first time the trace falls to <= 0.5 (linear
+                          interpolation between bracketing samples); NaN if
+                          it never does within the record.
+      frac_remaining_*  : normalised intensity at fixed times post-pulse.
+      initial_rate      : slope over the first 10% of the record (per second),
+                          from a straight-line fit. This is the one quantity a
+                          non-identifiable exponential still pins down.
+    """
+    out = {}
+    finite = np.isfinite(y_c)
+    t, y = t_c[finite], y_c[finite]
+    if len(t) < 3:
+        return {'t50_s': np.nan, 't50_censored': False,
+                't50_censored_below_s': np.nan, 'initial_rate_per_s': np.nan,
+                'has_step': False, 'n_steps': 0,
+                'first_step_t_s': np.nan, 'largest_step_drop': np.nan,
+                'drop_t10_s': np.nan, 'drop_t50_s': np.nan,
+                'drop_t90_s': np.nan, 'onset_lag_frac': np.nan}
+
+    # t50 via first downward crossing of 0.5.
+    #
+    # LEFT CENSORING: a GUV that is already below 0.5 at the first fitted
+    # frame crossed 50% during or before the pulse frame itself. The fast
+    # acquisition segment is only ~1.6 s long, so at higher field strengths
+    # a growing fraction of vesicles empty inside it. Reporting t50 = 0 for
+    # those would drag any t50 distribution toward zero with values that are
+    # not measurements — the crossing time is unobserved, only bounded above
+    # by the first sample. Report NaN and flag it; the flag lets a survival
+    # analysis treat these correctly rather than discarding them.
+    t50 = np.nan
+    censored = False
+    below = np.where(y <= 0.5)[0]
+    if below.size > 0:
+        k = int(below[0])
+        if k == 0:
+            # Already below threshold at first observation: crossing time is
+            # left-censored at t[0], not equal to it.
+            censored = True
+        else:
+            y0, y1 = y[k - 1], y[k]
+            if y0 != y1:
+                frac = (y0 - 0.5) / (y0 - y1)
+                t50 = float(t[k - 1] + frac * (t[k] - t[k - 1]))
+            else:
+                t50 = float(t[k])
+    out['t50_s'] = t50
+    out['t50_censored'] = censored
+    # Upper bound on the true crossing time when censored; NaN otherwise.
+    out['t50_censored_below_s'] = float(t[0]) if censored else np.nan
+
+    for target in getattr(cfg, 'MODEL_FREE_REPORT_TIMES_S', [10, 30, 60, 120, 300, 600]):
+        if t[-1] >= target >= t[0]:
+            out[f'frac_remaining_{int(target)}s'] = float(np.interp(target, t, y))
+        else:
+            out[f'frac_remaining_{int(target)}s'] = np.nan
+
+    # --- step detection ----------------------------------------------------
+    # The efflux formula assumes ONE permeabilisation event followed by a
+    # monotonic relaxation. A trace that declines slowly and then drops
+    # abruptly partway through has had a second event (or a tracking/mask
+    # artefact); no single- or double-exponential can describe that, and the
+    # fit will return a tau belonging to neither segment. Flagged, not fitted
+    # around.
+    if len(t) > 8:
+        dy = np.diff(y); dt_ = np.diff(t)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            rate = np.where(dt_ > 0, dy / dt_, np.nan)
+        med_rate = np.nanmedian(rate)
+        scale = np.nanmedian(np.abs(rate - med_rate)) * 1.4826
+        k_step = float(getattr(cfg, 'STEP_DETECT_SIGMA', 6.0))
+        min_drop = float(getattr(cfg, 'STEP_DETECT_MIN_DROP', 0.10))
+        if np.isfinite(scale) and scale > 0:
+            cand = np.where((rate < med_rate - k_step * scale) & (dy < -min_drop))[0]
+        else:
+            cand = np.where(dy < -min_drop)[0]
+        out['has_step'] = bool(cand.size > 0)
+        out['n_steps'] = int(cand.size)
+        out['first_step_t_s'] = float(t[cand[0] + 1]) if cand.size else np.nan
+        out['largest_step_drop'] = float(-dy[cand].min()) if cand.size else np.nan
+    else:
+        out['has_step'] = False; out['n_steps'] = 0
+        out['first_step_t_s'] = np.nan; out['largest_step_drop'] = np.nan
+
+    # --- response timing: milestones of the GUV'S OWN total decline ---------
+    # t50_s above is an ABSOLUTE crossing of 0.5, so a vesicle that only ever
+    # empties to 0.6 never reaches it and reports NaN. These milestones are
+    # relative to each trace's own start and end levels instead, so a partial
+    # responder still gets a timescale, and the shapes of large and small
+    # responses become comparable.
+    #
+    # onset_lag_frac = t10 / t90 is the discriminator between a decline that
+    # begins AT the pulse and one that begins some time after it. A vesicle
+    # permeabilised by the pulse itself starts leaking immediately, so t10 is
+    # a small fraction of t90 (~0.00 in practice). A trace that sits flat and
+    # only then falls gives a large ratio. That lag is not what STEP_DETECT
+    # finds: a step is one abrupt frame-to-frame drop, whereas a delayed onset
+    # can be a perfectly smooth decline that simply starts late, and the two
+    # flag almost disjoint sets of GUVs.
+    k = int(max(3, min(5, y.size // 10)))
+    y_hi = float(np.median(y[:k]))
+    y_lo = float(np.median(y[-k:]))
+    total = y_hi - y_lo
+    ms = {0.10: np.nan, 0.50: np.nan, 0.90: np.nan}
+    if np.isfinite(total) and total > 0 and y.size >= 6:
+        # Median-smooth before reading milestones so a single noisy frame
+        # cannot set the onset time.
+        ys = pd.Series(y).rolling(5, center=True, min_periods=1).median().values
+        for f in ms:
+            hit = np.where(ys <= y_hi - f * total)[0]
+            if hit.size:
+                ms[f] = float(t[hit[0]])
+    out['drop_t10_s'] = ms[0.10]
+    out['drop_t50_s'] = ms[0.50]
+    out['drop_t90_s'] = ms[0.90]
+    out['onset_lag_frac'] = (ms[0.10] / ms[0.90]
+                             if (np.isfinite(ms[0.10]) and np.isfinite(ms[0.90])
+                                 and ms[0.90] > 0) else np.nan)
+
+    span = t[-1] - t[0]
+    early = t <= (t[0] + max(0.10 * span, 1e-9))
+    if early.sum() >= 3:
+        out['initial_rate_per_s'] = float(np.polyfit(t[early], y[early], 1)[0])
+    else:
+        out['initial_rate_per_s'] = np.nan
+    return out
 
 
 def fit_individual_curves(aligned: dict, guv_results: dict, t: np.ndarray, logger: logging.Logger) -> pd.DataFrame:
@@ -643,14 +1150,47 @@ def fit_individual_curves(aligned: dict, guv_results: dict, t: np.ndarray, logge
 
         guv_data = df_track[df_track['guv_id'] == guv_id]
         if guv_data.empty: continue
-        r_px = guv_data['radius'].iloc[0]
-        r_um = r_px * getattr(cfg, 'MICRONS_PER_PIXEL', 1.0)
+        mpp  = getattr(cfg, 'MICRONS_PER_PIXEL', 1.0)
+        radii_px = pd.to_numeric(guv_data['radius'], errors='coerce').dropna()
+        if radii_px.empty:
+            continue
+        # radius_um is the INITIAL radius (used for size grouping). The
+        # terminal radius is exported alongside it so shrinkage is visible
+        # in the parameter table rather than only in the fate labels — a
+        # vesicle that deflates changes its own surface-to-volume ratio over
+        # the record, which matters for any permeability calculation.
+        r_um      = float(radii_px.iloc[0]) * mpp
+        r_um_end  = float(radii_px.iloc[-1]) * mpp
+        r_um_min  = float(radii_px.min()) * mpp
 
         ok = np.isfinite(curve)
         t_c, y_c = t[ok], curve[ok]
 
         if len(t_c) < 5:
             continue
+
+        # Honour FIT_DATA_PERCENTAGE, measured in TIME rather than frame
+        # count so it means the same thing across the variable-rate
+        # schedule. Previously this config value was never read at all and
+        # every fit silently used the whole record.
+        fit_frac = float(getattr(cfg, 'FIT_DATA_PERCENTAGE', 1.0))
+        if 0 < fit_frac < 1.0 and len(t_c) > 1:
+            t_cut = t_c[0] + fit_frac * (t_c[-1] - t_c[0])
+            keep = t_c <= t_cut
+            if keep.sum() >= 5:
+                t_c, y_c = t_c[keep], y_c[keep]
+
+        metrics_free = _model_free_metrics(t_c, y_c)
+
+        # Optionally restrict the fit to the first relaxation, so the efflux
+        # formula is applied to data it can actually describe rather than
+        # averaged across two distinct events.
+        if getattr(cfg, 'FIT_TRUNCATE_AT_FIRST_STEP', False) and metrics_free.get('has_step'):
+            t_step = metrics_free.get('first_step_t_s', np.nan)
+            if np.isfinite(t_step):
+                keep_pre = t_c < t_step
+                if keep_pre.sum() >= 5:
+                    t_c, y_c = t_c[keep_pre], y_c[keep_pre]
 
         y_start, y_end = y_c[0], y_c[-1]
         A_est = abs(y_end - y_start)
@@ -677,18 +1217,41 @@ def fit_individual_curves(aligned: dict, guv_results: dict, t: np.ndarray, logge
             comp_row[f'RSS_{tag}']  = f['rss']  if f else np.nan
             comp_row[f'AICc_{tag}'] = f['aicc'] if f else np.nan
             comp_row[f'BIC_{tag}']  = f['bic']  if f else np.nan
-        if fit_1exp and fit_2exp and np.isfinite(fit_1exp['aicc']) and np.isfinite(fit_2exp['aicc']):
+
+        # --- NESTING ASSERTION ------------------------------------------------
+        # Under the bounds in _get_kinetic_model_spec, 1EXP is a strict special
+        # case of 2EXP (a2 = 0). RSS_2EXP therefore CANNOT exceed RSS_1EXP at a
+        # true optimum. If it does, the 2EXP optimiser failed, and reporting
+        # "1EXP preferred" would be an artefact of that failure rather than
+        # evidence about the kinetics. Flag it and emit NaN instead.
+        tol = float(getattr(cfg, 'FIT_NESTING_TOLERANCE', 1e-6))
+        nesting_ok = True
+        if fit_1exp and fit_2exp:
+            nesting_ok = fit_2exp['rss'] <= fit_1exp['rss'] + tol
+        comp_row['nesting_ok'] = nesting_ok
+
+        if fit_1exp and fit_2exp and not nesting_ok:
+            logger.warning(
+                f"  GUV {guv_id}: 2EXP fit failed to converge "
+                f"(RSS_2EXP={fit_2exp['rss']:.5f} > RSS_1EXP={fit_1exp['rss']:.5f}). "
+                f"2EXP nests 1EXP, so this is an optimiser failure, not a model "
+                f"result. Model comparison suppressed for this GUV."
+            )
+
+        comparable = bool(fit_1exp and fit_2exp and nesting_ok)
+
+        if comparable and np.isfinite(fit_1exp['aicc']) and np.isfinite(fit_2exp['aicc']):
             comp_row['delta_AICc_1EXPminus2EXP'] = fit_1exp['aicc'] - fit_2exp['aicc']
             comp_row['preferred_model_AICc'] = '2EXP' if fit_2exp['aicc'] < fit_1exp['aicc'] else '1EXP'
         else:
             comp_row['delta_AICc_1EXPminus2EXP'] = np.nan
-            comp_row['preferred_model_AICc'] = None
-        if fit_1exp and fit_2exp and np.isfinite(fit_1exp['bic']) and np.isfinite(fit_2exp['bic']):
+            comp_row['preferred_model_AICc'] = None if comparable else 'FIT_FAILED'
+        if comparable and np.isfinite(fit_1exp['bic']) and np.isfinite(fit_2exp['bic']):
             comp_row['delta_BIC_1EXPminus2EXP'] = fit_1exp['bic'] - fit_2exp['bic']
             comp_row['preferred_model_BIC'] = '2EXP' if fit_2exp['bic'] < fit_1exp['bic'] else '1EXP'
         else:
             comp_row['delta_BIC_1EXPminus2EXP'] = np.nan
-            comp_row['preferred_model_BIC'] = None
+            comp_row['preferred_model_BIC'] = None if comparable else 'FIT_FAILED'
         comparison_records.append(comp_row)
 
         primary = fit_1exp if cfg.MODEL_TO_USE == name_1exp else fit_2exp
@@ -698,16 +1261,89 @@ def fit_individual_curves(aligned: dict, guv_results: dict, t: np.ndarray, logge
 
         params, names, perr, fn = primary['params'], primary['names'], primary['perr'], primary['fn']
 
-        res = {'guv_id': guv_id, 'radius_um': r_um}
+        res = {'guv_id': guv_id,
+               'radius_um': r_um,
+               'radius_um_final': r_um_end,
+               'radius_um_min': r_um_min}
         res.update(dict(zip(names, params)))
         res.update({f'{n}_SE': e for n, e in zip(names, perr)})
+
+        # Quality flags. tau_identifiable == False means the record ended
+        # before the decay resolved, so tau and Iinf are extrapolations and
+        # must be excluded from population statistics — use the model-free
+        # columns for those GUVs instead.
+        res['tau_identifiable'] = primary['tau_identifiable']
+        res['is_responding']    = primary['is_responding']
+        res['response_drop']    = primary['response_drop']
+        res['response_noise']   = primary['response_noise']
+        res['exp_vs_linear']    = primary['exp_vs_linear']
+        res['rss_linear']       = primary['rss_linear']
+
+        # --- response phenotype ------------------------------------------
+        # Four mutually exclusive classes, assigned in this order:
+        #
+        #   NON_RESPONDING - no decline resolvable above the trace's own
+        #                    noise. Retained as a data point: locating the
+        #                    voltage threshold is the point of the experiment.
+        #   EXPONENTIAL    - curvature resolved INSIDE the record, i.e. the
+        #                    exponential beats a straight line on the same
+        #                    window by RESPONSE_SHAPE_MIN_RSS_RATIO. Only
+        #                    these carry a tau that means anything.
+        #   DELAYED        - the decline begins measurably AFTER the pulse
+        #                    (onset_lag_frac >= RESPONSE_ONSET_LAG_FRAC),
+        #                    rather than at it.
+        #   GRADUAL        - declines from the pulse onward, but too slowly
+        #                    for the record to distinguish from a straight
+        #                    line. A tau is still fitted and reported; it is
+        #                    an extrapolation and tau_identifiable will
+        #                    almost always be False.
+        #
+        # EXPONENTIAL is tested before DELAYED deliberately. The exponential
+        # is fitted from the pulse, so a trace that sits flat and only then
+        # decays fits it poorly and falls through to DELAYED on its own —
+        # the ordering does not hide late-onset exponentials, it routes them
+        # to the class that describes the more salient feature.
+        _shape_min = float(getattr(cfg, 'RESPONSE_SHAPE_MIN_RSS_RATIO', 3.0))
+        _lag_min   = float(getattr(cfg, 'RESPONSE_ONSET_LAG_FRAC', 0.07))
+        _evl = primary['exp_vs_linear']
+        _lag = metrics_free.get('onset_lag_frac', np.nan)
+        if not primary['is_responding']:
+            res['response_class'] = 'NON_RESPONDING'
+        elif np.isfinite(_evl) and _evl >= _shape_min:
+            res['response_class'] = 'EXPONENTIAL'
+        elif np.isfinite(_lag) and _lag >= _lag_min:
+            res['response_class'] = 'DELAYED'
+        else:
+            res['response_class'] = 'GRADUAL'
+        res['amplitude_total']  = primary['amplitude_total']
+        res['residual_std']     = primary['residual_std']
+        # Fourth agreed flag. Sourced from the fate classification rather
+        # than recomputed here, so "grew" means exactly one thing across the
+        # whole pipeline (same pre-pulse baseline, same terminal-frame
+        # averaging, same threshold) instead of two definitions that can
+        # drift apart. NaN/False when tracking produced no fate map.
+        res['radius_growth_flag'] = bool(
+            str(guv_id) in guv_results.get('grown_guv_ids', set()))
+        res['radius_change_frac'] = float(
+            guv_results.get('radius_change_frac', {}).get(str(guv_id), np.nan))
+        res['tau_se_ratio']     = primary['tau_se_ratio']
+        res['tau_over_record']  = primary['tau_over_record']
+        res['nesting_ok']       = nesting_ok
+        res['rss']              = primary['rss']
+        res['n_points']         = primary['n_points']
+
+        res.update(metrics_free)
         fit_records.append(res)
 
-        # Build a short parameter label for the subplot title
+        # Build a short parameter label for the subplot title. A tau that
+        # failed the identifiability gate is shown parenthesised so the grid
+        # figure cannot be read as though every panel reported a measurement.
         if 'tau2' in names:
             param_str = f"τ₁={params[2]:.1f} s,  τ₂={params[4]:.1f} s"
         else:
             param_str = f"τ = {params[2]:.1f} s"
+        if not primary['tau_identifiable']:
+            param_str = f"({param_str})  τ NOT IDENTIFIABLE"
 
         fit_plot_data.append({
             'guv_id':    guv_id,
@@ -727,6 +1363,7 @@ def fit_individual_curves(aligned: dict, guv_results: dict, t: np.ndarray, logge
                                               guv_results.get('ruptured_guv_ids')),
             out_of_frame_guv_ids=guv_results.get('out_of_frame_guv_ids'),
             shrunk_guv_ids=guv_results.get('shrunk_guv_ids'),
+            grown_guv_ids=guv_results.get('grown_guv_ids'),
         )
         logger.info(f"Saved dye fits grid → {grid_path}")
 
@@ -739,50 +1376,202 @@ def fit_individual_curves(aligned: dict, guv_results: dict, t: np.ndarray, logge
         df_comp.to_csv(comp_path, index=False, float_format='%.4f', na_rep='NaN')
         logger.info(f"Saved model comparison (AICc/BIC, 1EXP vs 2EXP) → {comp_path}")
 
-        n_valid = df_comp['preferred_model_AICc'].notna().sum()
+        n_failed = int((df_comp['preferred_model_AICc'] == 'FIT_FAILED').sum())
+        if n_failed:
+            logger.warning(
+                f"Model comparison: {n_failed}/{len(df_comp)} GUV(s) suppressed "
+                f"because the 2EXP fit did not converge (RSS_2EXP > RSS_1EXP, "
+                f"which is impossible for a nested model). These are optimiser "
+                f"failures — raise FIT_N_MULTISTART if the count is large."
+            )
+
+        valid_mask = ~df_comp['preferred_model_AICc'].isin([None, 'FIT_FAILED'])
+        df_comp_ok = df_comp[valid_mask & df_comp['preferred_model_AICc'].notna()]
+        n_valid = len(df_comp_ok)
         if n_valid > 0:
-            n_2exp_aicc = (df_comp['preferred_model_AICc'] == '2EXP').sum()
-            n_2exp_bic  = (df_comp['preferred_model_BIC']  == '2EXP').sum()
-            mean_d_aicc = df_comp['delta_AICc_1EXPminus2EXP'].mean()
-            mean_d_bic  = df_comp['delta_BIC_1EXPminus2EXP'].mean()
+            n_2exp_aicc = (df_comp_ok['preferred_model_AICc'] == '2EXP').sum()
+            n_2exp_bic  = (df_comp_ok['preferred_model_BIC']  == '2EXP').sum()
+            # Report the MEDIAN. The mean is dominated by a handful of GUVs
+            # with very large positive deltas: the 260422 run had mean
+            # dAICc = +12.4 (nominally "favours 2EXP") while only 5 of 41
+            # GUVs individually preferred 2EXP. A skewed mean says the
+            # opposite of what the per-GUV verdicts say.
+            mean_d_aicc = df_comp_ok['delta_AICc_1EXPminus2EXP'].median()
+            mean_d_bic  = df_comp_ok['delta_BIC_1EXPminus2EXP'].median()
             logger.info(
                 f"Model comparison summary ({n_valid} GUV(s) with both fits): "
                 f"2EXP preferred by AICc in {n_2exp_aicc}/{n_valid}, "
                 f"by BIC in {n_2exp_bic}/{n_valid}. "
-                f"Mean ΔAICc (1EXP−2EXP) = {mean_d_aicc:.2f}, "
-                f"mean ΔBIC (1EXP−2EXP) = {mean_d_bic:.2f}. "
-                f"(Positive Δ favours 2EXP; a difference >~2 is usually "
-                f"considered meaningful for AICc, >~6 for BIC.)"
+                f"Median ΔAICc (1EXP−2EXP) = {mean_d_aicc:.2f}, "
+                f"median ΔBIC (1EXP−2EXP) = {mean_d_bic:.2f}. "
+                f"(Positive Δ favours 2EXP; >~2 is usually taken as meaningful "
+                f"for AICc, >~6 for BIC. NOTE: these criteria assume independent "
+                f"residuals; GUV traces are strongly autocorrelated, which "
+                f"inflates Δ, so treat the threshold as optimistic.)"
             )
         else:
             logger.warning("Model comparison: no GUV had both 1EXP and 2EXP fits converge.")
 
     df_fits = pd.DataFrame(fit_records)
+
+    # Size grouping lives here, with the fit table, rather than inside the
+    # plotting routine. Bin edges are configurable and the resulting counts
+    # are logged, because a bin holding a single vesicle is not a population
+    # and should not be silently boxplotted as one.
+    if not df_fits.empty:
+        bins   = list(getattr(cfg, 'SIZE_GROUP_BINS', [0, 5.0, 8.0, 11.0, 100.0]))
+        labels = list(getattr(cfg, 'SIZE_GROUP_LABELS', ['<5.0', '5.0-8.0', '8.0-11.0', '>11.0']))
+        df_fits['size_group'] = pd.cut(df_fits['radius_um'], bins=bins, labels=labels)
+        counts = df_fits['size_group'].value_counts().reindex(labels).fillna(0).astype(int)
+        logger.info("Size group counts: " + ", ".join(f"{k}: {v}" for k, v in counts.items()))
+        thin = [k for k, v in counts.items() if 0 < v < int(getattr(cfg, 'SIZE_GROUP_MIN_N', 3))]
+        if thin:
+            logger.warning(
+                f"Size group(s) {thin} contain fewer than "
+                f"{getattr(cfg, 'SIZE_GROUP_MIN_N', 3)} GUV(s). Per-experiment "
+                f"size binning is unreliable — pool across experiments before "
+                f"drawing size-dependence conclusions, or regress against "
+                f"continuous radius instead of binning."
+            )
+
+        if 'tau_identifiable' in df_fits.columns:
+            n_id = int(df_fits['tau_identifiable'].sum())
+            logger.info(
+                f"tau identifiability: {n_id}/{len(df_fits)} GUV(s) passed "
+                f"(tau_SE/tau <= {getattr(cfg, 'TAU_SE_RATIO_MAX', 0.5)} and "
+                f"tau <= {getattr(cfg, 'TAU_MAX_FRACTION_OF_RECORD', 1/3):.2f} x record). "
+                f"The remaining {len(df_fits) - n_id} have tau/Iinf reported for "
+                f"completeness only — use the model-free columns (t50_s, "
+                f"frac_remaining_*, initial_rate_per_s) for those."
+            )
+
+    # Primary data export. This used to happen as a side effect inside
+    # generate_parameter_boxplots(), so any failure in plotting also lost
+    # the parameter table.
+    if not df_fits.empty:
+        fits_path = os.path.join(
+            cfg.FOLDER_DYE, f"{cfg.EXPERIMENT_BASE_NAME}_fit_parameters.csv")
+        df_fits.to_csv(fits_path, index=False)
+        if 'response_class' in df_fits.columns:
+            vc = df_fits['response_class'].value_counts()
+            logger.info(
+                "Response classes: "
+                + ", ".join(f"{k}={int(v)}" for k, v in vc.items())
+                + f"  (EXPONENTIAL requires exp_vs_linear >= "
+                  f"{getattr(cfg, 'RESPONSE_SHAPE_MIN_RSS_RATIO', 3.0)}, "
+                  f"DELAYED requires onset_lag_frac >= "
+                  f"{getattr(cfg, 'RESPONSE_ONSET_LAG_FRAC', 0.07)})"
+            )
+            n_exp = int((df_fits['response_class'] == 'EXPONENTIAL').sum())
+            n_tid = int(df_fits['tau_identifiable'].fillna(False).sum())
+            if n_exp != n_tid:
+                logger.info(
+                    f"  Note: {n_exp} GUV(s) classed EXPONENTIAL vs "
+                    f"{n_tid} with identifiable tau. The two gates ask "
+                    f"different questions — shape resolved within the record "
+                    f"vs tau constrained by it — so a mismatch is expected, "
+                    f"not an error."
+                )
+
+        logger.info(f"Saved fit parameters → {fits_path}")
+
     return df_fits
 
 def generate_parameter_boxplots(df_fits: pd.DataFrame, logger: logging.Logger):
     if df_fits.empty: return
-    
-    bins = [0, 5.0, 8.0, 11.0, 100.0]
-    labels = ['<5.0', '5.0-8.0', '8.0-11.0', '>11.0']
-    df_fits['size_group'] = pd.cut(df_fits['radius_um'], bins=bins, labels=labels)
-    
-    df_fits.to_csv(os.path.join(cfg.FOLDER_DYE, f"{cfg.EXPERIMENT_BASE_NAME}_fit_parameters.csv"), index=False)
-    
+
+    if 'size_group' not in df_fits.columns:
+        bins   = list(getattr(cfg, 'SIZE_GROUP_BINS', [0, 5.0, 8.0, 11.0, 100.0]))
+        labels = list(getattr(cfg, 'SIZE_GROUP_LABELS', ['<5.0', '5.0-8.0', '8.0-11.0', '>11.0']))
+        df_fits = df_fits.copy()
+        df_fits['size_group'] = pd.cut(df_fits['radius_um'], bins=bins, labels=labels)
+
+    # Boxplot only the identifiable fits. Boxplotting a tau that the record
+    # cannot constrain produces a distribution of optimiser artefacts.
+    if 'tau_identifiable' in df_fits.columns:
+        n_before = len(df_fits)
+        df_fits = df_fits[df_fits['tau_identifiable'].fillna(False)]
+        if df_fits.empty:
+            logger.warning(
+                f"Parameter boxplots skipped: none of {n_before} fit(s) passed "
+                f"the tau identifiability gate. This usually means the record "
+                f"is too short for the kinetics present, not that the fits are "
+                f"broken — report the model-free metrics instead."
+            )
+            return
+        if len(df_fits) < n_before:
+            logger.info(
+                f"Parameter boxplots use {len(df_fits)}/{n_before} fit(s) with "
+                f"identifiable tau."
+            )
+
+    # Explicit shortlist, not "every numeric column that isn't excluded".
+    # The sweep produced a panel for each of ~24 columns — flags, backing
+    # diagnostics, rss, model-free metrics — giving a 36000 px figure in which
+    # the three quantities the model actually estimates were indistinguishable
+    # from the bookkeeping. Everything else remains in fit_parameters.csv,
+    # which is where per-GUV numbers belong; the boxplot exists to show how
+    # the FITTED PARAMETERS vary with vesicle size, nothing more.
     params_to_plot = [
-        col for col in df_fits.columns
-        if col not in ['guv_id', 'radius_um', 'size_group'] and not col.endswith('_SE')
+        col for col in getattr(cfg, 'BOXPLOT_PARAMS', ['Iinf', 'A', 'tau'])
+        if col in df_fits.columns and pd.api.types.is_numeric_dtype(df_fits[col])
     ]
+    missing = [c for c in getattr(cfg, 'BOXPLOT_PARAMS', ['Iinf', 'A', 'tau'])
+               if c not in df_fits.columns]
+    if missing:
+        logger.info(
+            f"Boxplot parameters not present for model {cfg.MODEL_TO_USE} and "
+            f"skipped: {missing}. (A 2EXP model names them a1/tau1/a2/tau2 — "
+            f"set BOXPLOT_PARAMS accordingly in config.py.)"
+        )
+    if not params_to_plot:
+        return
     
     fig, axes = plt.subplots(1, len(params_to_plot), figsize=(5 * len(params_to_plot), 5))
     if len(params_to_plot) == 1: axes = [axes]
     
+    # seaborn >= 0.13 raises "boxplot statistics and positions must have the
+    # same length" if the categorical carries levels with no rows left after
+    # filtering. Drop unused levels, and drop NaN rows per-parameter.
+    if hasattr(df_fits['size_group'], 'cat'):
+        df_fits = df_fits.copy()
+        df_fits['size_group'] = df_fits['size_group'].cat.remove_unused_categories()
+
     for ax, param in zip(axes, params_to_plot):
-        sns.boxplot(data=df_fits, x='size_group', y=param, ax=ax)
-        sns.stripplot(data=df_fits, x='size_group', y=param, ax=ax, color='black', alpha=0.5)
-        ax.set_title(param)
+        sub = df_fits[['size_group', param]].dropna()
+        if hasattr(sub['size_group'], 'cat'):
+            sub['size_group'] = sub['size_group'].cat.remove_unused_categories()
+        if sub.empty or sub['size_group'].nunique() == 0:
+            ax.text(0.5, 0.5, f'no data\n({param})', ha='center', va='center',
+                    transform=ax.transAxes, fontsize=9, color='0.5')
+            ax.set_title(param); ax.set_xticks([])
+            continue
+        order = list(sub['size_group'].cat.categories) if hasattr(sub['size_group'], 'cat') \
+            else sorted(sub['size_group'].unique())
+        sns.boxplot(data=sub, x='size_group', y=param, ax=ax, order=order)
+        sns.stripplot(data=sub, x='size_group', y=param, ax=ax, order=order,
+                      color='black', alpha=0.5)
+        # Put n ON the axis. After the tau-identifiability gate a box can rest
+        # on two points, which draws a full box-and-whisker that looks like a
+        # distribution. The count belongs in the figure, not only in the log.
+        counts = sub.groupby('size_group', observed=True)[param].size()
+        ax.set_xticks(range(len(order)))
+        ax.set_xticklabels([f'{g}\n(n={int(counts.get(g, 0))})' for g in order])
+        if int(counts.min()) < 3:
+            ax.set_title(f'{param}  [n<3 in a group]', color='#B22222')
+        else:
+            ax.set_title(param)
         ax.set_xlabel(r'Radius ($\mu$m)')
         
+    grp_n = df_fits.groupby('size_group', observed=True).size()
+    thin = grp_n[grp_n < 3]
+    if len(thin):
+        logger.warning(
+            f"Parameter boxplots: size group(s) {list(thin.index)} have "
+            f"n<3 ({dict(thin)}). A box drawn on two points is not a "
+            f"distribution — pool across experiments before interpreting "
+            f"any size dependence in this figure."
+        )
     plt.tight_layout()
     fig.savefig(os.path.join(cfg.FOLDER_DYE, f"{cfg.EXPERIMENT_BASE_NAME}_parameter_boxplots.png"), dpi=300)
     plt.close(fig)
@@ -820,11 +1609,33 @@ def export_results(aligned: dict, dye_mmap_info: tuple, time_array: np.ndarray, 
                             f"snapshot_{i+1}_frame{fi}_at_{int(round(rel_time))}s.png"), styled)
         del dye_stack
 
-    # Export CSV data
+    # Export CSV data.
+    # Columns are named I_retained, not I_uptake. The quantity computed in
+    # normalise_and_align_curves is
+    #     I_retained(t) = (I_bg,t - I_dye,t) / (I_bg,t - I_dye,0) = 1 - I_uptake(t)
+    # which runs 1 -> 0 as dye leaves. The old I_uptake header named the
+    # complement of what was actually written.
+    #
+    # The export now spans the FULL record, including the pre-pulse frames at
+    # negative time. Those frames are where dye0, bg0 and bg_std0 come from,
+    # so without them the baseline underlying every normalised value — and
+    # the dead-GUV filter threshold — cannot be checked from the outputs.
+    # A `phase` column marks which rows the fitter actually saw.
     try:
-        hdrs  = ['Time (s)'] + [f'GUV_{g}_I_uptake' for g in ids] + ['Average_I_uptake']
-        data  = np.hstack([t.reshape(-1,1), arr.T, avg.reshape(-1,1)])
-        pd.DataFrame(data, columns=hdrs).to_csv(
+        t_out   = aligned.get('t_full')
+        arr_out = aligned.get('all_curves_full')
+        if t_out is None or arr_out is None:
+            t_out, arr_out = t, arr
+        avg_out = np.nanmean(arr_out, axis=0)
+
+        phase = np.where(t_out < 0, 'pre_pulse',
+                         np.where(t_out == 0, 'pulse', 'post_pulse'))
+
+        hdrs = ['Time (s)'] + [f'GUV_{g}_I_retained' for g in ids] + ['Average_I_retained']
+        data = np.hstack([t_out.reshape(-1, 1), arr_out.T, avg_out.reshape(-1, 1)])
+        df_out = pd.DataFrame(data, columns=hdrs)
+        df_out.insert(1, 'phase', phase)
+        df_out.to_csv(
             os.path.join(cfg.FOLDER_DYE,
                          f"{cfg.EXPERIMENT_BASE_NAME}_normalized_curves.csv"),
             index=False, float_format='%.6f', na_rep='NaN')
@@ -850,9 +1661,47 @@ def validate_config(logger: logging.Logger) -> bool:
         (1 <= getattr(cfg,'RUPTURE_DETECTION_CONSECUTIVE_FAILS',3) <= 20,
          "RUPTURE_DETECTION_CONSECUTIVE_FAILS should be 1–20"),
     ]
+    checks += [
+        (0 < float(getattr(cfg, 'FIT_DATA_PERCENTAGE', 1.0)) <= 1.0,
+         "FIT_DATA_PERCENTAGE must be in (0, 1]"),
+        (float(getattr(cfg, 'FIT_IINF_MAX', 1.2)) > 0,
+         "FIT_IINF_MAX must be positive (negative fluorescence is unphysical)"),
+        (float(getattr(cfg, 'TAU_SE_RATIO_MAX', 0.5)) > 0,
+         "TAU_SE_RATIO_MAX must be positive"),
+        (0 < float(getattr(cfg, 'TAU_MAX_FRACTION_OF_RECORD', 1/3)) <= 1.0,
+         "TAU_MAX_FRACTION_OF_RECORD must be in (0, 1]"),
+        (0 < float(getattr(cfg, 'BG_PERCENTILE', 15.0)) < float(getattr(cfg, 'BG_SIGMA_UPPER_PERCENTILE', 40.0)) < 50.0,
+         "Require 0 < BG_PERCENTILE < BG_SIGMA_UPPER_PERCENTILE < 50"),
+        (int(getattr(cfg, 'PHOTOMETRY_BLUR_KERNEL', 5)) % 2 == 1,
+         "PHOTOMETRY_BLUR_KERNEL must be odd"),
+    ]
+
     for passed, msg in checks:
         if not passed:
             logger.error(f"Config error: {msg}"); ok = False
+
+    # Channel roles: raises rather than falling back to a default index.
+    try:
+        utils.validate_channel_config(logger)
+    except Exception as e:
+        logger.error(f"Config error: {e}")
+        ok = False
+
+    if getattr(cfg, 'FIT_INCLUDE_DRIFT', False):
+        logger.warning(
+            "FIT_INCLUDE_DRIFT is enabled. The linear D*t term is only "
+            "justified if bleaching has been demonstrated independently in "
+            "this dataset — check that non-responding GUVs actually drift. "
+            "An unconstrained D can cancel real curvature and make tau "
+            "unidentifiable."
+        )
+    if getattr(cfg, 'PHOTOMETRY_BLUR', False):
+        logger.warning(
+            "PHOTOMETRY_BLUR is enabled. Blurring before photometry corrupts "
+            "the per-pixel background std that MIN_PREPULSE_SEPARATION_SIGMA "
+            "divides by; the dead-GUV filter threshold will need recalibrating."
+        )
+
     if not ok:
         logger.critical("Configuration validation failed.")
     return ok
@@ -930,10 +1779,6 @@ def main():
                     dye_stack_bg, n_frames_bg, all_ellipses, local_i,
                     cfg.MEMBRANE_FIXED_HALF_WIDTH, cfg.BG_BUFFER_PIXELS, cfg.BG_RING_WIDTH_PIXELS,
                     img_shape_bg,
-                    exclusion_padding=getattr(cfg, 'BG_EXCLUSION_PADDING_PX', 2),
-                    min_bg_pixels=getattr(cfg, 'BG_EXCLUSION_MIN_PIXELS', 20),
-                    neighbor_hold_frames=getattr(cfg, 'BG_NEIGHBOR_HOLD_FRAMES', 5),
-                    sigma_clip=getattr(cfg, 'BG_SIGMA_CLIP', 3.0),
                 )
                 new_bg_curves.append(bg_med)
                 new_bg_std_curves.append(bg_std)
@@ -941,26 +1786,51 @@ def main():
                 # neighbor-position exclusion AND the statistical clip) —
                 # needed downstream to convert the per-pixel std into a
                 # standard error of the mean.
-                new_bg_n_curves.append(diag['n_pixels_total'] - diag['n_excluded_stats'])
+                new_bg_n_curves.append(diag['n_pixels_total'])
 
                 gid = str(data['circles'][guv_results['valid_guv_indices'][local_i]]['id'])
                 diagnostics_per_guv[gid] = diag
 
-                frames_with_overlap = int(np.sum(n_excl > 0))
-                if frames_with_overlap > 0:
-                    logger.info(
-                        f"  GUV {gid}: neighbor overlap excluded from background "
-                        f"in {frames_with_overlap} frame(s)."
-                    )
+                # Annulus crowding diagnostic. The low-quantile anchor does
+                # not exclude neighbours -- it tolerates them -- so instead of
+                # an exclusion count we report how far the annulus MEDIAN has
+                # been pulled above the quantile anchor. A large gap means
+                # neighbours are filling the ring; the anchor should still be
+                # sound, but it is worth knowing which GUVs sit in crowded
+                # neighbourhoods.
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    gap = (diag['bg_median_raw'] - diag['bg_estimate']) / diag['bg_std_raw']
+                gap = gap[np.isfinite(gap)]
+                if gap.size:
+                    expected = -float(_norm_ppf(getattr(cfg, 'BG_PERCENTILE', 15.0) / 100.0))
+                    if float(np.median(gap)) > expected + 1.0:
+                        logger.info(
+                            f"  GUV {gid}: crowded annulus — (median−quantile)/sigma "
+                            f"= {np.median(gap):.2f} vs {expected:.2f} expected for a "
+                            f"clean ring — neighbours are filling the ring."
+                        )
 
             guv_results['all_background_curves']     = new_bg_curves
             guv_results['all_background_std_curves'] = new_bg_std_curves
             guv_results['all_background_n_curves']   = new_bg_n_curves
 
+            # Optional one-off QC: bath level far from any vesicle. Off by
+            # default — it costs ~50 s per run and tells you nothing about
+            # kinetics. Worth running once per new imaging condition to
+            # confirm the annulus is not sitting in a locally bright region.
+            if getattr(cfg, 'FAR_FIELD_DIAGNOSTIC', False):
+                try:
+                    utils.measure_far_field_background(
+                        dye_stack_bg, n_frames_bg, all_ellipses, img_shape_bg,
+                        exclusion_factor=getattr(cfg, 'FAR_FIELD_EXCLUSION_FACTOR', 2.5),
+                        logger=logger,
+                    )
+                except Exception as _e:
+                    logger.warning(f"Far-field diagnostic skipped: {_e}")
+
             diag_csv = utils.export_background_diagnostics_csv(
                 diagnostics_per_guv, data['time_array'], cfg.FOLDER_DYE,
                 cfg.EXPERIMENT_BASE_NAME,
-                sigma_clip_active=getattr(cfg, 'BG_SIGMA_CLIP', 3.0),
                 logger=logger,
             )
             logger.info(f"Saved background diagnostics → {diag_csv}")
@@ -1059,20 +1929,32 @@ def main():
             except Exception as e:
                 logger.warning(f"Failed to generate shape metrics plots: {e}")
 
-            # 5. Refine RUPTURED / OUT_OF_FRAME into RUPTURED / SHRUNK /
-            # OUT_OF_FRAME / SURVIVED, now that PULSE_FRAME (needed for the
-            # pre-pulse radius baseline) is known. A vesicle that deflates
-            # gradually and only then drops below the ring-detector's
-            # minimum resolvable size will ALSO trip the tracker's raw
-            # rupture-score exit — that's a detection-limit artifact of
-            # shrinkage, not a membrane burst, so it's reclassified SHRUNK
-            # here rather than left counted as a rupture.
+            # 5. Refine the tracker's raw RUPTURED / OUT_OF_FRAME exit tags
+            # into five fates — OUT_OF_FRAME / SHRUNK / RUPTURED / GROWN /
+            # SURVIVED — now that PULSE_FRAME (needed for the pre-pulse
+            # radius baseline) is known. Two asymmetries in the priority
+            # order are deliberate:
+            #   * SHRUNK OVERRIDES a raw RUPTURED tag. A vesicle that
+            #     deflates gradually and only then drops below the
+            #     ring-detector's minimum resolvable size will ALSO trip the
+            #     rupture-score exit — a detection-limit artifact of
+            #     shrinkage, not a membrane burst.
+            #   * GROWN DOES NOT override RUPTURED. Swelling cannot
+            #     masquerade as a rupture-score exit the way deflation can,
+            #     and swell-then-burst is the canonical electroporation
+            #     failure mode, so an expanding vesicle that then bursts is
+            #     scored as the rupture it is.
+            # OUT_OF_FRAME outranks everything: the vesicle's eventual fate
+            # is simply unobserved once it leaves the field of view.
             fate_map, df_fate = utils.classify_guv_fates(
                 df_track,
                 guv_results.get('ruptured_guv_ids', set()),
                 guv_results.get('out_of_frame_guv_ids', set()),
                 shrinkage_fraction_threshold=getattr(cfg, 'SHRINKAGE_FRACTION_THRESHOLD', 0.15),
+                growth_fraction_threshold=getattr(cfg, 'GROWTH_FRACTION_THRESHOLD', 0.15),
                 terminal_n_frames=getattr(cfg, 'SHRINKAGE_TERMINAL_N_FRAMES', 3),
+                growth_use_peak_radius=getattr(cfg, 'GROWTH_USE_PEAK_RADIUS', False),
+                pulse_frame=PULSE_FRAME,
             )
             df_fate.to_csv(
                 os.path.join(cfg.FOLDER_TRACKING,
@@ -1081,29 +1963,60 @@ def main():
             )
             ruptured_guv_ids = {g for g, f in fate_map.items() if f == 'RUPTURED'}
             shrunk_guv_ids   = {g for g, f in fate_map.items() if f == 'SHRUNK'}
+            grown_guv_ids    = {g for g, f in fate_map.items() if f == 'GROWN'}
             out_of_frame_ids_refined = {g for g, f in fate_map.items() if f == 'OUT_OF_FRAME'}
             n_survived = sum(1 for f in fate_map.values() if f == 'SURVIVED')
             logger.info(
                 f"GUV fate classification: {len(ruptured_guv_ids)} ruptured, "
                 f"{len(shrunk_guv_ids)} shrunk (>= "
                 f"{getattr(cfg, 'SHRINKAGE_FRACTION_THRESHOLD', 0.15)*100:.0f}% radius loss), "
+                f"{len(grown_guv_ids)} grown (>= "
+                f"{getattr(cfg, 'GROWTH_FRACTION_THRESHOLD', 0.15)*100:.0f}% radius gain, "
+                f"{'peak' if getattr(cfg, 'GROWTH_USE_PEAK_RADIUS', False) else 'terminal'} radius), "
                 f"{len(out_of_frame_ids_refined)} lost out of frame, "
                 f"{n_survived} survived intact → "
                 f"{cfg.EXPERIMENT_BASE_NAME}_guv_fate_classification.csv"
             )
+            if grown_guv_ids:
+                # A >15% radius gain is ~32% area, which a taut bilayer
+                # cannot supply — so GROWN is either a floppy vesicle
+                # rounding up (circularity rises toward 1) or a tracking /
+                # fusion artifact. Flag it for manual triage rather than
+                # letting it pass silently into the fate counts.
+                logger.warning(
+                    f"{len(grown_guv_ids)} GUV(s) classified GROWN "
+                    f"({', '.join(sorted(grown_guv_ids))}). Radius gains of this "
+                    f"size exceed what bilayer stretching allows, so check "
+                    f"terminal_norm_circularity in the fate CSV: a rise toward 1 "
+                    f"indicates a floppy vesicle tensing up (real), a flat or "
+                    f"falling value suggests vesicle fusion or the ring detector "
+                    f"jumping to a neighbouring object (artifact)."
+                )
             # Stored back on guv_results so any function downstream that
             # only receives guv_results (e.g. fit_individual_curves) can
             # pick up the shrinkage-aware classification without needing an
             # extra parameter threaded through every call.
             guv_results['ruptured_guv_ids_refined'] = ruptured_guv_ids
             guv_results['shrunk_guv_ids']            = shrunk_guv_ids
+            guv_results['grown_guv_ids']             = grown_guv_ids
+            # Signed fractional radius change per GUV, so fit_individual_curves
+            # can report radius_growth_flag together with the NUMBER behind it
+            # without recomputing (and possibly redefining) growth.
+            guv_results['fate_map'] = fate_map
+            guv_results['radius_change_frac'] = dict(
+                zip(df_fate['guv_id'].astype(str), df_fate['frac_radius_change'])
+            )
         else:
             # No tracking dataframe: fall back to the tracker's raw
-            # RUPTURED/OUT_OF_FRAME sets with no shrinkage refinement.
+            # RUPTURED/OUT_OF_FRAME sets with no shrinkage/growth refinement.
             ruptured_guv_ids = guv_results.get('ruptured_guv_ids', set())
             shrunk_guv_ids   = set()
+            grown_guv_ids    = set()
             guv_results['ruptured_guv_ids_refined'] = ruptured_guv_ids
             guv_results['shrunk_guv_ids']            = shrunk_guv_ids
+            guv_results['grown_guv_ids']             = grown_guv_ids
+            guv_results['fate_map'] = {}
+            guv_results['radius_change_frac'] = {}
         
         if getattr(cfg, 'TRACKING_ONLY_MODE', False):
             logger.info("=== TRACKING_ONLY_MODE Active: Halting before intensity analysis ===")
@@ -1142,6 +2055,7 @@ def main():
             ruptured_guv_ids=ruptured_guv_ids,
             out_of_frame_guv_ids=guv_results.get('out_of_frame_guv_ids'),
             shrunk_guv_ids=shrunk_guv_ids,
+            grown_guv_ids=grown_guv_ids,
         )
         logger.info(f"Saved dye summary plot → {summary_path}")
 
@@ -1176,6 +2090,7 @@ def main():
                 ruptured_guv_ids=ruptured_guv_ids,
                 out_of_frame_guv_ids=guv_results.get('out_of_frame_guv_ids'),
                 shrunk_guv_ids=shrunk_guv_ids,
+                grown_guv_ids=grown_guv_ids,
             )
             logger.info(f"Saved actin analysis plot → {plot_path}")
 
@@ -1188,6 +2103,7 @@ def main():
                     ruptured_guv_ids=ruptured_guv_ids,
                     out_of_frame_guv_ids=guv_results.get('out_of_frame_guv_ids'),
                     shrunk_guv_ids=shrunk_guv_ids,
+                    grown_guv_ids=grown_guv_ids,
                 )
                 logger.info(f"Saved dye/actin overlay → {overlay_path}")
 
