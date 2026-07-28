@@ -19,8 +19,8 @@ import re
 
 INPUT_FORMAT = 'ND2' 
 
-DATA_FOLDER  = r"D:\EP\260726_InvE_Empty_SRB_775V"
-EXPERIMENT_BASE_NAME  = "DOPC_Empty_Experiment1-775V-500us-frame5"
+DATA_FOLDER  = r"D:\EP\260422_InvE_Empty_SRB_400V"
+EXPERIMENT_BASE_NAME  = "DOPC_Empty_Experiment1-400V-500us-frame5"
 
 # --- NEW DIRECTORY ROUTING ---
 # Define the master parent directory where all analyses will be stored
@@ -123,8 +123,8 @@ PHOTOMETRY_BLUR_SIGMA  = 1.5
 # change your numbers. Recommended: widen to BG_BUFFER_PIXELS = 6 and
 # BG_RING_WIDTH_PIXELS = 6, then confirm on a sparse field that the
 # background median stops depending on the buffer distance.
-BG_BUFFER_PIXELS = 3        # gap (px) between outer membrane edge and bg ring start
-BG_RING_WIDTH_PIXELS = 2    # width (px) of background sampling ring
+BG_BUFFER_PIXELS = 6        # gap (px) between outer membrane edge and bg ring start
+BG_RING_WIDTH_PIXELS = 4    # width (px) of background sampling ring
 
 # One-off QC: measures the bath level far from any tracked vesicle, to confirm
 # the annulus is not sitting in a locally bright region. Off by default — it
@@ -143,6 +143,9 @@ BG_RING_WIDTH_PIXELS = 2    # width (px) of background sampling ring
 # = 1.00 sigma, matching theory. A fully-emptied vesicle therefore reads
 # about delta/sep0 (~0.4 there) rather than 0. Do NOT read a fitted Iinf as
 # 'fraction of dye retained' without accounting for this.
+
+# Use the low-quantile anchor instead of the median to estimate background
+BG_LEVEL_ESTIMATOR = 'percentile'
 
 # A fitted Iinf therefore mixes genuine trapped dye with this offset and the
 # curve alone cannot separate them. No correction is applied: do not read a
