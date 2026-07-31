@@ -147,9 +147,20 @@ BG_RING_WIDTH_PIXELS = 4    # width (px) of background sampling ring
 # Use the low-quantile anchor instead of the median to estimate background
 BG_LEVEL_ESTIMATOR = 'percentile'
 
+# Which low quantile of the annulus is taken as THE background level.
+# RESTORED: this constant had gone missing from config, so every call site
+# was silently falling back on its getattr default of 15.0 and the value
+# could not be changed from here. 15.0 reproduces that behaviour exactly, so
+# restoring it changes no results — it only makes the knob reachable again
+# and lets validate_config() see the value it checks.
+# Must satisfy 0 < BG_PERCENTILE < BG_SIGMA_UPPER_PERCENTILE < 50.
+BG_PERCENTILE = 15.0
+
 # A fitted Iinf therefore mixes genuine trapped dye with this offset and the
 # curve alone cannot separate them. No correction is applied: do not read a
 # fitted Iinf as 'fraction of dye retained'.
+
+# -----------------------------------------------------------------------------
 # --- 3. FITTING & MODELING ---
 # -----------------------------------------------------------------------------
 
@@ -358,7 +369,17 @@ PULSE_SEARCH_MAX_FRAMES = 5
 # Output sub-folders (created automatically at runtime inside the new directory)
 FOLDER_TRACKING = os.path.join(OUTPUT_IMAGE_FOLDER, "tracking")   # track PNGs/AVIs, metrics, CSVs
 FOLDER_MASKS    = os.path.join(OUTPUT_IMAGE_FOLDER, "masks")      # mask overlay AVI
-FOLDER_DYE      = os.path.join(OUTPUT_IMAGE_FOLDER, "dye")        # fit plots, frame exports, CSVs
+FOLDER_DYE      = os.path.join(OUTPUT_IMAGE_FOLDER, "dye")        # dye-channel root: diagnostics + snapshots
+
+# The dye folder is split so model-dependent and model-free products never
+# sit side by side. Anything under fitting/ inherits the assumptions of
+# MODEL_TO_USE and is only meaningful when the post-pulse sampling actually
+# resolves the transient; anything under intensity/ is a direct measurement
+# that stands on its own. Diagnostics belonging to neither (pulse-frame
+# detection, background diagnostics, contrast QC, dye snapshots) stay in the
+# dye/ root.
+FOLDER_DYE_FITTING   = os.path.join(FOLDER_DYE, "fitting")     # fit grids, fit params, model comparison, boxplots
+FOLDER_DYE_INTENSITY = os.path.join(FOLDER_DYE, "intensity")   # normalised traces, endpoint figure, crops
 FOLDER_ACTIN    = os.path.join(OUTPUT_IMAGE_FOLDER, "actin")      # actin cortex plots, traces, profiles
 
 EXPORT_TIME_POINTS_S     = [0, 50, 100, 200, 300]
@@ -366,6 +387,89 @@ EXPORT_DEBUG_PLOTS       = True
 
 MICRONS_PER_PIXEL        = 0.11 # Plan Apo λ 60x Oil
 SCALE_BAR_LENGTH_MICRONS = 10
+
+# -----------------------------------------------------------------------------
+# --- MODEL-FREE ENDPOINT OUTPUTS (dye/intensity/) ---
+# -----------------------------------------------------------------------------
+
+# Per-GUV multipanel plot (and CSV) of normalised dye intensity BEFORE the
+# pulse vs. at the END of the movie. Intended for datasets where the
+# post-pulse acquisition is too coarse to resolve the efflux transient, so a
+# fitted tau is set by the sampling interval rather than by membrane
+# permeability. The endpoint contrast assumes nothing about the shape of the
+# trajectory between the two time points.
+EXPORT_PREPOST_INTENSITY_PLOT = True
+
+# Frames averaged for the pre-pulse baseline level. The window ends at the
+# frame immediately before the detected pulse frame — the same window the
+# normalisation uses, so I_pre comes out at ~1 by construction.
+PREPOST_N_PRE_FRAMES = 5
+
+# Frames averaged at the END of each GUV's own trace. Taken per-GUV from its
+# last FINITE post-pulse frames, so a vesicle whose tracking ended early
+# reports its own true endpoint (with t_final_s in the CSV recording when
+# that was) rather than being padded or dropped. Set to 1 for the strict
+# last frame; >1 averages down endpoint noise at the cost of reaching
+# slightly further back in time.
+PREPOST_N_FINAL_FRAMES = 3
+
+# --- Endpoint QC gates ---
+# Two ways an endpoint can be numerically fine but scientifically wrong.
+# GUVs failing either gate are FLAGGED, never deleted: they keep their row in
+# the CSV (column `endpoint_qc`, with `qc_pass` False) and their panel in the
+# figure, but they are left out of the reported population mean.
+
+# Minimum length of a GUV's own observation window, as a fraction of the
+# post-pulse duration of the movie. Below this, its "final" value is an early
+# post-pulse sample rather than an endpoint, and pooling it with full-length
+# traces silently averages over two different observation windows. A vesicle
+# that ruptures or leaves the field a few seconds after the pulse typically
+# lands here. Set to 0.0 to disable the gate.
+PREPOST_MIN_FINAL_TIME_FRAC = 0.5
+
+# Maximum permitted RISE of the endpoint above the pre-pulse baseline, in
+# units of that GUV's own pre-pulse SD (floored at the population median SD,
+# so an unusually quiet baseline cannot manufacture a large sigma from a
+# trivial excursion). Efflux only ever lowers lumen intensity, so an endpoint
+# significantly above baseline is not dye loss — it is the ROI having come to
+# enclose brighter surroundings instead of a lumen, which is what happens
+# after rupture. Left unflagged, such a GUV reports a large NEGATIVE release
+# and drags the population mean down while inflating its SD.
+#
+# The test is one-sided by design: a very low endpoint is the expected signal
+# and is never flagged. Set high (e.g. np.inf) to disable the gate.
+PREPOST_MAX_ENDPOINT_RISE_SIGMA = 5.0
+
+# Single-vesicle crops accompanying the endpoint figure: membrane + dye
+# (+ actin when ANALYZE_ACTIN_CHANNEL is on) at the last pre-pulse frame and
+# at each GUV's own final frame.
+EXPORT_GUV_CROPS = True
+
+# Half-width of the crop box in units of the pre-pulse radius. 2.0 spans four
+# radii, leaving roughly one radius of surroundings each side. The box is
+# sized from the PRE-pulse radius and held constant for the final frame, so
+# deflation shows as the vesicle shrinking inside a fixed field rather than
+# being re-zoomed to fill it.
+CROP_FACTOR = 2.0
+
+# Also write each crop as a standalone 8-bit PNG into dye/intensity/crops/
+# (one file per GUV per channel per timepoint), for assembling figures by
+# hand. The montage PNG is written regardless.
+CROP_SAVE_INDIVIDUAL = True
+
+# Use ONE crop box size for every GUV in the montage, sized from the largest
+# pre-pulse radius. Matplotlib stretches each panel to fill its axes, so
+# per-GUV box sizes would make a 10 um and a 25 um vesicle look identical; a
+# single box keeps the whole montage at one pixel scale. False gives tighter
+# framing of small vesicles at the cost of between-GUV size comparison.
+CROP_UNIFORM_BOX = True
+
+# Display colours for the black-to-colour lookup applied to each channel.
+CROP_CHANNEL_COLORS = {
+    'membrane': '#00FF66',
+    'dye':      '#FF3355',
+    'actin':    '#33CCFF',
+}
 
 # Percentiles for contrast boosting (Lower p_low or lower p_high = more contrast)
 CONTRAST_P_LOW  = 0.5  # Ignore bottom 0.5% of pixels
