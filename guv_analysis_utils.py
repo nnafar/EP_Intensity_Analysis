@@ -875,11 +875,18 @@ def track_guv_across_frames(
 def get_intensity_trace_tracked(dye_stack: np.ndarray,
                                 n_frames: int,
                                 per_frame_masks: List[Optional[np.ndarray]],
-                                method: str = 'mean'
+                                method: str = 'mean',
+                                percentile: float = 50.0
                                 ) -> np.ndarray:
     """
     Extract intensity inside *per_frame_masks[i]* from *dye_files[i]*.
     Returns NaN for frames whose mask is None (post-rupture / untracked).
+
+    method : 'mean' | 'median' | 'percentile'
+        'percentile' takes `percentile` of the masked pixels; at 50.0 it is
+        identical to 'median'. Used for the background annulus so the
+        background estimator is set in one place (cfg.BG_PERCENTILE) rather
+        than hard-coded.
     """
     trace = np.full(n_frames, np.nan)
     for i, mask in enumerate(per_frame_masks):
@@ -890,7 +897,9 @@ def get_intensity_trace_tracked(dye_stack: np.ndarray,
         if len(pixels) == 0:
             continue
             
-        if method == 'median':
+        if method == 'percentile':
+            trace[i] = float(np.percentile(pixels, percentile))
+        elif method == 'median':
             trace[i] = float(np.median(pixels))
         else:
             trace[i] = float(np.mean(pixels))
@@ -917,6 +926,7 @@ def recompute_background_traces(
         neighbor_hold_frames: int = 5,
         sigma_clip: float = 3.0,
         sigma_clip_candidates: Optional[List[float]] = None,
+        percentile: float = 50.0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
     """
     Re-extracts the background median AND std for one GUV, frame by frame,
@@ -948,6 +958,17 @@ def recompute_background_traces(
        bright membrane rim or dark lumen from an untracked/unselected
        neighbor sitting in the ring without needing to know where it is.
 
+    Choice of estimator
+    -------------------
+    The value finally reported per frame is `percentile` of the surviving
+    annulus pixels (cfg.BG_PERCENTILE; 50.0 reproduces the median that this
+    function used previously). The MAD sigma-clip in step 2 deliberately
+    keeps using the TRUE MEDIAN as its centre regardless of `percentile` —
+    centring a symmetric ±sigma clip on, say, the 25th percentile would
+    make the rejection lopsided, throwing away the upper half of a
+    perfectly clean annulus. So `percentile` changes what is reported, not
+    which pixels are considered contaminated.
+
     Diagnostics for tuning `sigma_clip`
     ------------------------------------
     While the raw (position-excluded, pre-statistical-clip) pixels for a
@@ -978,9 +999,11 @@ def recompute_background_traces(
 
     Returns
     -------
-    (bg_median_trace, bg_std_trace, n_excluded_pixels_trace, diagnostics)
-        bg_median_trace, bg_std_trace : (n_frames,) float arrays, NaN where
-            no ellipse/frame was available. Reflect the ACTIVE `sigma_clip`.
+    (bg_value_trace, bg_std_trace, n_excluded_pixels_trace, diagnostics)
+        bg_value_trace : (n_frames,) float array of the `percentile` of the
+            surviving pixels (median when percentile=50). NaN where no
+            ellipse/frame was available. Reflects the ACTIVE `sigma_clip`.
+        bg_std_trace : (n_frames,) per-pixel std of the surviving pixels.
         n_excluded_pixels_trace : (n_frames,) int array — total pixels
             removed by either mechanism at the active threshold.
         diagnostics : dict of (n_frames,) arrays —
@@ -988,6 +1011,10 @@ def recompute_background_traces(
             'n_excluded_position'   : pixels removed by neighbor-position exclusion
             'n_excluded_stats'      : pixels removed by the active sigma-clip
             'bg_median_raw'         : median before statistical clipping
+                (also the centre used for the MAD clip)
+            'bg_percentile_raw'     : the ACTIVE `percentile` before
+                statistical clipping — compare against 'bg_median_raw' to
+                see how much the estimator choice actually moves I_bg,t
             'bg_mean_raw'           : mean before statistical clipping
             'bg_std_raw'            : std before statistical clipping
             'bg_mad_raw'            : median absolute deviation (unscaled)
@@ -1000,7 +1027,7 @@ def recompute_background_traces(
         sigma_clip_candidates = [1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0]
 
     n_guvs = len(all_ellipses)
-    bg_median = np.full(n_frames, np.nan)
+    bg_value  = np.full(n_frames, np.nan)   # the reported estimator (percentile)
     bg_std    = np.full(n_frames, np.nan)
     n_excl    = np.zeros(n_frames, dtype=int)
 
@@ -1008,6 +1035,7 @@ def recompute_background_traces(
     n_excluded_position = np.zeros(n_frames, dtype=int)
     n_excluded_stats    = np.zeros(n_frames, dtype=int)
     bg_median_raw       = np.full(n_frames, np.nan)
+    bg_percentile_raw   = np.full(n_frames, np.nan)
     bg_mean_raw          = np.full(n_frames, np.nan)
     bg_std_raw            = np.full(n_frames, np.nan)
     bg_mad_raw            = np.full(n_frames, np.nan)
@@ -1021,6 +1049,7 @@ def recompute_background_traces(
         'n_excluded_position': n_excluded_position,
         'n_excluded_stats':    n_excluded_stats,
         'bg_median_raw':       bg_median_raw,
+        'bg_percentile_raw':   bg_percentile_raw,
         'bg_mean_raw':         bg_mean_raw,
         'bg_std_raw':          bg_std_raw,
         'bg_mad_raw':          bg_mad_raw,
@@ -1030,7 +1059,7 @@ def recompute_background_traces(
         diagnostics[f'frac_excluded_sigma_{s}'] = frac_excluded_by_sigma[s]
 
     if dye_stack is None:
-        return bg_median, bg_std, n_excl, diagnostics
+        return bg_value, bg_std, n_excl, diagnostics
 
     target_ellipses = all_ellipses[target_idx]
 
@@ -1100,8 +1129,9 @@ def recompute_background_traces(
 
         n_pixels_total[i]      = len(pixels)
         n_excluded_position[i] = excluded_by_position
-        bg_median_raw[i] = float(np.median(pixels))
-        bg_mean_raw[i]   = float(np.mean(pixels))
+        bg_median_raw[i]     = float(np.median(pixels))
+        bg_percentile_raw[i] = float(np.percentile(pixels, percentile))
+        bg_mean_raw[i]       = float(np.mean(pixels))
         bg_std_raw[i]    = float(np.std(pixels))
 
         med = bg_median_raw[i]
@@ -1131,10 +1161,10 @@ def recompute_background_traces(
 
         n_excluded_stats[i] = excluded_by_stats
         n_excl[i] = excluded_by_position + excluded_by_stats
-        bg_median[i] = float(np.median(pixels))
-        bg_std[i]    = float(np.std(pixels))
+        bg_value[i] = float(np.percentile(pixels, percentile))
+        bg_std[i]   = float(np.std(pixels))
 
-    return bg_median, bg_std, n_excl, diagnostics
+    return bg_value, bg_std, n_excl, diagnostics
 
 
 def export_background_diagnostics_csv(
@@ -1185,6 +1215,7 @@ def export_background_diagnostics_csv(
                 'n_excluded_position': diag['n_excluded_position'][i],
                 'n_excluded_stats':    diag['n_excluded_stats'][i],
                 'bg_median_raw':       diag['bg_median_raw'][i],
+                'bg_percentile_raw':   diag['bg_percentile_raw'][i],
                 'bg_mean_raw':         diag['bg_mean_raw'][i],
                 'bg_std_raw':          diag['bg_std_raw'][i],
                 'bg_mad_raw':          diag['bg_mad_raw'][i],
@@ -1203,19 +1234,38 @@ def export_background_diagnostics_csv(
 
     if logger is not None and not df.empty:
         mean_raw   = np.nanmean(df['bg_median_raw'])
+        mean_pct   = np.nanmean(df['bg_percentile_raw'])
         mean_mad   = np.nanmean(df['bg_scaled_mad_raw'])
+        bg_pct     = getattr(cfg, 'BG_PERCENTILE', 50.0)
         active_col = f'frac_excluded_sigma_{sigma_clip_active}'
         if active_col in df.columns:
             mean_excl_active = np.nanmean(df[active_col])
             logger.info(
-                f"Background diagnostics: mean raw background = {mean_raw:.2f}, "
+                f"Background diagnostics: mean raw median = {mean_raw:.2f}, "
                 f"mean scaled-MAD = {mean_mad:.2f}, average fraction excluded "
                 f"at sigma_clip={sigma_clip_active} = {mean_excl_active:.3%}."
             )
         else:
             logger.info(
-                f"Background diagnostics: mean raw background = {mean_raw:.2f}, "
+                f"Background diagnostics: mean raw median = {mean_raw:.2f}, "
                 f"mean scaled-MAD = {mean_mad:.2f}."
+            )
+
+        # The active estimator is reported alongside the median, and their
+        # difference is the downward bias that BG_PERCENTILE introduces. It
+        # is the number to check before trusting a non-50 setting, so it is
+        # logged rather than left buried in the diagnostics CSV.
+        if abs(bg_pct - 50.0) > 1e-6:
+            offset = mean_raw - mean_pct
+            rel = (offset / mean_mad) if np.isfinite(mean_mad) and mean_mad > 0 else np.nan
+            logger.info(
+                f"  Active estimator = {bg_pct:g}th percentile "
+                f"(mean = {mean_pct:.2f}), i.e. {offset:.2f} AU below the "
+                f"median" + (f" ({rel:.2f} x scaled-MAD)." if np.isfinite(rel) else ".")
+            )
+            logger.info(
+                "  This offset shifts fully-permeabilised GUVs below zero in "
+                "the normalised curves; the pre-pulse end stays pinned at 1."
             )
 
     return csv_path
@@ -1270,7 +1320,10 @@ def process_single_guv(guv_id: str,
 
     # --- 2. Extract Intensity (Calculation happens here while masks are still in RAM) ---
     intensity_trace  = get_intensity_trace_tracked(dye_stack, n_frames, tracking['inner_masks'], method='mean')
-    background_trace = get_intensity_trace_tracked(dye_stack, n_frames, tracking['bg_masks'], method='median')
+    background_trace = get_intensity_trace_tracked(
+        dye_stack, n_frames, tracking['bg_masks'], method='percentile',
+        percentile=getattr(cfg, 'BG_PERCENTILE', 50.0)
+    )
 
     # --- 2b. Extract Actin Cortex Traces (C2 channel) ---
     actin_data = None
@@ -1766,7 +1819,7 @@ def extract_actin_traces(
     Peak intensity: max of the smoothed radial profile within the FWHM window
                     — directly measures actin density at the cortex apex
     Lumen         : mean intensity inside the GUV (inner mask from tracking)
-    BG            : median background annulus
+    BG            : background annulus at cfg.BG_PERCENTILE (median at 50)
     FWHM          : full-width at half-maximum of the membrane peak, in both px
                     and µm (µm requires *microns_per_pixel* to be set correctly)
 
@@ -1776,7 +1829,7 @@ def extract_actin_traces(
         'cortex_trace'      – mean intensity in the FWHM cortex ring (n_frames,)
         'peak_intensity_trace' – max of radial profile within FWHM   (n_frames,)
         'lumen_trace'       – mean intensity in the GUV lumen         (n_frames,)
-        'bg_trace'          – median background                       (n_frames,)
+        'bg_trace'          – background annulus percentile            (n_frames,)
         'fwhm_px_trace'     – FWHM of the membrane peak in pixels     (n_frames,)
         'fwhm_um_trace'     – FWHM in µm                              (n_frames,)
     """
@@ -1818,7 +1871,10 @@ def extract_actin_traces(
         if inner_m_base is not None and inner_m_base.any():
             lumen_tr[i] = float(np.mean(frame[inner_m_base]))
         if bg_m_base is not None and bg_m_base.any():
-            bg_tr[i] = float(np.median(frame[bg_m_base]))
+            # Same estimator as the dye background (cfg.BG_PERCENTILE), so
+            # the two channels' backgrounds are defined consistently.
+            bg_tr[i] = float(np.percentile(frame[bg_m_base],
+                                           getattr(cfg, 'BG_PERCENTILE', 50.0)))
 
         # --- Cortex and peak: only filled when a distinct peak is found ---
         can_profile = (cx - r_max >= 0 and cx + r_max < w and
@@ -2940,6 +2996,572 @@ def plot_dye_actin_overlay(
 # -------------------------------------------------------------------
 # --- 11. DYE CHANNEL SUMMARY PLOTS ---
 # -------------------------------------------------------------------
+
+
+
+
+
+def _crop_around(frame: np.ndarray, center: Tuple[float, float],
+                 half_size: int) -> np.ndarray:
+    """
+    Fixed-size square crop centred on `center`, zero-padded where the box
+    runs off the edge of the image. Returning a constant (2*half_size)^2
+    array regardless of position is what keeps the pixel scale identical
+    between the two timepoints, so a vesicle that deflates shrinks inside
+    the frame instead of being re-zoomed to fill it.
+    """
+    h, w = frame.shape[:2]
+    cx, cy = int(round(center[0])), int(round(center[1]))
+    size = 2 * half_size
+    out = np.zeros((size, size), dtype=frame.dtype)
+
+    x0, x1 = cx - half_size, cx + half_size
+    y0, y1 = cy - half_size, cy + half_size
+    sx0, sy0 = max(0, x0), max(0, y0)
+    sx1, sy1 = min(w, x1), min(h, y1)
+    if sx1 <= sx0 or sy1 <= sy0:
+        return out
+
+    src = frame[sy0:sy1, sx0:sx1]
+    if src.ndim == 3:
+        src = src[:, :, 0]
+    out[sy0 - y0: sy0 - y0 + src.shape[0],
+        sx0 - x0: sx0 - x0 + src.shape[1]] = src
+    return out
+
+
+def _last_valid_center(centers: List[Optional[Tuple]], frame_idx: int
+                       ) -> Tuple[Optional[Tuple], Optional[int]]:
+    """
+    Centre at `frame_idx`, falling back to the most recent earlier frame
+    that has one. Returns (center, frame_actually_used).
+    """
+    if frame_idx is None or frame_idx < 0:
+        frame_idx = len(centers) - 1
+    frame_idx = min(int(frame_idx), len(centers) - 1)
+    for i in range(frame_idx, -1, -1):
+        if centers[i] is not None:
+            return centers[i], i
+    return None, None
+
+
+def _fluor_cmap(color: str):
+    """Black -> `color` linear colormap, the usual look for a fluorescence channel."""
+    from matplotlib.colors import LinearSegmentedColormap, to_rgb
+    return LinearSegmentedColormap.from_list('fluor', [(0, 0, 0), to_rgb(color)])
+
+
+def export_guv_crops_prepost(
+        prepost_df: pd.DataFrame,
+        gid_to_tracking: dict,
+        pulse_frame: int,
+        time_full: np.ndarray,
+        roi_mmap_info: Tuple,
+        dye_mmap_info: Tuple,
+        actin_mmap_info: Tuple,
+        output_folder: str,
+        experiment_name: str,
+        crop_factor: float = 2.0,
+        microns_per_pixel: float = 1.0,
+        scale_bar_microns: float = 10.0,
+        analyze_actin: bool = False,
+        save_individual: bool = True,
+        uniform_box: bool = True,
+        channel_colors: Optional[dict] = None,
+        ruptured_guv_ids: Optional[set] = None,
+        out_of_frame_guv_ids: Optional[set] = None,
+        shrunk_guv_ids: Optional[set] = None,
+) -> str:
+    """
+    Cropped single-vesicle images accompanying the pre-vs-final endpoint
+    figure: for every GUV, the membrane and dye channels (and the actin
+    channel when it is enabled) at the last pre-pulse frame and at that
+    GUV's own final frame.
+
+    Two conventions here matter for the images to mean anything:
+
+    1. DISPLAY SCALING IS SHARED BETWEEN THE TWO TIMEPOINTS. The intensity
+       range is taken from the PRE-pulse crop of each channel and reused
+       unchanged for the final crop. Per-image autoscaling (what
+       _convert_to_8bit_gray does, correctly, for the tracking overlays)
+       would renormalise a dim post-pulse vesicle back up to full range and
+       erase the very dye loss the figure exists to show. Scaling is per
+       GUV rather than per experiment so that dim and bright vesicles are
+       each visible, which means brightness is comparable ACROSS the two
+       timepoints of one GUV but NOT across GUVs — read the endpoint CSV,
+       not the pixel brightness, for between-vesicle comparisons.
+
+    2. CROP BOX SIZE IS FIXED FROM THE PRE-PULSE RADIUS. Both timepoints
+       are cropped at crop_factor x the pre-pulse radius, so a vesicle that
+       deflates visibly shrinks inside a constant frame instead of being
+       re-zoomed to fill it. With uniform_box=True (the default) ONE box
+       size, set by the largest pre-pulse radius in the experiment, is used
+       for every GUV, so the montage is at a single pixel scale throughout
+       and vesicles can be size-compared against each other by eye. Set it
+       to False to size each box to its own GUV — tighter framing for small
+       vesicles, but then imshow rescales each panel independently and
+       relative sizes across rows become meaningless.
+
+    The final frame is per-GUV, taken from `prepost_df['frame_final']`, so
+    a vesicle that ruptured or drifted out of frame shows its own last
+    observation. Its timestamp is printed on the panel.
+
+    Returns the path of the montage PNG. Individual crops (one PNG per GUV
+    per channel per timepoint, 8-bit, same shared scaling) are written to a
+    `crops/` subfolder when save_individual is True.
+    """
+    if channel_colors is None:
+        channel_colors = {'membrane': '#00FF66', 'dye': '#FF3355', 'actin': '#33CCFF'}
+
+    # ── Assemble the channel list actually available ──────────────────────
+    stacks = []
+    if roi_mmap_info and roi_mmap_info[0] is not None:
+        p, s, d = roi_mmap_info
+        stacks.append(('membrane', np.memmap(p, dtype=d, mode='r', shape=s)))
+    if dye_mmap_info and dye_mmap_info[0] is not None:
+        p, s, d = dye_mmap_info
+        stacks.append(('dye', np.memmap(p, dtype=d, mode='r', shape=s)))
+    if analyze_actin and actin_mmap_info and actin_mmap_info[0] is not None:
+        p, s, d = actin_mmap_info
+        stacks.append(('actin', np.memmap(p, dtype=d, mode='r', shape=s)))
+
+    if not stacks or len(prepost_df) == 0:
+        return ""
+
+    pre_frame = max(0, int(pulse_frame) - 1)
+    time_full = np.asarray(time_full, dtype=float)
+
+    crop_dir = os.path.join(output_folder, 'crops')
+    if save_individual:
+        os.makedirs(crop_dir, exist_ok=True)
+
+    # One box size for the whole montage (see docstring point 2). Taken from
+    # the largest pre-pulse radius so no vesicle is clipped.
+    global_half = None
+    if uniform_box:
+        r_all = []
+        for _, rr in prepost_df.iterrows():
+            trk = gid_to_tracking.get(str(rr['guv_id']))
+            if trk is None:
+                continue
+            _, fp = _last_valid_center(trk['centers'], pre_frame)
+            if fp is not None and trk['radii'][fp]:
+                r_all.append(float(trk['radii'][fp]))
+        if r_all:
+            global_half = max(8, int(round(crop_factor * max(r_all))))
+
+    n_rows = len(prepost_df)
+    n_cols = 2 * len(stacks)   # (pre, final) per channel
+
+    fig, axes = plt.subplots(n_rows, n_cols,
+                             figsize=(2.4 * n_cols, 2.6 * n_rows),
+                             squeeze=False)
+
+    for r_i, (_, r) in enumerate(prepost_df.iterrows()):
+        gid = str(r['guv_id'])
+        tracking = gid_to_tracking.get(gid)
+        status_col, suffix = _guv_status_style(
+            gid, ruptured_guv_ids, out_of_frame_guv_ids, shrunk_guv_ids
+        )
+
+        if tracking is None:
+            for c_i in range(n_cols):
+                axes[r_i][c_i].axis('off')
+            axes[r_i][0].text(0.5, 0.5, f'GUV {gid}\nno tracking data',
+                              ha='center', va='center', fontsize=8)
+            continue
+
+        centers = tracking['centers']
+        radii   = tracking['radii']
+
+        c_pre,  f_pre  = _last_valid_center(centers, pre_frame)
+        f_final_req    = int(r['frame_final']) if r['frame_final'] is not None else -1
+        c_fin,  f_fin  = _last_valid_center(centers, f_final_req)
+        if c_pre is None or c_fin is None:
+            for c_i in range(n_cols):
+                axes[r_i][c_i].axis('off')
+            continue
+
+        # Box size from the PRE-pulse radius (see docstring point 2)
+        r_pre = radii[f_pre] if (f_pre is not None and radii[f_pre]) else None
+        if not r_pre:
+            r_pre = next((x for x in radii if x), 20)
+        half = global_half or max(8, int(round(crop_factor * float(r_pre))))
+
+        for ch_i, (ch_name, stack) in enumerate(stacks):
+            n_f = stack.shape[0]
+            fi_pre = min(f_pre, n_f - 1)
+            fi_fin = min(f_fin, n_f - 1)
+
+            crop_pre = _crop_around(np.asarray(stack[fi_pre]), c_pre, half)
+            crop_fin = _crop_around(np.asarray(stack[fi_fin]), c_fin, half)
+
+            # Shared display range, taken from the PRE crop (docstring point 1)
+            vmin, vmax = np.percentile(
+                crop_pre[crop_pre > 0] if np.any(crop_pre > 0) else crop_pre,
+                (getattr(cfg, 'CONTRAST_P_LOW', 0.5),
+                 getattr(cfg, 'CONTRAST_P_HIGH', 98.0))
+            )
+            if not np.isfinite(vmax) or vmax <= vmin:
+                vmax = vmin + 1.0
+
+            cmap = _fluor_cmap(channel_colors.get(ch_name, '#FFFFFF'))
+
+            for k, (crop, tag, fi) in enumerate(
+                    [(crop_pre, 'pre', fi_pre), (crop_fin, 'final', fi_fin)]):
+                ax = axes[r_i][2 * ch_i + k]
+                ax.imshow(crop, cmap=cmap, vmin=vmin, vmax=vmax,
+                          interpolation='nearest')
+                ax.set_xticks([]); ax.set_yticks([])
+                for sp in ax.spines.values():
+                    sp.set_color(status_col if suffix else '#333333')
+                    sp.set_linewidth(1.8 if suffix else 0.8)
+
+                t_rel = (float(time_full[fi] - time_full[pulse_frame])
+                         if fi < len(time_full) and pulse_frame < len(time_full)
+                         else np.nan)
+                lbl = 'pre-pulse' if tag == 'pre' else 'final'
+                ax.set_xlabel(f'{lbl}  (f{fi}, {t_rel:+.0f} s)', fontsize=6)
+
+                if r_i == 0:
+                    ax.set_title(f'{ch_name.capitalize()} – {lbl}', fontsize=8)
+                if 2 * ch_i + k == 0:
+                    ax.set_ylabel(f"GUV {gid}{suffix}", fontsize=7,
+                                  color=status_col if suffix else 'black')
+
+                # Scale bar on the first channel only, to avoid clutter
+                if ch_i == 0 and microns_per_pixel > 0 and scale_bar_microns > 0:
+                    bar_px = scale_bar_microns / microns_per_pixel
+                    if bar_px < 0.9 * crop.shape[1]:
+                        y = crop.shape[0] - 0.10 * crop.shape[0]
+                        x0 = 0.06 * crop.shape[1]
+                        ax.plot([x0, x0 + bar_px], [y, y], '-', color='white', lw=2.5)
+                        ax.text(x0, y - 0.05 * crop.shape[0],
+                                f'{scale_bar_microns:g} µm',
+                                color='white', fontsize=5, va='bottom')
+
+                if save_individual:
+                    lo, hi = float(vmin), float(vmax)
+                    scaled = np.clip((crop.astype(np.float32) - lo) / (hi - lo), 0, 1)
+                    cv2.imwrite(
+                        os.path.join(
+                            crop_dir,
+                            f'{experiment_name}_GUV{gid}_{ch_name}_{tag}_f{fi}.png'),
+                        (scaled * 255).astype(np.uint8)
+                    )
+
+    plt.suptitle(
+        f'{experiment_name}  –  Single-vesicle crops, pre-pulse vs. final frame\n'
+        f'(display range shared between timepoints; crop box fixed at '
+        f'{crop_factor:g}x pre-pulse radius)',
+        fontsize=10
+    )
+    plt.tight_layout(rect=(0, 0, 1, 0.98))
+
+    out_path = os.path.join(output_folder,
+                            f'{experiment_name}_guv_crops_prepost.png')
+    fig.savefig(out_path, dpi=300)
+    plt.close(fig)
+
+    for _, st in stacks:
+        del st
+
+    return out_path
+
+
+def compute_prepulse_vs_final(
+        curves_full: np.ndarray,
+        time_full: np.ndarray,
+        pulse_frame: int,
+        guv_ids: List[str],
+        n_pre: int = 5,
+        n_final: int = 3,
+) -> pd.DataFrame:
+    """
+    Per-GUV endpoint metric: normalised dye intensity BEFORE the pulse vs.
+    at the END of the movie.
+
+    Motivation
+    ----------
+    When the post-pulse acquisition is too coarse to resolve the efflux
+    transient (i.e. the vesicle has already largely equilibrated by the
+    first or second post-pulse frame), a single-exponential tau is not
+    identifiable and the fitted time constant is dominated by the sampling
+    interval rather than by membrane permeability. The pre-vs-final
+    contrast is the quantity the data *can* support: it measures how much
+    dye was lost in total, without any assumption about the shape of the
+    trajectory in between.
+
+    Definitions
+    -----------
+    I_pre   : mean of the normalised curve over the `n_pre` frames
+              immediately preceding `pulse_frame` (same baseline window
+              used by the normalisation, so I_pre is ~1 by construction;
+              it is recomputed here rather than assumed, and its spread
+              gives an honest pre-pulse noise estimate for the panel).
+    I_final : mean of the last `n_final` FINITE frames of the curve. The
+              last frame is taken per-GUV, not globally: a GUV whose
+              tracking ends early (rupture, drift out of frame) has its
+              own true last observation, and `t_final_s` records when that
+              was so a shortened observation window is visible rather than
+              silently averaged in with full-length traces.
+
+    Returns
+    -------
+    DataFrame with one row per GUV:
+        guv_id, I_pre, I_pre_sd, I_final, I_final_sd, delta_I,
+        released_fraction, released_pct, frame_final, t_final_s,
+        n_final_used
+    where delta_I = I_final - I_pre (negative for efflux) and
+    released_fraction = (I_pre - I_final) / I_pre.
+    """
+    curves_full = np.asarray(curves_full, dtype=float)
+    time_full   = np.asarray(time_full,   dtype=float)
+
+    pre_end   = pulse_frame if pulse_frame > 0 else 1
+    pre_start = max(0, pre_end - int(n_pre))
+
+    rows = []
+    for gid, row in zip(guv_ids, curves_full):
+        pre_vals = row[pre_start:pre_end]
+        pre_vals = pre_vals[np.isfinite(pre_vals)]
+
+        finite_idx = np.flatnonzero(np.isfinite(row))
+        # Only frames at or after the pulse count as "final" — a GUV whose
+        # entire post-pulse trace is NaN must not fall back onto its own
+        # pre-pulse baseline and report zero release.
+        finite_idx = finite_idx[finite_idx >= pulse_frame]
+
+        if pre_vals.size == 0 or finite_idx.size == 0:
+            # I_pre is still reported when only the endpoint is missing, so a
+            # GUV with a clean baseline but no usable post-pulse frame is
+            # distinguishable in the CSV from one that failed outright.
+            rows.append({
+                'guv_id': str(gid),
+                'I_pre':    float(np.mean(pre_vals)) if pre_vals.size else np.nan,
+                'I_pre_sd': float(np.std(pre_vals))  if pre_vals.size > 1 else np.nan,
+                'I_final': np.nan, 'I_final_sd': np.nan, 'delta_I': np.nan,
+                'released_fraction': np.nan, 'released_pct': np.nan,
+                'frame_final': -1, 't_final_s': np.nan, 'n_final_used': 0,
+            })
+            continue
+
+        tail_idx   = finite_idx[-int(max(1, n_final)):]
+        final_vals = row[tail_idx]
+
+        I_pre   = float(np.mean(pre_vals))
+        I_final = float(np.mean(final_vals))
+        f_last  = int(finite_idx[-1])
+
+        t_last = (float(time_full[f_last] - time_full[pulse_frame])
+                  if f_last < len(time_full) and pulse_frame < len(time_full)
+                  else np.nan)
+
+        released = (I_pre - I_final) / I_pre if abs(I_pre) > 1e-9 else np.nan
+
+        rows.append({
+            'guv_id':            str(gid),
+            'I_pre':             I_pre,
+            'I_pre_sd':          float(np.std(pre_vals))   if pre_vals.size   > 1 else 0.0,
+            'I_final':           I_final,
+            'I_final_sd':        float(np.std(final_vals)) if final_vals.size > 1 else 0.0,
+            'delta_I':           I_final - I_pre,
+            'released_fraction': released,
+            'released_pct':      100.0 * released if np.isfinite(released) else np.nan,
+            'frame_final':       f_last,
+            't_final_s':         t_last,
+            'n_final_used':      int(tail_idx.size),
+        })
+
+    return pd.DataFrame(rows)
+
+
+def plot_dye_prepulse_vs_final(
+        curves_full: np.ndarray,
+        time_full: np.ndarray,
+        pulse_frame: int,
+        guv_ids: List[str],
+        output_folder: str,
+        experiment_name: str,
+        n_pre: int = 5,
+        n_final: int = 3,
+        ruptured_guv_ids: Optional[set] = None,
+        out_of_frame_guv_ids: Optional[set] = None,
+        shrunk_guv_ids: Optional[set] = None,
+) -> Tuple[str, str, pd.DataFrame]:
+    """
+    Multipanel per-GUV figure of the pre-pulse -> final-frame intensity
+    change, plus a population summary panel.
+
+    One panel per GUV shows the full normalised trace (pre-pulse frames at
+    negative time, pulse at t = 0), the shaded pre-pulse baseline window
+    with its mean level, and the endpoint level averaged over the last
+    `n_final` finite frames. The vertical arrow between the two levels is
+    the reported delta_I. The panel title carries the released fraction and
+    the time of the last observation, so a GUV that stopped being tracked
+    early is not mistaken for one measured over the full window.
+
+    The final panel is a paired slope graph (pre -> final for every GUV)
+    coloured by tracking fate, giving the population picture without
+    invoking any kinetic model.
+
+    Colour scheme matches the rest of the dye figures via
+    _guv_status_style(): surviving grey, ruptured red, shrunk orange,
+    out-of-frame blue.
+
+    Returns
+    -------
+    (png_path, csv_path, dataframe)
+    """
+    df = compute_prepulse_vs_final(
+        curves_full, time_full, pulse_frame, guv_ids,
+        n_pre=n_pre, n_final=n_final
+    )
+
+    curves_full = np.asarray(curves_full, dtype=float)
+    time_full   = np.asarray(time_full,   dtype=float)
+    t_rel = time_full - time_full[pulse_frame]
+
+    pre_end   = pulse_frame if pulse_frame > 0 else 1
+    pre_start = max(0, pre_end - int(n_pre))
+
+    C_TRACE   = '#888888'
+    C_PRE     = '#2C7FB8'   # baseline level
+    C_FIN     = '#D95F0E'   # endpoint level
+    C_PRE_BAND = '#DCE9F2'  # shaded pre-pulse window
+
+    n        = len(df)
+    if n == 0:
+        return "", "", df
+    n_panels = n + 1
+    ncols    = min(4, n_panels)
+    nrows    = int(np.ceil(n_panels / ncols))
+
+    fig, axes = plt.subplots(nrows, ncols,
+                             figsize=(5 * ncols, 4 * nrows),
+                             squeeze=False)
+
+    for k, (_, r) in enumerate(df.iterrows()):
+        ax = axes[k // ncols][k % ncols]
+        row = curves_full[k]
+        status_col, suffix = _guv_status_style(
+            r['guv_id'], ruptured_guv_ids, out_of_frame_guv_ids, shrunk_guv_ids
+        )
+        c_trace = status_col if suffix else C_TRACE
+
+        # Shaded baseline window
+        if pre_end > pre_start:
+            ax.axvspan(t_rel[pre_start], t_rel[max(pre_start, pre_end - 1)],
+                       color=C_PRE_BAND, alpha=0.9, zorder=0,
+                       label='Pre-pulse window')
+
+        ax.plot(t_rel, row, '-', color=c_trace, lw=1.0, alpha=0.55, zorder=1)
+        ax.plot(t_rel, row, '.', color=c_trace, ms=4, alpha=0.85, zorder=2,
+                label='Data' + suffix)
+
+        if np.isfinite(r['I_pre']):
+            ax.axhline(r['I_pre'], color=C_PRE, ls='--', lw=1.4, zorder=3,
+                       label=f"Pre-pulse = {r['I_pre']:.2f}")
+        if np.isfinite(r['I_final']):
+            ax.axhline(r['I_final'], color=C_FIN, ls='--', lw=1.4, zorder=3,
+                       label=f"Final = {r['I_final']:.2f}")
+
+        # Endpoint marker(s) actually averaged
+        f_last = int(r['frame_final'])
+        if f_last >= 0:
+            n_used = int(r['n_final_used'])
+            finite_idx = np.flatnonzero(np.isfinite(row))
+            finite_idx = finite_idx[finite_idx >= pulse_frame]
+            tail_idx = finite_idx[-n_used:] if n_used > 0 else finite_idx[-1:]
+            ax.plot(t_rel[tail_idx], row[tail_idx], 'o', mfc='none',
+                    mec=C_FIN, mew=1.6, ms=8, zorder=4,
+                    label=f'Final {n_used} frame(s)')
+
+            # Delta arrow at the last time point
+            if np.isfinite(r['I_pre']) and np.isfinite(r['I_final']):
+                ax.annotate(
+                    '', xy=(t_rel[f_last], r['I_final']),
+                    xytext=(t_rel[f_last], r['I_pre']),
+                    arrowprops=dict(arrowstyle='->', color='black', lw=1.6),
+                    zorder=5
+                )
+                ax.text(t_rel[f_last], 0.5 * (r['I_pre'] + r['I_final']),
+                        rf"  $\Delta$I = {r['delta_I']:+.2f}",
+                        fontsize=7, va='center', ha='right', color='black')
+
+        ax.axvline(0, color='crimson', ls='--', lw=1.0, zorder=1)
+
+        title_color = status_col if suffix else 'black'
+        rel_txt = (f"{r['released_pct']:.0f}% released"
+                   if np.isfinite(r['released_pct']) else 'no valid endpoint')
+        t_txt = (f"last obs. t = {r['t_final_s']:.0f} s"
+                 if np.isfinite(r['t_final_s']) else 'last obs. n/a')
+        ax.set_title(f"GUV {r['guv_id']}{suffix}\n{rel_txt}   |   {t_txt}",
+                     fontsize=8, color=title_color)
+        ax.set_xlabel('Time relative to pulse (s)', fontsize=8)
+        ax.set_ylabel('Norm. intensity', fontsize=8)
+        ax.tick_params(labelsize=7)
+        ax.grid(True, alpha=0.20)
+        ax.legend(fontsize=6, loc='best')
+
+    # ── Population summary panel: paired slope graph ──────────────────────
+    sum_ax = axes[n // ncols][n % ncols]
+    for _, r in df.iterrows():
+        if not (np.isfinite(r['I_pre']) and np.isfinite(r['I_final'])):
+            continue
+        col, suffix = _guv_status_style(
+            r['guv_id'], ruptured_guv_ids, out_of_frame_guv_ids, shrunk_guv_ids
+        )
+        sum_ax.plot([0, 1], [r['I_pre'], r['I_final']], '-o',
+                    color=col, lw=1.2, ms=5, alpha=0.75)
+        sum_ax.annotate(str(r['guv_id']), xy=(1.02, r['I_final']),
+                        fontsize=6, va='center', color=col)
+
+    ok = df[np.isfinite(df['I_pre']) & np.isfinite(df['I_final'])]
+    if len(ok) > 0:
+        m_pre, m_fin = ok['I_pre'].mean(), ok['I_final'].mean()
+        s_pre, s_fin = ok['I_pre'].std(),  ok['I_final'].std()
+        sum_ax.errorbar([0, 1], [m_pre, m_fin], yerr=[s_pre, s_fin],
+                        fmt='-s', color='black', lw=2.5, ms=8, capsize=4,
+                        zorder=5, label='Mean ± SD')
+        sum_ax.set_title(
+            f'Pre-pulse → final (n = {len(ok)})\n'
+            f"mean released = {ok['released_pct'].mean():.0f} ± "
+            f"{ok['released_pct'].std():.0f} %",
+            fontsize=8
+        )
+        sum_ax.legend(fontsize=6)
+    else:
+        sum_ax.set_title('Pre-pulse → final (no valid GUVs)', fontsize=8)
+
+    sum_ax.set_xticks([0, 1])
+    sum_ax.set_xticklabels(['Pre-pulse', 'Final frame'], fontsize=8)
+    sum_ax.set_xlim(-0.35, 1.35)
+    sum_ax.set_ylabel('Norm. intensity', fontsize=8)
+    sum_ax.tick_params(labelsize=7)
+    sum_ax.grid(True, axis='y', alpha=0.20)
+
+    for k in range(n_panels, nrows * ncols):
+        axes[k // ncols][k % ncols].set_visible(False)
+
+    plt.suptitle(
+        f'{experiment_name}  –  Pre-pulse vs. final-frame dye intensity '
+        f'(model-free endpoint)',
+        fontsize=11
+    )
+    plt.tight_layout()
+
+    png_path = os.path.join(output_folder,
+                            f'{experiment_name}_dye_prepulse_vs_final.png')
+    fig.savefig(png_path, dpi=300)
+    plt.close(fig)
+
+    csv_path = os.path.join(output_folder,
+                            f'{experiment_name}_dye_prepulse_vs_final.csv')
+    df.to_csv(csv_path, index=False)
+
+    return png_path, csv_path, df
+
 
 def plot_dye_fits_grid(
         fit_data: list,

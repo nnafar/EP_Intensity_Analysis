@@ -25,7 +25,7 @@ EXPERIMENT_BASE_NAME  = "DOPC_Empty_Experiment1-400V-500us-frame5"
 
 # --- NEW DIRECTORY ROUTING ---
 # Define the master parent directory where all analyses will be stored
-PARENT_OUTPUT_FOLDER = r"C:\GitHub\EP_Intensity_Analysis\Outputs"
+PARENT_OUTPUT_FOLDER = r"D:\EP\Outputs"
 
 # Extract the 6-digit YYMMDD date from the DATA_FOLDER name
 _data_dir_name = os.path.basename(os.path.normpath(DATA_FOLDER))
@@ -114,6 +114,41 @@ BG_NEIGHBOR_HOLD_FRAMES = 5
 # to disable.
 BG_SIGMA_CLIP = 3.0
 
+# Percentile of the (neighbor-excluded, sigma-clipped) annulus pixels taken
+# as THE background value for each frame. This is the I_bg,t that enters the
+# normalisation denominator, the dead-GUV separation gate, and the actin
+# background trace.
+#
+# NOTE: 50.0 is exactly the median (the pipeline's original behaviour); the
+# active setting is 15.0. Changing this number is not a robustness tweak — it
+# moves I_bg,t, which moves every normalised curve and therefore every
+# released fraction. A low percentile biases the estimate toward the dim end
+# of the annulus, guarding against residual contamination from an untracked
+# neighbour or bright debris that survived both the position exclusion and
+# the MAD clip. But on a genuinely clean annulus it is no longer estimating
+# the bath — it is estimating the dim tail of the bath's noise distribution.
+#
+# How that bias propagates (normalisation is (I_bg,t - I_dye,t)/(I_bg,t -
+# I_dye,0), so I_bg appears in BOTH numerator and denominator and the bias
+# does NOT simply cancel): a downward bias b in I_bg leaves the PRE-PULSE
+# value pinned at exactly 1 — numerator and denominator are equal there, so
+# that end is bias-immune — but shifts the fully-permeabilised end by about
+# -b / |I_bg,0 - I_dye,0|, i.e. the bias expressed in units of pre-pulse
+# contrast. For roughly Gaussian annulus noise the 15th percentile sits
+# ~1.04 sigma below the mean, so the released fraction is inflated by
+# approximately sigma_bg / contrast.
+#
+# Two things to check on real data before trusting this setting:
+#   1. bg_percentile_raw vs bg_median_raw in
+#      {experiment}_background_diagnostics.csv — their difference IS b. The
+#      run log now prints the mean offset directly.
+#   2. Fully-permeabilised GUVs in the intensity plots. With an unbiased
+#      background they asymptote at 0; a downward-biased one drives them
+#      slightly NEGATIVE, and released_pct in the endpoint CSV can exceed
+#      100%. A small consistent undershoot is the signature of this bias
+#      rather than of a real measurement.
+BG_PERCENTILE = 15.0
+
 # -----------------------------------------------------------------------------
 # --- 3. FITTING & MODELING ---
 # -----------------------------------------------------------------------------
@@ -122,6 +157,60 @@ BG_SIGMA_CLIP = 3.0
 # Dye Influx: ['INFLUX-1EXP' or 'INFLUX-2EXP']
 MODEL_TO_USE        = 'EFFLUX-1EXP' 
 FIT_DATA_PERCENTAGE = 0.9
+
+# Model-free endpoint figure
+# Adds a per-GUV multipanel plot (and CSV) of the normalised dye intensity
+# BEFORE the pulse vs. at the END of the movie. Intended for datasets where
+# the post-pulse acquisition is too coarse to resolve the efflux transient,
+# so a fitted tau is set by the sampling interval rather than by membrane
+# permeability. The endpoint contrast makes no assumption about the shape of
+# the trajectory between the two time points.
+EXPORT_PREPOST_INTENSITY_PLOT = True
+
+# Frames averaged for the pre-pulse baseline level (window ends at the frame
+# immediately before the detected pulse frame — same window the dye
+# normalisation uses, so I_pre comes out at ~1 by construction).
+PREPOST_N_PRE_FRAMES = 5
+
+# Frames averaged at the END of each GUV's own trace for the final level.
+# Taken per-GUV from its last FINITE post-pulse frames, so a vesicle whose
+# tracking ended early reports its own true endpoint (with t_final_s in the
+# CSV recording when that was) rather than being padded or dropped. Set to 1
+# to use the single last frame; >1 averages down endpoint noise at the cost
+# of reaching slightly further back in time.
+PREPOST_N_FINAL_FRAMES = 3
+
+# Single-vesicle crops accompanying the endpoint figure: membrane + dye
+# (+ actin when ANALYZE_ACTIN_CHANNEL is on) at the last pre-pulse frame and
+# at each GUV's own final frame. Written to the dye/intensity/ folder.
+EXPORT_GUV_CROPS = True
+
+# Half-width of the crop box in units of each GUV's PRE-PULSE radius.
+# 2.0 = box spans 4 radii, leaving roughly one radius of surroundings on
+# each side. The box is sized from the pre-pulse radius and held constant
+# for the final frame, so deflation shows up as the vesicle shrinking
+# inside a fixed field rather than being re-zoomed to fill it.
+CROP_FACTOR = 2.0
+
+# Also write each crop as a standalone 8-bit PNG into
+# dye/intensity/crops/ (one file per GUV per channel per timepoint), for
+# assembling figures by hand. The montage PNG is written regardless.
+CROP_SAVE_INDIVIDUAL = True
+
+# Use ONE crop box size for every GUV in the montage, sized from the largest
+# pre-pulse radius in the experiment. Matplotlib stretches each panel to fill
+# its axes, so per-GUV box sizes would make a 10 um and a 25 um vesicle look
+# identical; a single box keeps the whole montage at one pixel scale. Set to
+# False for tighter framing of small vesicles, at the cost of losing
+# between-GUV size comparison by eye.
+CROP_UNIFORM_BOX = True
+
+# Display colours for the black-to-colour lookup applied to each channel.
+CROP_CHANNEL_COLORS = {
+    'membrane': '#00FF66',
+    'dye':      '#FF3355',
+    'actin':    '#33CCFF',
+}
 
 # Pulse-frame detection
 # Set to an integer to hard-pin the pulse frame and skip auto-detection.
@@ -157,7 +246,16 @@ PULSE_SEARCH_MAX_FRAMES = 5
 # Output sub-folders (created automatically at runtime inside the new directory)
 FOLDER_TRACKING = os.path.join(OUTPUT_IMAGE_FOLDER, "tracking")   # track PNGs/AVIs, metrics, CSVs
 FOLDER_MASKS    = os.path.join(OUTPUT_IMAGE_FOLDER, "masks")      # mask overlay AVI
-FOLDER_DYE      = os.path.join(OUTPUT_IMAGE_FOLDER, "dye")        # fit plots, frame exports, CSVs
+FOLDER_DYE      = os.path.join(OUTPUT_IMAGE_FOLDER, "dye")        # dye-channel root: diagnostics + snapshots
+
+# The dye folder is split so that model-dependent and model-free products
+# never sit side by side. Anything under fitting/ inherits the assumptions of
+# MODEL_TO_USE (and is only meaningful when the post-pulse sampling actually
+# resolves the transient); anything under intensity/ is a direct measurement
+# that stands on its own. Diagnostics that belong to neither (pulse-frame
+# detection, background diagnostics, dye snapshots) stay in the dye/ root.
+FOLDER_DYE_FITTING   = os.path.join(FOLDER_DYE, "fitting")     # fit grids, fit params, model comparison, boxplots
+FOLDER_DYE_INTENSITY = os.path.join(FOLDER_DYE, "intensity")   # normalised traces, pre-vs-final endpoint
 FOLDER_ACTIN    = os.path.join(OUTPUT_IMAGE_FOLDER, "actin")      # actin cortex plots, traces, profiles
 
 EXPORT_TIME_POINTS_S     = [0, 50, 100, 200, 300]

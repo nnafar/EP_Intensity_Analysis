@@ -541,6 +541,13 @@ def normalize_and_align_curves(guv_results: dict,
         'valid_guv_ids':            valid_ids,
         'median_jump_frame':        pulse_frame,
         'excluded_dead_guv_ids':    excluded_dead_ids,
+        # Un-truncated normalised curves (pre-pulse frames INCLUDED) and the
+        # matching absolute time base. 'all_curves_aligned' starts at the
+        # pulse and so cannot express a pre-pulse baseline; the model-free
+        # pre-vs-final endpoint figure needs both sides of the pulse.
+        'all_curves_full':          np.array(normalised),
+        'time_full':                time_array,
+        'pre_window':               (safe_pre_start, safe_pre_end),
     }
 
 
@@ -711,7 +718,7 @@ def fit_individual_curves(aligned: dict, guv_results: dict, t: np.ndarray, logge
     # ── Grid figure (replaces individual PNGs) ────────────────────────────
     if fit_plot_data:
         grid_path = utils.plot_dye_fits_grid(
-            fit_plot_data, cfg.FOLDER_DYE,
+            fit_plot_data, cfg.FOLDER_DYE_FITTING,
             cfg.EXPERIMENT_BASE_NAME, cfg.MODEL_TO_USE,
             ruptured_guv_ids=guv_results.get('ruptured_guv_ids_refined',
                                               guv_results.get('ruptured_guv_ids')),
@@ -724,7 +731,7 @@ def fit_individual_curves(aligned: dict, guv_results: dict, t: np.ndarray, logge
     if comparison_records:
         df_comp = pd.DataFrame(comparison_records)
         comp_path = os.path.join(
-            cfg.FOLDER_DYE, f"{cfg.EXPERIMENT_BASE_NAME}_model_comparison.csv"
+            cfg.FOLDER_DYE_FITTING, f"{cfg.EXPERIMENT_BASE_NAME}_model_comparison.csv"
         )
         df_comp.to_csv(comp_path, index=False, float_format='%.4f', na_rep='NaN')
         logger.info(f"Saved model comparison (AICc/BIC, 1EXP vs 2EXP) → {comp_path}")
@@ -757,7 +764,7 @@ def generate_parameter_boxplots(df_fits: pd.DataFrame, logger: logging.Logger):
     labels = ['<5.0', '5.0-8.0', '8.0-11.0', '>11.0']
     df_fits['size_group'] = pd.cut(df_fits['radius_um'], bins=bins, labels=labels)
     
-    df_fits.to_csv(os.path.join(cfg.FOLDER_DYE, f"{cfg.EXPERIMENT_BASE_NAME}_fit_parameters.csv"), index=False)
+    df_fits.to_csv(os.path.join(cfg.FOLDER_DYE_FITTING, f"{cfg.EXPERIMENT_BASE_NAME}_fit_parameters.csv"), index=False)
     
     params_to_plot = [
         col for col in df_fits.columns
@@ -774,7 +781,7 @@ def generate_parameter_boxplots(df_fits: pd.DataFrame, logger: logging.Logger):
         ax.set_xlabel(r'Radius ($\mu$m)')
         
     plt.tight_layout()
-    fig.savefig(os.path.join(cfg.FOLDER_DYE, f"{cfg.EXPERIMENT_BASE_NAME}_parameter_boxplots.png"), dpi=300)
+    fig.savefig(os.path.join(cfg.FOLDER_DYE_FITTING, f"{cfg.EXPERIMENT_BASE_NAME}_parameter_boxplots.png"), dpi=300)
     plt.close(fig)
 
 # -------------------------------------------------------------------
@@ -815,7 +822,7 @@ def export_results(aligned: dict, dye_mmap_info: tuple, time_array: np.ndarray, 
         hdrs  = ['Time (s)'] + [f'GUV_{g}_I_uptake' for g in ids] + ['Average_I_uptake']
         data  = np.hstack([t.reshape(-1,1), arr.T, avg.reshape(-1,1)])
         pd.DataFrame(data, columns=hdrs).to_csv(
-            os.path.join(cfg.FOLDER_DYE,
+            os.path.join(cfg.FOLDER_DYE_INTENSITY,
                          f"{cfg.EXPERIMENT_BASE_NAME}_normalized_curves.csv"),
             index=False, float_format='%.6f', na_rep='NaN')
     except Exception as e:
@@ -857,6 +864,8 @@ def main():
         cfg.FOLDER_TRACKING,
         cfg.FOLDER_MASKS,
         cfg.FOLDER_DYE,
+        cfg.FOLDER_DYE_FITTING,
+        cfg.FOLDER_DYE_INTENSITY,
     ]
     
     if getattr(cfg, 'ANALYZE_ACTIN_CHANNEL', False):
@@ -916,7 +925,7 @@ def main():
             new_bg_n_curves   = []
             diagnostics_per_guv = {}
             for local_i in range(len(all_ellipses)):
-                bg_med, bg_std, n_excl, diag = utils.recompute_background_traces(
+                bg_val, bg_std, n_excl, diag = utils.recompute_background_traces(
                     dye_stack_bg, n_frames_bg, all_ellipses, local_i,
                     cfg.MEMBRANE_FIXED_HALF_WIDTH, cfg.BG_BUFFER_PIXELS, cfg.BG_RING_WIDTH_PIXELS,
                     img_shape_bg,
@@ -924,10 +933,11 @@ def main():
                     min_bg_pixels=getattr(cfg, 'BG_EXCLUSION_MIN_PIXELS', 20),
                     neighbor_hold_frames=getattr(cfg, 'BG_NEIGHBOR_HOLD_FRAMES', 5),
                     sigma_clip=getattr(cfg, 'BG_SIGMA_CLIP', 3.0),
+                    percentile=getattr(cfg, 'BG_PERCENTILE', 50.0),
                 )
-                new_bg_curves.append(bg_med)
+                new_bg_curves.append(bg_val)
                 new_bg_std_curves.append(bg_std)
-                # Final pixel count actually used for bg_med/bg_std (after
+                # Final pixel count actually used for bg_val/bg_std (after
                 # neighbor-position exclusion AND the statistical clip) —
                 # needed downstream to convert the per-pixel std into a
                 # standard error of the mean.
@@ -1128,12 +1138,71 @@ def main():
 
         # Step 4b – dye summary (all traces + mean)
         summary_path = utils.plot_dye_summary(
-            aligned, cfg.FOLDER_DYE, cfg.EXPERIMENT_BASE_NAME,
+            aligned, cfg.FOLDER_DYE_INTENSITY, cfg.EXPERIMENT_BASE_NAME,
             ruptured_guv_ids=ruptured_guv_ids,
             out_of_frame_guv_ids=guv_results.get('out_of_frame_guv_ids'),
             shrunk_guv_ids=shrunk_guv_ids,
         )
         logger.info(f"Saved dye summary plot → {summary_path}")
+
+        # Step 4c – model-free endpoint: pre-pulse vs final frame, per GUV.
+        # Kept separate from (and computed before) the kinetic fitting so it
+        # remains valid when the post-pulse sampling is too coarse for tau to
+        # be identifiable.
+        if getattr(cfg, 'EXPORT_PREPOST_INTENSITY_PLOT', True):
+            prepost_png, prepost_csv, df_prepost = utils.plot_dye_prepulse_vs_final(
+                aligned['all_curves_full'],
+                aligned['time_full'],
+                aligned['median_jump_frame'],
+                aligned['valid_guv_ids'],
+                cfg.FOLDER_DYE_INTENSITY, cfg.EXPERIMENT_BASE_NAME,
+                n_pre=getattr(cfg, 'PREPOST_N_PRE_FRAMES', 5),
+                n_final=getattr(cfg, 'PREPOST_N_FINAL_FRAMES', 3),
+                ruptured_guv_ids=ruptured_guv_ids,
+                out_of_frame_guv_ids=guv_results.get('out_of_frame_guv_ids'),
+                shrunk_guv_ids=shrunk_guv_ids,
+            )
+            logger.info(f"Saved pre-pulse vs final plot → {prepost_png}")
+            logger.info(f"Saved pre-pulse vs final CSV  → {prepost_csv}")
+            _ok = df_prepost['released_pct'].dropna()
+            if len(_ok) > 0:
+                logger.info(
+                    f"  Released fraction across {len(_ok)} GUV(s): "
+                    f"{_ok.mean():.1f} ± {_ok.std():.1f} %"
+                )
+
+            # Matching single-vesicle crops (membrane + dye [+ actin]) at the
+            # last pre-pulse frame and each GUV's own final frame. Keyed off
+            # id_to_raw_idx rather than positional order, since the dead-GUV
+            # filter can leave gaps relative to valid_guv_indices.
+            if getattr(cfg, 'EXPORT_GUV_CROPS', True):
+                gid_to_tracking = {
+                    gid: guv_results['raw_results'][gi][0]['tracking']
+                    for gid, gi in id_to_raw_idx.items()
+                    if guv_results['raw_results'][gi][0] is not None
+                }
+                crops_png = utils.export_guv_crops_prepost(
+                    df_prepost,
+                    gid_to_tracking,
+                    aligned['median_jump_frame'],
+                    aligned['time_full'],
+                    data['roi_mmap_info'],
+                    data['dye_mmap_info'],
+                    data.get('actin_mmap_info', (None, None, None)),
+                    cfg.FOLDER_DYE_INTENSITY, cfg.EXPERIMENT_BASE_NAME,
+                    crop_factor=getattr(cfg, 'CROP_FACTOR', 2.0),
+                    microns_per_pixel=getattr(cfg, 'MICRONS_PER_PIXEL', 1.0),
+                    scale_bar_microns=getattr(cfg, 'SCALE_BAR_LENGTH_MICRONS', 10),
+                    analyze_actin=getattr(cfg, 'ANALYZE_ACTIN_CHANNEL', False),
+                    save_individual=getattr(cfg, 'CROP_SAVE_INDIVIDUAL', True),
+                    uniform_box=getattr(cfg, 'CROP_UNIFORM_BOX', True),
+                    channel_colors=getattr(cfg, 'CROP_CHANNEL_COLORS', None),
+                    ruptured_guv_ids=ruptured_guv_ids,
+                    out_of_frame_guv_ids=guv_results.get('out_of_frame_guv_ids'),
+                    shrunk_guv_ids=shrunk_guv_ids,
+                )
+                if crops_png:
+                    logger.info(f"Saved single-vesicle crops → {crops_png}")
 
         # Step 5 – fit
         df_fits = fit_individual_curves(aligned, guv_results, aligned['t_aligned'], logger)
