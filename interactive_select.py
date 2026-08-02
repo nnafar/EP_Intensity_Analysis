@@ -45,8 +45,9 @@ COLOR_TEXT      = (255, 255, 255) # White  – labels
 COLOR_INSTRUCT  = (0, 255, 255)   # Cyan   – instructions
 
 INSTRUCTIONS = [
-    "Left-drag : draw circle (centre to edge)",
-    "Right-click: remove nearest circle",
+    "Left-click 1: select first edge",
+    "Left-click 2: select opposite edge",
+    "Right-click : cancel drawing or remove nearest",
     "Enter / Space : confirm",
     "Escape : cancel",
 ]
@@ -64,32 +65,42 @@ class _CircleSelector:
         self.scale  = scale                  # original → display factor
         self._confirmed: list[tuple] = []    # (cx, cy, r) in display coords
         self._live:  tuple | None = None
-        self._start: tuple | None = None
-        self._drawing = False
+        self._edge_point: tuple | None = None  # Stores the first click
 
     # ── Mouse callback ──────────────────────────────────────────────────────
 
     def mouse_cb(self, event, x, y, flags, _param):
         if event == cv2.EVENT_LBUTTONDOWN:
-            self._drawing = True
-            self._start   = (x, y)
-            self._live    = (x, y, 0)
+            if self._edge_point is None:
+                # First click sets the starting edge
+                self._edge_point = (x, y)
+                self._live = (x, y, 0)
+            else:
+                # Second click finishes the circle
+                cx = int((self._edge_point[0] + x) / 2)
+                cy = int((self._edge_point[1] + y) / 2)
+                r = int(np.hypot(x - self._edge_point[0], y - self._edge_point[1]) / 2)
+                if r > 4:
+                    self._confirmed.append((cx, cy, r))
+                
+                self._edge_point = None
+                self._live = None
 
-        elif event == cv2.EVENT_MOUSEMOVE and self._drawing:
-            dx, dy = x - self._start[0], y - self._start[1]
-            r = max(0, int(np.hypot(dx, dy)))
-            self._live = (*self._start, r)
-
-        elif event == cv2.EVENT_LBUTTONUP and self._drawing:
-            dx, dy = x - self._start[0], y - self._start[1]
-            r = int(np.hypot(dx, dy))
-            if r > 4:
-                self._confirmed.append((*self._start, r))
-            self._drawing = False
-            self._live    = None
+        elif event == cv2.EVENT_MOUSEMOVE:
+            # Update live preview between first and second clicks
+            if self._edge_point is not None:
+                cx = int((self._edge_point[0] + x) / 2)
+                cy = int((self._edge_point[1] + y) / 2)
+                r = int(np.hypot(x - self._edge_point[0], y - self._edge_point[1]) / 2)
+                self._live = (cx, cy, r)
 
         elif event == cv2.EVENT_RBUTTONDOWN:
-            if self._confirmed:
+            if self._edge_point is not None:
+                # Cancel the active draw operation
+                self._edge_point = None
+                self._live = None
+            elif self._confirmed:
+                # Remove the nearest confirmed circle
                 dists = [np.hypot(cx - x, cy - y) for cx, cy, _ in self._confirmed]
                 self._confirmed.pop(int(np.argmin(dists)))
 
@@ -112,7 +123,10 @@ class _CircleSelector:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55,
                         COLOR_CONFIRMED, 1, cv2.LINE_AA)
 
-        # Live circle
+        # Live circle and active edge point
+        if self._edge_point is not None:
+            cv2.circle(canvas, self._edge_point, 3, COLOR_LIVE, -1)
+            
         if self._live and self._live[2] > 0:
             cx, cy, cr = self._live
             cv2.circle(canvas, (cx, cy), cr, COLOR_LIVE, 1, cv2.LINE_AA)

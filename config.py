@@ -19,8 +19,8 @@ import re
 
 INPUT_FORMAT = 'ND2' 
 
-DATA_FOLDER  = r"D:\EP\260422_InvE_Empty_SRB_400V"
-EXPERIMENT_BASE_NAME  = "DOPC_Empty_Experiment1-400V-500us-frame5"
+DATA_FOLDER  = r"D:\EP\260331_Trial4_InvE_BranchedCortex_SRB_400V"
+EXPERIMENT_BASE_NAME  = "DOPC_BranchedCortex_Experiment2-400V-500us-frame6"
 
 # --- NEW DIRECTORY ROUTING ---
 # Define the master parent directory where all analyses will be stored
@@ -620,7 +620,7 @@ EXPORT_TRACK_VISUALIZATION = True
 # -----------------------------------------------------------------------------
 
 # Enable actin cortex analysis on the C2 channel
-ANALYZE_ACTIN_CHANNEL = False
+ANALYZE_ACTIN_CHANNEL = True
 
 # Which mask to use for the cortex signal.
 # 'membrane' = the ring mask (peak ± MEMBRANE_FIXED_HALF_WIDTH).
