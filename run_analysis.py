@@ -676,6 +676,35 @@ def normalize_and_align_curves(guv_results: dict,
     full_arr = np.array(normalised)
     t_full   = time_array - time_array[pulse_frame]
 
+    # Truncate the POST-pulse record at DYE_ANALYSIS_MAX_TIME_S, if set. The
+    # cut is applied here, before anything is sliced or fitted, so the fits,
+    # the endpoint figure and the exported CSV all see the same window and
+    # cannot silently disagree about it. Pre-pulse frames (t < 0) are never
+    # cut: they carry the baseline the whole normalisation rests on. The dye
+    # snapshots in export_results() read the memmap directly and are
+    # unaffected by design.
+    t_max = getattr(cfg, 'DYE_ANALYSIS_MAX_TIME_S', None)
+    if t_max is not None and np.isfinite(t_max):
+        # Indices up to and including the pulse frame are kept unconditionally,
+        # so `pulse_frame` remains a valid index into the truncated arrays even
+        # if someone sets a nonsensical negative cutoff.
+        keep = (t_full <= float(t_max)) | (np.arange(len(t_full)) <= pulse_frame)
+        n_cut = int((~keep).sum())
+        if n_cut > 0 and keep.any():
+            logger.info(
+                f"Dye analysis window: keeping post-pulse frames up to "
+                f"t = {float(t_max):.2f} s ({int((keep & (t_full >= 0)).sum())} "
+                f"post-pulse frame(s)); {n_cut} later frame(s) excluded "
+                f"[DYE_ANALYSIS_MAX_TIME_S]."
+            )
+            full_arr = full_arr[:, keep]
+            t_full   = t_full[keep]
+        elif n_cut > 0:
+            logger.warning(
+                f"DYE_ANALYSIS_MAX_TIME_S = {t_max} s would leave no frames; "
+                f"ignoring it and using the full record."
+            )
+
     arr   = full_arr[:, pulse_frame:]
     t_al  = t_full[pulse_frame:]
     avg   = np.nanmean(arr, axis=0)
@@ -1721,7 +1750,12 @@ def main():
     ]
     
     if getattr(cfg, 'ANALYZE_ACTIN_CHANNEL', False):
-        folders.append(cfg.FOLDER_ACTIN)
+        folders += [
+            cfg.FOLDER_ACTIN,
+            cfg.FOLDER_ACTIN_KYMOGRAPH,
+            cfg.FOLDER_ACTIN_INTENSITY,
+            cfg.FOLDER_ACTIN_CORTEX,
+        ]
         
     for _folder in folders:
         os.makedirs(_folder, exist_ok=True)
@@ -2159,6 +2193,12 @@ def main():
             )
             valid_ids = aligned['valid_guv_ids']  # GUVs that passed the pre-pulse SNR gate
 
+            # _actin_cortex_traces.csv stays at the actin/ ROOT, not in a
+            # subfolder. It is the single unsmoothed source table behind
+            # figures in BOTH cortex/ (cortex_peak, fwhm_um, gini) and
+            # intensity/ (lumen), so filing it under either one separates it
+            # from half the figures it feeds. Same rule the dye/ root already
+            # follows for products belonging to no single subfolder.
             if getattr(cfg, 'EXPORT_ACTIN_TRACES', True):
                 csv_path = utils.export_actin_csv(
                     aligned_actin, valid_ids,
@@ -2166,9 +2206,20 @@ def main():
                 )
                 logger.info(f"Saved actin traces → {csv_path}")
 
+            # Where everything went. Logged once, at the top of the actin
+            # block, so a missing file can be located from the log instead of
+            # by searching the output tree.
+            logger.info(
+                "Actin outputs: kymographs+pole/equator -> %s | overlay+lumen "
+                "endpoint -> %s | cortex analysis+profiles+evolution -> %s | "
+                "source traces CSV -> %s",
+                cfg.FOLDER_ACTIN_KYMOGRAPH, cfg.FOLDER_ACTIN_INTENSITY,
+                cfg.FOLDER_ACTIN_CORTEX, cfg.FOLDER_ACTIN,
+            )
+
             plot_path = utils.plot_actin_analysis(
                 aligned_actin, valid_ids,
-                cfg.FOLDER_ACTIN, cfg.EXPERIMENT_BASE_NAME,
+                cfg.FOLDER_ACTIN_CORTEX, cfg.EXPERIMENT_BASE_NAME,
                 smooth_sigma=getattr(cfg, 'ACTIN_PLOT_SMOOTH_SIGMA', 1.5),
                 ruptured_guv_ids=ruptured_guv_ids,
                 out_of_frame_guv_ids=guv_results.get('out_of_frame_guv_ids'),
@@ -2181,7 +2232,7 @@ def main():
             if aligned is not None:
                 overlay_path = utils.plot_dye_actin_overlay(
                     aligned, aligned_actin, valid_ids,
-                    cfg.FOLDER_ACTIN, cfg.EXPERIMENT_BASE_NAME,
+                    cfg.FOLDER_ACTIN_INTENSITY, cfg.EXPERIMENT_BASE_NAME,
                     smooth_sigma=getattr(cfg, 'ACTIN_PLOT_SMOOTH_SIGMA', 1.5),
                     ruptured_guv_ids=ruptured_guv_ids,
                     out_of_frame_guv_ids=guv_results.get('out_of_frame_guv_ids'),
@@ -2189,6 +2240,51 @@ def main():
                     grown_guv_ids=grown_guv_ids,
                 )
                 logger.info(f"Saved dye/actin overlay → {overlay_path}")
+
+            # Model-free endpoint figure for LUMENAL ACTIN, method-identical
+            # to the dye one (same function, different channel).
+            #
+            # This is the reason it is worth having. Lumenal actin is released
+            # through the same permeabilised membrane as the SRB, so it is an
+            # independent readout of the same event — but it is measured on the
+            # actin channel, which does NOT carry the dye channel's burst /
+            # time-lapse offset step. Where DYE_ANALYSIS_MAX_TIME_S restricts
+            # the dye to the first acquisition block, this figure still spans
+            # the FULL record, so the slow phase of release remains observable.
+            #
+            # Caveat to carry into any interpretation: unlike the dye, actin is
+            # not a pure released-volume marker. The lumenal ROI also contains
+            # unpolymerised monomer and out-of-focus cortex signal, and the
+            # channel is subject to photobleaching, which release is not. A
+            # no-pulse or low-field control is what separates the two.
+            if getattr(cfg, 'EXPORT_PREPOST_INTENSITY_PLOT', True):
+                lum_full = aligned_actin.get('lumen_norm_full')
+                t_a_full = aligned_actin.get('t_full')
+                if lum_full is not None and t_a_full is not None and len(lum_full):
+                    try:
+                        a_png, a_csv, _ = utils.plot_dye_prepulse_vs_final(
+                            lum_full, t_a_full, PULSE_FRAME, valid_ids,
+                            cfg.FOLDER_ACTIN_INTENSITY, cfg.EXPERIMENT_BASE_NAME,
+                            n_pre=getattr(cfg, 'PREPOST_N_PRE_FRAMES', 5),
+                            n_final=getattr(cfg, 'PREPOST_N_FINAL_FRAMES', 3),
+                            min_final_time_frac=getattr(
+                                cfg, 'PREPOST_MIN_FINAL_TIME_FRAC', 0.5),
+                            max_endpoint_rise_sigma=getattr(
+                                cfg, 'PREPOST_MAX_ENDPOINT_RISE_SIGMA', 5.0),
+                            ruptured_guv_ids=ruptured_guv_ids,
+                            out_of_frame_guv_ids=guv_results.get('out_of_frame_guv_ids'),
+                            shrunk_guv_ids=shrunk_guv_ids,
+                            grown_guv_ids=grown_guv_ids,
+                            file_stem='actin_lumen_prepulse_vs_final',
+                            quantity_label='lumenal actin intensity',
+                        )
+                        logger.info(
+                            f"Saved lumenal-actin endpoint figure → {a_png}")
+                        logger.info(
+                            f"Saved lumenal-actin endpoint CSV → {a_csv}")
+                    except Exception as e:
+                        logger.warning(
+                            f"Could not build lumenal-actin endpoint figure: {e}")
 
             # Actin angular kymographs (directionality of cortex breakdown).
             # Built from a fresh guv_id -> actin_data mapping keyed off
@@ -2217,7 +2313,7 @@ def main():
                     if kd is None:
                         continue
                     kymo_path = utils.plot_actin_angular_kymograph(
-                        kd, gid, cfg.FOLDER_ACTIN, cfg.EXPERIMENT_BASE_NAME,
+                        kd, gid, cfg.FOLDER_ACTIN_KYMOGRAPH, cfg.EXPERIMENT_BASE_NAME,
                         electrode_angle_deg=electrode_angle,
                         angle_display_offset_deg=display_offset,
                     )
@@ -2228,7 +2324,7 @@ def main():
                         angular_half_width_deg=getattr(cfg, 'POLE_EQUATOR_HALF_WIDTH_DEG', 22.5),
                     )
                     pe_path = utils.plot_pole_vs_equator(
-                        pe_data, gid, cfg.FOLDER_ACTIN, cfg.EXPERIMENT_BASE_NAME
+                        pe_data, gid, cfg.FOLDER_ACTIN_KYMOGRAPH, cfg.EXPERIMENT_BASE_NAME
                     )
                     logger.info(f"  GUV {gid}: saved pole-vs-equator trace → {pe_path}")
 
@@ -2238,7 +2334,7 @@ def main():
                 if kymo_data_list:
                     group_path = utils.plot_actin_angular_kymograph_group(
                         kymo_data_list, kymo_ids,
-                        cfg.FOLDER_ACTIN, cfg.EXPERIMENT_BASE_NAME,
+                        cfg.FOLDER_ACTIN_KYMOGRAPH, cfg.EXPERIMENT_BASE_NAME,
                         electrode_angle_deg=electrode_angle,
                         angle_display_offset_deg=display_offset,
                     )
@@ -2268,7 +2364,7 @@ def main():
                 # Single Radial profile  (pre-pulse frame, per GUV)
                 utils.plot_actin_spatial_snapshot(
                     actin_stack_main, snapshots,
-                    cfg.FOLDER_ACTIN, cfg.EXPERIMENT_BASE_NAME,
+                    cfg.FOLDER_ACTIN_CORTEX, cfg.EXPERIMENT_BASE_NAME,
                     microns_per_pixel=getattr(cfg, 'MICRONS_PER_PIXEL', 1.0),
                 )
 
@@ -2287,8 +2383,10 @@ def main():
                 if evolution_input:
                     evo_path = utils.plot_actin_radial_evolution(
                         actin_stack_main, evolution_input,
-                        cfg.FOLDER_ACTIN, cfg.EXPERIMENT_BASE_NAME,
+                        cfg.FOLDER_ACTIN_CORTEX, cfg.EXPERIMENT_BASE_NAME,
                         microns_per_pixel=getattr(cfg, 'MICRONS_PER_PIXEL', 1.0),
+                        time_array=data['time_array'],
+                        pulse_frame=PULSE_FRAME,
                     )
                     logger.info(f"Saved actin radial evolution plot → {evo_path}")
 

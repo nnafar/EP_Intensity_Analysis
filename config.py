@@ -20,7 +20,7 @@ import re
 INPUT_FORMAT = 'ND2' 
 
 DATA_FOLDER  = r"D:\EP\260331_Trial4_InvE_BranchedCortex_SRB_400V"
-EXPERIMENT_BASE_NAME  = "DOPC_BranchedCortex_Experiment2-400V-500us-frame6"
+EXPERIMENT_BASE_NAME  = "DOPC_BranchedCortex_Experiment1-400V-500us-frame6"
 
 # --- NEW DIRECTORY ROUTING ---
 # Define the master parent directory where all analyses will be stored
@@ -380,13 +380,67 @@ FOLDER_DYE      = os.path.join(OUTPUT_IMAGE_FOLDER, "dye")        # dye-channel 
 # dye/ root.
 FOLDER_DYE_FITTING   = os.path.join(FOLDER_DYE, "fitting")     # fit grids, fit params, model comparison, boxplots
 FOLDER_DYE_INTENSITY = os.path.join(FOLDER_DYE, "intensity")   # normalised traces, endpoint figure, crops
-FOLDER_ACTIN    = os.path.join(OUTPUT_IMAGE_FOLDER, "actin")      # actin cortex plots, traces, profiles
+FOLDER_ACTIN    = os.path.join(OUTPUT_IMAGE_FOLDER, "actin")      # actin-channel root
+
+# The actin folder is split the same way the dye folder is, by what the
+# product actually measures rather than by which function emitted it:
+#   kymograph/ - angular/directional products (per-GUV and population-average
+#                kymographs, pole-vs-equator traces). Everything here depends
+#                on ELECTRODE_ANGLE_DEG being correct.
+#   intensity/ - amplitude products: the normalised traces CSV, the dye/actin
+#                overlay, and the model-free lumenal-actin endpoint figure.
+#                Lumenal actin is measured on the actin channel, which has no
+#                burst/time-lapse acquisition break, so unlike the dye these
+#                span the FULL record.
+#   cortex/    - radial-structure products: cortex analysis, radial profiles at
+#                the pre-pulse frame, and the radial-profile evolution.
+# _actin_cortex_traces.csv stays at the actin/ ROOT: it is the one unsmoothed
+# source table feeding figures in both cortex/ and intensity/, so it belongs
+# to neither.
+FOLDER_ACTIN_KYMOGRAPH = os.path.join(FOLDER_ACTIN, "kymograph")
+FOLDER_ACTIN_INTENSITY = os.path.join(FOLDER_ACTIN, "intensity")
+FOLDER_ACTIN_CORTEX    = os.path.join(FOLDER_ACTIN, "cortex")
 
 EXPORT_TIME_POINTS_S     = [0, 50, 100, 200, 300]
 EXPORT_DEBUG_PLOTS       = True
 
 MICRONS_PER_PIXEL        = 0.11 # Plan Apo λ 60x Oil
 SCALE_BAR_LENGTH_MICRONS = 10
+
+# -----------------------------------------------------------------------------
+# --- DYE ANALYSIS TIME WINDOW ---
+# -----------------------------------------------------------------------------
+
+# Upper limit, in seconds AFTER the pulse, on the dye-channel frames that
+# enter the normalised curves, the fits, and the endpoint figure. Set to None
+# for no limit (the full record).
+#
+# WHY THIS EXISTS
+# ---------------
+# The normalisation is
+#     I_retained(t) = (I_bg,t - I_dye,t) / (I_bg,t - I_dye,0)
+# with a TIME-VARYING numerator but a denominator pinned to the pre-pulse
+# lumen level I_dye,0. That is correct only while the dye channel's intensity
+# scale is the same as it was at t = 0. When an acquisition switches from a
+# fast burst block to a slower time-lapse block, the dye channel typically
+# picks up a uniform additive offset at the boundary. I_bg,t then moves toward
+# I_dye,0 and the denominator collapses — on the 400 V / 500 us / frame-6 run
+# it went from about -18 AU to -4 AU, a fourfold shrinkage, and for one GUV it
+# crossed zero and inverted sign. The resulting curves rise to 2-7x baseline
+# and every downstream product (tau, is_responding, released_pct) follows the
+# denominator instead of the vesicle.
+#
+# This gate truncates the record at the last frame of the first acquisition
+# block, keeping the window over which the intensity scale is constant. The
+# pre-pulse baseline is ALWAYS retained regardless of this setting; only
+# post-pulse frames are dropped. The dye SNAPSHOTS are deliberately NOT gated
+# — they are read straight from the memmap over the full record, so the movie
+# stills still show the whole time course.
+#
+# Set this from the dataset's own acquisition structure (check the frame
+# interval and the bg_estimate column of _background_diagnostics.csv for a
+# step), not by eye on the normalised curves.
+DYE_ANALYSIS_MAX_TIME_S = 1.5 #None
 
 # -----------------------------------------------------------------------------
 # --- MODEL-FREE ENDPOINT OUTPUTS (dye/intensity/) ---
@@ -642,7 +696,7 @@ ACTIN_PEAK_MIN_PROMINENCE = 0.10
 # Number of angular samples used for the cortex angular profile and Gini index.
 # Higher values give a finer angular map but increase per-frame compute time.
 # 72 = 5° resolution (matches the tracking grid search default).
-ACTIN_N_ANGLES = 72
+ACTIN_N_ANGLES = 360
 
 # Padding (pixels) added outward to each side of the membrane FWHM border before
 # it is used as the search window for the actin peak.  Matches the ±3 px padding
