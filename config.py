@@ -19,8 +19,8 @@ import re
 
 INPUT_FORMAT = 'ND2' 
 
-DATA_FOLDER  = r"D:\EP\260331_Trial4_InvE_BranchedCortex_SRB_400V"
-EXPERIMENT_BASE_NAME  = "DOPC_BranchedCortex_Experiment1-400V-500us-frame6"
+DATA_FOLDER  = r"D:\EP\260726_InvE_BranchedCortex_SRB_900V"
+EXPERIMENT_BASE_NAME  = "DOPC_BranchedCortex_Experiment2-900V-500us-frame5"
 
 # --- NEW DIRECTORY ROUTING ---
 # Define the master parent directory where all analyses will be stored
@@ -440,7 +440,7 @@ SCALE_BAR_LENGTH_MICRONS = 10
 # Set this from the dataset's own acquisition structure (check the frame
 # interval and the bg_estimate column of _background_diagnostics.csv for a
 # step), not by eye on the normalised curves.
-DYE_ANALYSIS_MAX_TIME_S = 1.5 #None
+DYE_ANALYSIS_MAX_TIME_S = None  # 1.5
 
 # -----------------------------------------------------------------------------
 # --- MODEL-FREE ENDPOINT OUTPUTS (dye/intensity/) ---
