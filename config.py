@@ -19,12 +19,27 @@ import re
 
 INPUT_FORMAT = 'ND2' 
 
-DATA_FOLDER  = r"D:\EP\260726_InvE_BranchedCortex_SRB_900V"
-EXPERIMENT_BASE_NAME  = "DOPC_BranchedCortex_Experiment2-900V-500us-frame5"
+# Experiment identity. Both may be overridden by environment variables so
+# that batch_run.py can drive many experiments through one code base
+# without editing this file. A plain single run ignores the environment
+# entirely and uses the literals below, exactly as before.
+#
+# Environment override is used rather than mutating cfg at runtime
+# because the worker pool uses the 'spawn' start method: each worker
+# re-imports this module from disk, so in-process attribute edits would
+# silently fail to reach them.
+DATA_FOLDER = os.environ.get(
+    "EP_DATA_FOLDER",
+    r"D:\Data\EP\260331_Trial4_InvE_BranchedCortex_SRB_400V",
+)
+EXPERIMENT_BASE_NAME = os.environ.get(
+    "EP_EXPERIMENT_BASE_NAME",
+    "DOPC_BranchedCortex_Experiment2-400V-500us-frame6",
+)
 
 # --- NEW DIRECTORY ROUTING ---
 # Define the master parent directory where all analyses will be stored
-PARENT_OUTPUT_FOLDER = r"D:\EP\Outputs"
+PARENT_OUTPUT_FOLDER = r"D:\Data\EP\Outputs"
 
 # Extract the 6-digit YYMMDD date from the DATA_FOLDER name
 _data_dir_name = os.path.basename(os.path.normpath(DATA_FOLDER))
@@ -380,67 +395,13 @@ FOLDER_DYE      = os.path.join(OUTPUT_IMAGE_FOLDER, "dye")        # dye-channel 
 # dye/ root.
 FOLDER_DYE_FITTING   = os.path.join(FOLDER_DYE, "fitting")     # fit grids, fit params, model comparison, boxplots
 FOLDER_DYE_INTENSITY = os.path.join(FOLDER_DYE, "intensity")   # normalised traces, endpoint figure, crops
-FOLDER_ACTIN    = os.path.join(OUTPUT_IMAGE_FOLDER, "actin")      # actin-channel root
-
-# The actin folder is split the same way the dye folder is, by what the
-# product actually measures rather than by which function emitted it:
-#   kymograph/ - angular/directional products (per-GUV and population-average
-#                kymographs, pole-vs-equator traces). Everything here depends
-#                on ELECTRODE_ANGLE_DEG being correct.
-#   intensity/ - amplitude products: the normalised traces CSV, the dye/actin
-#                overlay, and the model-free lumenal-actin endpoint figure.
-#                Lumenal actin is measured on the actin channel, which has no
-#                burst/time-lapse acquisition break, so unlike the dye these
-#                span the FULL record.
-#   cortex/    - radial-structure products: cortex analysis, radial profiles at
-#                the pre-pulse frame, and the radial-profile evolution.
-# _actin_cortex_traces.csv stays at the actin/ ROOT: it is the one unsmoothed
-# source table feeding figures in both cortex/ and intensity/, so it belongs
-# to neither.
-FOLDER_ACTIN_KYMOGRAPH = os.path.join(FOLDER_ACTIN, "kymograph")
-FOLDER_ACTIN_INTENSITY = os.path.join(FOLDER_ACTIN, "intensity")
-FOLDER_ACTIN_CORTEX    = os.path.join(FOLDER_ACTIN, "cortex")
+FOLDER_ACTIN    = os.path.join(OUTPUT_IMAGE_FOLDER, "actin")      # actin cortex plots, traces, profiles
 
 EXPORT_TIME_POINTS_S     = [0, 50, 100, 200, 300]
 EXPORT_DEBUG_PLOTS       = True
 
 MICRONS_PER_PIXEL        = 0.11 # Plan Apo λ 60x Oil
 SCALE_BAR_LENGTH_MICRONS = 10
-
-# -----------------------------------------------------------------------------
-# --- DYE ANALYSIS TIME WINDOW ---
-# -----------------------------------------------------------------------------
-
-# Upper limit, in seconds AFTER the pulse, on the dye-channel frames that
-# enter the normalised curves, the fits, and the endpoint figure. Set to None
-# for no limit (the full record).
-#
-# WHY THIS EXISTS
-# ---------------
-# The normalisation is
-#     I_retained(t) = (I_bg,t - I_dye,t) / (I_bg,t - I_dye,0)
-# with a TIME-VARYING numerator but a denominator pinned to the pre-pulse
-# lumen level I_dye,0. That is correct only while the dye channel's intensity
-# scale is the same as it was at t = 0. When an acquisition switches from a
-# fast burst block to a slower time-lapse block, the dye channel typically
-# picks up a uniform additive offset at the boundary. I_bg,t then moves toward
-# I_dye,0 and the denominator collapses — on the 400 V / 500 us / frame-6 run
-# it went from about -18 AU to -4 AU, a fourfold shrinkage, and for one GUV it
-# crossed zero and inverted sign. The resulting curves rise to 2-7x baseline
-# and every downstream product (tau, is_responding, released_pct) follows the
-# denominator instead of the vesicle.
-#
-# This gate truncates the record at the last frame of the first acquisition
-# block, keeping the window over which the intensity scale is constant. The
-# pre-pulse baseline is ALWAYS retained regardless of this setting; only
-# post-pulse frames are dropped. The dye SNAPSHOTS are deliberately NOT gated
-# — they are read straight from the memmap over the full record, so the movie
-# stills still show the whole time course.
-#
-# Set this from the dataset's own acquisition structure (check the frame
-# interval and the bg_estimate column of _background_diagnostics.csv for a
-# step), not by eye on the normalised curves.
-DYE_ANALYSIS_MAX_TIME_S = None  # 1.5
 
 # -----------------------------------------------------------------------------
 # --- MODEL-FREE ENDPOINT OUTPUTS (dye/intensity/) ---
@@ -674,7 +635,25 @@ EXPORT_TRACK_VISUALIZATION = True
 # -----------------------------------------------------------------------------
 
 # Enable actin cortex analysis on the C2 channel
-ANALYZE_ACTIN_CHANNEL = True
+def _actin_channel_default() -> bool:
+    """Actin analysis on for corticated samples, off for Empty ones.
+
+    Derived from EXPERIMENT_BASE_NAME so a batch run needs no
+    per-experiment edit. EP_ANALYZE_ACTIN overrides it when set.
+
+    NOTE: this switches ANALYSIS only, not channel indices. Empty
+    acquisitions are still assumed to contain three channels in the
+    same order, with the actin channel simply featureless. If an Empty
+    ND2 was acquired with only two channels the ND2_CHANNEL_IDX_*
+    constants are wrong for it and must be set separately.
+    """
+    env = os.environ.get('EP_ANALYZE_ACTIN')
+    if env is not None:
+        return env.strip().lower() in ('1', 'true', 'yes', 'on')
+    return 'empty' not in EXPERIMENT_BASE_NAME.lower()
+
+
+ANALYZE_ACTIN_CHANNEL = _actin_channel_default()
 
 # Which mask to use for the cortex signal.
 # 'membrane' = the ring mask (peak ± MEMBRANE_FIXED_HALF_WIDTH).
@@ -693,10 +672,19 @@ ACTIN_CORTEX_HALF_WIDTH = 5   # px  (~0.44 µm at 0.11 µm/px)
 # lower it if faint-but-real cortices are being missed.  Default = 0.10 (10 %).
 ACTIN_PEAK_MIN_PROMINENCE = 0.10
 
+# --- Cortex presence classification (pre-pulse) ---
+# cortex_contrast = (I_peak - I_lumen) / (I_lumen - I_bg), measured on
+# pre-pulse frames. Separates a corticated vesicle from one merely filled
+# with unpolymerised actin. PROVISIONAL: set these from the observed
+# contrast distribution across your BranchedCortex experiments before use.
+CORTEX_CONTRAST_HIGH = 0.35   # >= this -> CORTEX
+CORTEX_CONTRAST_LOW  = 0.15   # <= this -> NO_CORTEX; between -> AMBIGUOUS
+CORTEX_MAX_FWHM_UM   = 1.5    # a peak broader than this is not a thin shell
+
 # Number of angular samples used for the cortex angular profile and Gini index.
 # Higher values give a finer angular map but increase per-frame compute time.
 # 72 = 5° resolution (matches the tracking grid search default).
-ACTIN_N_ANGLES = 360
+ACTIN_N_ANGLES = 72
 
 # Padding (pixels) added outward to each side of the membrane FWHM border before
 # it is used as the search window for the actin peak.  Matches the ±3 px padding

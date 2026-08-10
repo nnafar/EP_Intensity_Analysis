@@ -2281,13 +2281,15 @@ def normalize_actin_curves(
     dict with aligned arrays and GUV-averaged traces
     """
     cortex_norm_list = []
+    prepulse_peak0   = []
+    prepulse_lumen0  = []
+    prepulse_cortex0 = []
+    prepulse_fwhm    = []
     peak_norm_list   = []
     lumen_norm_list  = []
     fwhm_al_list     = []
     peak_det_list    = []
     gini_al_list     = []
-    cortex_full_list = []
-    lumen_full_list  = []
 
     safe_pre_end   = pulse_frame if pulse_frame > 0 else 1
     safe_pre_start = max(0, safe_pre_end - 5)
@@ -2305,17 +2307,21 @@ def normalize_actin_curves(
         p0 = float(np.nanmean((peak   - bg)[safe_pre_start:safe_pre_end]))
         l0 = float(np.nanmean((lumen  - bg)[safe_pre_start:safe_pre_end]))
 
+        # Absolute pre-pulse levels, retained before they are used as
+        # normalisation denominators: the normalised traces divide out the
+        # cortex/lumen contrast that distinguishes a corticated vesicle
+        # from one merely filled with unpolymerised actin.
+        prepulse_cortex0.append(c0)
+        prepulse_peak0.append(p0)
+        prepulse_lumen0.append(l0)
+        prepulse_fwhm.append(
+            float(np.nanmedian(fwhm[safe_pre_start:safe_pre_end]))
+        )
+
         with np.errstate(divide='ignore', invalid='ignore'):
             c_norm = (cortex - bg) / c0 if (c0 != 0 and np.isfinite(c0)) else np.full_like(cortex, np.nan)
             p_norm = (peak   - bg) / p0 if (p0 != 0 and np.isfinite(p0)) else np.full_like(peak,   np.nan)
             l_norm = (lumen  - bg) / l0 if (l0 != 0 and np.isfinite(l0)) else np.full_like(lumen,  np.nan)
-
-        # Full record (pre-pulse frames at negative t included) is kept
-        # alongside the aligned post-pulse slice. The model-free endpoint
-        # figure needs the pre-pulse baseline frames to draw and average, the
-        # same way the dye endpoint figure uses all_curves_full.
-        cortex_full_list.append(c_norm)
-        lumen_full_list .append(l_norm)
 
         cortex_norm_list.append(c_norm[pulse_frame:])
         peak_norm_list  .append(p_norm[pulse_frame:])
@@ -2337,15 +2343,13 @@ def normalize_actin_curves(
         'cortex_norm':     cortex_arr,
         'peak_norm':       peak_arr,
         'lumen_norm':      lumen_arr,
-        # Full record including pre-pulse frames (negative times), for the
-        # model-free endpoint figure. NOT used by the trace plots.
-        't_full':          np.asarray(time_array, float) - float(time_array[pulse_frame]),
-        'cortex_norm_full': np.array(cortex_full_list),
-        'lumen_norm_full':  np.array(lumen_full_list),
-        'pulse_frame':      int(pulse_frame),
         'fwhm_aligned':    fwhm_arr,                         # µm, absolute
         'gini_aligned':    gini_arr,                         # Gini (0–1), absolute
         'peak_detected':   peak_det_arr,                     # (n_guvs, n_frames) 0/1
+        'prepulse_cortex0':  np.array(prepulse_cortex0, float),
+        'prepulse_peak0':    np.array(prepulse_peak0,   float),
+        'prepulse_lumen0':   np.array(prepulse_lumen0,  float),
+        'prepulse_fwhm_um':  np.array(prepulse_fwhm,    float),
         'avg_cortex':      np.nanmean(cortex_arr, axis=0),
         'avg_peak':        np.nanmean(peak_arr,   axis=0),
         'avg_lumen':       np.nanmean(lumen_arr,  axis=0),
@@ -2488,43 +2492,63 @@ def plot_actin_analysis(
     out_path = os.path.join(output_folder, f'{experiment_name}_actin_cortex_analysis.png')
     fig.savefig(out_path, dpi=300)
     plt.close(fig)
-
-    # Companion CSV holding exactly the series drawn above.
-    #
-    # The UNSMOOTHED source data already lives in _actin_cortex_traces.csv;
-    # this file is not a duplicate of it. What it adds is the smoothing: every
-    # curve in the figure has been through _smooth() with smooth_sigma, so a
-    # value read off the figure will not match the traces CSV. Writing the
-    # plotted series makes the figure exactly reproducible (and re-styleable
-    # for the thesis) without having to re-derive the filter, and records the
-    # sigma that was used in the header comment column.
-    #
-    # Note the mean columns are smooth(mean), NOT mean(smooth) — that is the
-    # order plot_actin_analysis uses, and the two differ wherever GUVs drop
-    # out at different times.
-    try:
-        plot_dict = {'time_s': t}
-        for gid, p_row, l_row, f_row, g_row in zip(
-                valid_guv_ids, peak_arr, lumen_arr, fwhm_arr, gini_arr):
-            plot_dict[f'GUV_{gid}_cortex_peak_sm'] = _smooth(p_row)
-            plot_dict[f'GUV_{gid}_lumen_sm']       = _smooth(l_row)
-            plot_dict[f'GUV_{gid}_fwhm_um_sm']     = _smooth(f_row)
-            plot_dict[f'GUV_{gid}_gini_sm']        = _smooth(g_row)
-        plot_dict['mean_cortex_peak_sm'] = _smooth(avg_peak)
-        plot_dict['mean_lumen_sm']       = _smooth(avg_lumen)
-        plot_dict['mean_fwhm_um_sm']     = _smooth(avg_fwhm)
-        plot_dict['mean_gini_sm']        = _smooth(avg_gini)
-        plot_dict['smooth_sigma_frames'] = np.full(len(t), float(smooth_sigma))
-
-        pd.DataFrame(plot_dict).to_csv(
-            os.path.join(output_folder,
-                         f'{experiment_name}_actin_cortex_analysis.csv'),
-            index=False, float_format='%.6f', na_rep='NaN')
-    except Exception as e:
-        logging.getLogger(__name__).warning(
-            "Could not write actin_cortex_analysis.csv: %s", e)
-
     return out_path
+
+
+def classify_cortex_presence(contrast: float, fwhm_um: float) -> str:
+    """Label a GUV from its pre-pulse cortex contrast and peak width."""
+    hi    = getattr(cfg, 'CORTEX_CONTRAST_HIGH', 0.35)
+    lo    = getattr(cfg, 'CORTEX_CONTRAST_LOW',  0.15)
+    max_w = getattr(cfg, 'CORTEX_MAX_FWHM_UM',   1.5)
+
+    if not np.isfinite(contrast):
+        return 'UNKNOWN'
+    if contrast >= hi and (not np.isfinite(fwhm_um) or fwhm_um <= max_w):
+        return 'CORTEX'
+    if contrast <= lo:
+        return 'NO_CORTEX'
+    return 'AMBIGUOUS'
+
+
+def export_actin_cortex_status(
+        aligned_actin: dict,
+        valid_guv_ids: list,
+        output_folder: str,
+        experiment_name: str,
+):
+    """One row per GUV: is there a cortex, judged on pre-pulse frames only.
+
+    cortex_contrast = (I_peak - I_lumen) / (I_lumen - I_bg), evaluated on
+    pre-pulse frames. peak_detected cannot answer this: its prominence test
+    measures the peak above the EXTRACELLULAR baseline, so a lumen-filled
+    vesicle with no cortex passes it.
+
+    Pre-pulse only is deliberate. Classifying on post-pulse frames would
+    condition the grouping on the response being measured.
+    """
+    p0 = np.asarray(aligned_actin['prepulse_peak0'],   float)
+    l0 = np.asarray(aligned_actin['prepulse_lumen0'],  float)
+    c0 = np.asarray(aligned_actin['prepulse_cortex0'], float)
+    fw = np.asarray(aligned_actin['prepulse_fwhm_um'], float)
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        contrast = np.where(l0 > 0, (p0 - l0) / l0, np.nan)
+
+    df = pd.DataFrame({
+        'guv_id':              valid_guv_ids,
+        'prepulse_peak_abs':   p0,
+        'prepulse_lumen_abs':  l0,
+        'prepulse_cortex_abs': c0,
+        'prepulse_fwhm_um':    fw,
+        'cortex_contrast':     contrast,
+        'cortex_status':       [classify_cortex_presence(cv, wv)
+                                for cv, wv in zip(contrast, fw)],
+    })
+
+    csv_path = os.path.join(output_folder,
+                            f'{experiment_name}_actin_cortex_status.csv')
+    df.to_csv(csv_path, index=False, float_format='%.6f', na_rep='NaN')
+    return csv_path
 
 
 def export_actin_csv(
@@ -3104,45 +3128,20 @@ def plot_actin_radial_evolution(
         output_folder: str,
         experiment_name: str,
         microns_per_pixel: float = 1.0,
-        time_array: Optional[np.ndarray] = None,
-        pulse_frame: Optional[int] = None,
-        export_csv: bool = True,
 ):
     """
     Generates a multigrid plot showing radial intensity profile evolution
     over time for each GUV, using a colormap from light gray to black.
     X-axis is in µm when microns_per_pixel is supplied.
-
-    When export_csv is True a long-format companion CSV is written next to
-    the figure. Unlike the actin trace exports, these radial profiles are
-    computed here and NOWHERE else in the pipeline — before this export they
-    existed only as pixels in the PNG and could not be recovered without
-    re-reading the ND2. The CSV is long rather than wide because r_max is
-    proportional to each GUV's own radius, so the profiles have different
-    lengths and do not share a column index.
-
-    Both the raw and the smoothed profile are written: the smoothed column is
-    what the figure draws (gaussian_filter1d, sigma = 1.5 px along r), the raw
-    column is what any re-analysis should start from.
-
-    time_array/pulse_frame are optional; when both are given, a time_s column
-    relative to the pulse is included.
     """
     n = len(ellipses_per_guv)
     if n == 0 or actin_stack is None:
-        return None
+        return
 
     ncols = min(4, n)
     nrows = int(np.ceil(n / ncols))
     fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 3.5 * nrows),
                              squeeze=False)
-
-    prof_rows = []
-    t_rel = None
-    if time_array is not None and pulse_frame is not None:
-        _ta = np.asarray(time_array, float)
-        if 0 <= int(pulse_frame) < len(_ta):
-            t_rel = _ta - _ta[int(pulse_frame)]
 
     for k, (gid, el_list) in enumerate(ellipses_per_guv):
         ax = axes[k // ncols][k % ncols]
@@ -3179,18 +3178,6 @@ def plot_actin_radial_evolution(
 
             ax.plot(r_um, profile_sm, color=colors[idx], lw=1.0, alpha=0.7)
 
-            if export_csv:
-                prof_rows.append(pd.DataFrame({
-                    'guv_id':             gid,
-                    'frame':              fi,
-                    'time_s':             (np.nan if t_rel is None
-                                           else float(t_rel[fi])),
-                    'radius_px':          np.arange(r_max),
-                    'radius_um':          r_um,
-                    'intensity_raw':      np.asarray(profile, float),
-                    'intensity_smoothed': np.asarray(profile_sm, float),
-                }))
-
         ax.set_title(f'GUV {gid} Profile Evolution')
         ax.set_xlabel(r'Radius ($\mu$m)')
         ax.set_ylabel('Intensity (AU)')
@@ -3201,24 +3188,8 @@ def plot_actin_radial_evolution(
         axes[k // ncols][k % ncols].set_visible(False)
 
     plt.tight_layout()
-    out_path = os.path.join(output_folder, f'{experiment_name}_actin_evolution.png')
-    fig.savefig(out_path, dpi=300)
+    fig.savefig(os.path.join(output_folder, f'{experiment_name}_actin_evolution.png'), dpi=300)
     plt.close(fig)
-
-    if export_csv and prof_rows:
-        try:
-            pd.concat(prof_rows, ignore_index=True).to_csv(
-                os.path.join(output_folder,
-                             f'{experiment_name}_actin_evolution.csv'),
-                index=False, float_format='%.6f', na_rep='NaN')
-        except Exception as e:
-            logging.getLogger(__name__).warning(
-                "Could not write actin_evolution.csv: %s", e)
-
-    # Previously this function fell off the end returning None, so the
-    # caller's "Saved actin radial evolution plot -> {evo_path}" log line
-    # always printed None.
-    return out_path
 
 
 def plot_dye_actin_overlay(
@@ -3825,21 +3796,10 @@ def plot_dye_prepulse_vs_final(
         out_of_frame_guv_ids: Optional[set] = None,
         shrunk_guv_ids: Optional[set] = None,
         grown_guv_ids: Optional[set] = None,
-        file_stem: str = 'dye_prepulse_vs_final',
-        quantity_label: str = 'dye intensity',
 ) -> Tuple[str, str, pd.DataFrame]:
     """
     Multipanel per-GUV figure of the pre-pulse -> final-frame intensity
     change, plus a population summary panel.
-
-    The function is channel-agnostic: it takes an already-normalised
-    (n_guvs, n_frames) array whose pre-pulse level is ~1 and whose value
-    falls as material is lost. `file_stem` and `quantity_label` only set the
-    output filenames and the figure title, so the same code serves the dye
-    channel and the lumenal-actin channel and the two figures cannot drift
-    apart in method. Note that the two channels may cover DIFFERENT time
-    windows (see DYE_ANALYSIS_MAX_TIME_S) — t_final_s in the CSV records the
-    window each one actually used.
 
     One panel per GUV shows the full normalised trace (pre-pulse frames at
     negative time, pulse at t = 0), the shaded pre-pulse baseline window
@@ -4020,19 +3980,19 @@ def plot_dye_prepulse_vs_final(
         axes[k // ncols][k % ncols].set_visible(False)
 
     plt.suptitle(
-        f'{experiment_name}  –  Pre-pulse vs. final-frame {quantity_label} '
+        f'{experiment_name}  –  Pre-pulse vs. final-frame dye intensity '
         f'(model-free endpoint)',
         fontsize=11
     )
     plt.tight_layout()
 
     png_path = os.path.join(output_folder,
-                            f'{experiment_name}_{file_stem}.png')
+                            f'{experiment_name}_dye_prepulse_vs_final.png')
     fig.savefig(png_path, dpi=300)
     plt.close(fig)
 
     csv_path = os.path.join(output_folder,
-                            f'{experiment_name}_{file_stem}.csv')
+                            f'{experiment_name}_dye_prepulse_vs_final.csv')
     df.to_csv(csv_path, index=False)
 
     return png_path, csv_path, df
