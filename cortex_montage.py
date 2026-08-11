@@ -56,6 +56,22 @@ FRAME_OVERRIDE = None
 
 RESULTS_SUBFOLDER = "Bulk_Analysis_Results"
 
+# The exclusion list is owned by process.py so there is ONE place to edit it.
+# Imported rather than copied: a second list drifts the moment either is
+# changed, and this script would then report a different denominator than the
+# figures for the same run. Only the list is taken, none of process.py's
+# gating, so the montage stays independent of its filters.
+try:
+  from process import EXCLUDE_EXPERIMENTS, is_excluded_experiment
+except Exception as _e:
+  print(f"WARNING: could not import EXCLUDE_EXPERIMENTS from process.py "
+        f"({type(_e).__name__}: {_e}). No experiments will be excluded from "
+        "the montages; their counts may not match the figures.")
+  EXCLUDE_EXPERIMENTS = []
+
+  def is_excluded_experiment(name: str) -> bool:
+    return any(re.search(pat, name) for pat in EXCLUDE_EXPERIMENTS)
+
 
 # -----------------------------------------------------------------------------
 
@@ -120,11 +136,14 @@ def load_actin_frame(nd2_path: Path, frame: int, ch: int) -> np.ndarray:
 
 def collect(root: Path, nd2_index: dict) -> pd.DataFrame:
   """One row per classified GUV, with everything needed to cut its crop."""
-  rows = []
+  rows, n_excluded = [], 0
   for status_csv in sorted(root.glob("**/*_actin_cortex_status.csv")):
     if RESULTS_SUBFOLDER in status_csv.parts:
       continue
     exp_dir = status_csv.parents[1]
+    if is_excluded_experiment(exp_dir.name):
+      n_excluded += 1
+      continue
     base = status_csv.name.replace("_actin_cortex_status.csv", "")
 
     # exp_dir.name is already '{yymmdd}_{base}', the same key index_nd2 builds.
@@ -165,6 +184,9 @@ def collect(root: Path, nd2_index: dict) -> pd.DataFrame:
           "contrast": r.get("cortex_contrast", np.nan),
           "x": float(t["x"]), "y": float(t["y"]), "radius": float(t["radius"]),
       })
+  if n_excluded:
+    print(f"  excluded {n_excluded} experiment(s) via "
+          f"process.EXCLUDE_EXPERIMENTS: {EXCLUDE_EXPERIMENTS}")
   return pd.DataFrame(rows)
 
 
@@ -262,8 +284,11 @@ def main(data_root=None, results_dir=None):
   data_root   : tree containing the .nd2 files. None = the DATA_ROOT setting.
   results_dir : where to write. None = outputs_root()/RESULTS_SUBFOLDER.
   """
-  results = (Path(results_dir) if results_dir
-             else outputs_root() / RESULTS_SUBFOLDER)
+  base = (Path(results_dir) if results_dir
+          else outputs_root() / RESULTS_SUBFOLDER)
+  # Must match process.LAYOUT["cortex_class"]; the montages are the visual
+  # check on the classification, so they sit with it.
+  results = base / "03_cortex_classification" / "montages"
   results.mkdir(parents=True, exist_ok=True)
   root = outputs_root()
 

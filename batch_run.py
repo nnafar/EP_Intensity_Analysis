@@ -116,10 +116,17 @@ def run_one(data_folder: str, base_name: str, repo_dir: Path) -> int:
       text=True,
       bufsize=1,
   )
+  # QC markers are picked out of the stream as it goes past rather than by
+  # re-reading the log afterwards: the child already prints them, and this
+  # way an interrupted or crashed run still reports whatever it emitted.
+  qc_lines = []
   for line in proc.stdout:
-      print(line.rstrip(), flush=True)
+      line = line.rstrip()
+      print(line, flush=True)
+      if "[QC:" in line:
+          qc_lines.append(line[line.index("[QC:"):])
   proc.wait()
-  return proc.returncode
+  return proc.returncode, qc_lines
 
 
 def main():
@@ -198,23 +205,45 @@ def main():
     print(f"{'=' * 70}\n")
     started = time.time()
     try:
-      code = run_one(data_folder, base_name, repo_dir)
+      code, qc = run_one(data_folder, base_name, repo_dir)
     except KeyboardInterrupt:
       print("\nInterrupted.")
       break
     except Exception as e:  # a crash here must not kill the remaining queue
       print(f"  launcher error: {e}")
-      code = -1
-    results.append((base_name, code, time.time() - started))
+      code, qc = -1, []
+    results.append((base_name, code, time.time() - started, qc))
 
   print(f"\n{'=' * 70}\nBatch summary\n{'=' * 70}")
-  for base_name, code, elapsed in results:
+  for base_name, code, elapsed, qc in results:
     status = "ok  " if code == 0 else f"FAIL({code})"
-    print(f"  {status}  {elapsed / 60:6.1f} min  {base_name}")
-  n_failed = sum(1 for _, code, _ in results if code != 0)
+    flag = "  <-- QC FLAG" if any("FAIL" in q for q in qc) else ""
+    print(f"  {status}  {elapsed / 60:6.1f} min  {base_name}{flag}")
+  n_failed = sum(1 for _, code, _, _ in results if code != 0)
   print(f"\n{len(results) - n_failed} succeeded, {n_failed} failed.")
   if n_failed:
     print("Failed experiments left their logs in their own output folders.")
+
+  # A run that exits 0 can still have produced unusable fates, so the QC
+  # result is reported separately from the exit code and never folded into it.
+  flagged = [(b, q) for b, _, _, qc in results for q in qc if "FAIL" in q]
+  n_checked = sum(1 for _, _, _, qc in results if qc)
+  print(f"\n{'=' * 70}\nQC: synchronized exit\n{'=' * 70}")
+  if flagged:
+    print(f"  {len(flagged)} of {n_checked} experiment(s) flagged. Vesicles do")
+    print("  not rupture in unison, so open the ALL_TRACKING video for each")
+    print("  before using its fate labels:")
+    for base_name, q in flagged:
+      print(f"    {base_name}")
+      print(f"        {q}")
+    print("\n  If the vesicles are intact after the event, add the last good")
+    print("  frame to cfg.FRAME_TRUNCATION and re-run, rather than discarding")
+    print("  the field of view.")
+  else:
+    print(f"  No flags across {n_checked} experiment(s) checked.")
+  if n_checked < len(results):
+    print(f"  {len(results) - n_checked} experiment(s) emitted no QC line "
+          f"(check they reached fate classification).")
 
 
 if __name__ == "__main__":

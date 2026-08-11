@@ -247,6 +247,38 @@ def load_input_data(circles: list[dict], logger: logging.Logger) -> dict | None:
         actin_mmap_info = create_memmap_stack(actin_files, actin_mmap_path, desc="Actin Stack") \
                           if actin_files and getattr(cfg, 'ANALYZE_ACTIN_CHANNEL', False) else (None, None, None)
 
+    # --- Per-experiment frame truncation ------------------------------------
+    # Applied here, before anything reads the stacks, so tracking, pulse
+    # detection, fitting and fate classification all see the same shortened
+    # record. Only the DECLARED shape shrinks: a read-mode memmap over a file
+    # larger than its shape is valid, so the .dat files are untouched and
+    # every downstream consumer picks the count up from shape[0].
+    _keep = getattr(cfg, 'FRAME_TRUNCATION', {}).get(cfg.EXPERIMENT_BASE_NAME)
+    if _keep is not None and _keep < len(time_array):
+        logger.warning(
+            f"FRAME_TRUNCATION active for {cfg.EXPERIMENT_BASE_NAME}: keeping "
+            f"frames 0-{_keep - 1} of {len(time_array)} "
+            f"(t_final {time_array[_keep - 1]:.1f} s instead of "
+            f"{time_array[-1]:.1f} s). This record is shorter than its "
+            f"siblings -- treat fixed-time descriptors beyond t_final as "
+            f"censored, not as measurements."
+        )
+
+        def _truncate_mmap_info(info):
+            path, shape, dtype = info
+            return info if path is None else (path, (_keep,) + tuple(shape[1:]), dtype)
+
+        time_array      = time_array[:_keep]
+        dye_files       = dye_files[:_keep]
+        roi_mmap_info   = _truncate_mmap_info(roi_mmap_info)
+        dye_mmap_info   = _truncate_mmap_info(dye_mmap_info)
+        actin_mmap_info = _truncate_mmap_info(actin_mmap_info)
+    elif _keep is not None:
+        logger.info(
+            f"FRAME_TRUNCATION lists {cfg.EXPERIMENT_BASE_NAME} at {_keep} "
+            f"frames, but the record is only {len(time_array)} -- no cut made."
+        )
+
     logger.info(f"Frame interval: {frame_interval:.3f} s  ({len(time_array)} frames)")
     
     if len(time_array) > 1:
@@ -1979,6 +2011,23 @@ def main():
                 f"{n_survived} survived intact → "
                 f"{cfg.EXPERIMENT_BASE_NAME}_guv_fate_classification.csv"
             )
+
+            # Field-of-view sanity check on those fates. Vesicles porate
+            # independently, so simultaneous loss of the whole field is an
+            # imaging failure rather than lysis, and every affected GUV will
+            # have been labelled RUPTURED. Logs and prints only; nothing is
+            # written to disk and no exported column changes.
+            utils.check_synchronized_exit(
+                df_track,
+                fate_map,
+                n_frames=data['roi_mmap_info'][1][0],
+                logger=logger,
+                pulse_frame=PULSE_FRAME,
+                min_fraction=getattr(cfg, 'QC_SYNC_EXIT_MIN_FRACTION', 0.5),
+                window_frames=getattr(cfg, 'QC_SYNC_EXIT_WINDOW_FRAMES', 3),
+                min_guvs=getattr(cfg, 'QC_SYNC_EXIT_MIN_GUVS', 3),
+            )
+
             if grown_guv_ids:
                 # A >15% radius gain is ~32% area, which a taut bilayer
                 # cannot supply — so GROWN is either a floppy vesicle

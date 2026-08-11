@@ -1,23 +1,4 @@
-"""Why tau is not reported: a pooled identifiability diagnostic.
-
-Reads every *_fit_parameters.csv under PARENT_OUTPUT_FOLDER and answers one
-question — when the identifiability gate rejects a GUV, WHICH constraint did
-it fail?
-
-    tau_over_record > 0.33   the decay never turned over inside the record
-                             (efflux slower than the observation window)
-    tau_se_ratio    > 0.5    tau is unconstrained by the data
-    has_step                 the drop completed between two frames
-                             (efflux faster than the sampling interval)
-
-Those first and third causes are opposite, and the distinction matters: the
-first says "record too short", the second "sampling too coarse". They imply
-different follow-up experiments, so the figure separates them rather than
-lumping both under "tau unidentifiable".
-
-Run in Spyder with F5. Writes tau_identifiability.pdf next to the CSVs.
-"""
-
+import re
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -28,48 +9,104 @@ from palette import PALETTE, POPULATION_COLORS
 
 try:
     import config as cfg
-except Exception:            # runnable outside the repo folder too
+except Exception:            
     cfg = None
 
 OUTPUTS_ROOT = Path(getattr(cfg, 'PARENT_OUTPUT_FOLDER', r"D:\Data\EP\Outputs"))
 
-# Must match process.RESULTS_SUBFOLDER. Not imported from process.py on
-# purpose: this report reads the raw fit parameters and applies none of
-# process.py's gates, and importing it would invite that coupling.
 RESULTS_SUBFOLDER = 'Bulk_Analysis_Results'
 
-# Gate values read from config, not hardcoded, so this figure cannot drift
-# away from the gate it is describing.
+try:
+  from process import EXCLUDE_EXPERIMENTS, is_excluded_experiment
+except Exception as _e:
+  print(f"WARNING: could not import EXCLUDE_EXPERIMENTS from process.py "
+        f"({type(_e).__name__}: {_e}). No experiments will be excluded from "
+        "this report; its counts may not match the figures.")
+  EXCLUDE_EXPERIMENTS = []
+
+  def is_excluded_experiment(name: str) -> bool:
+    return any(re.search(pat, name) for pat in EXCLUDE_EXPERIMENTS)
+
 SE_RATIO_MAX = float(getattr(cfg, 'TAU_SE_RATIO_MAX', 0.5))
 TAU_OVER_RECORD_MAX = float(getattr(cfg, 'TAU_MAX_FRACTION_OF_RECORD', 1 / 3))
-
 
 def population_of(name: str) -> str:
   return 'Empty' if 'empty' in name.lower() else 'BranchedCortex'
 
+EXCLUDE_GROUPS = ['Branched, ambiguous', 'Branched, unclassified']
+
+def cortex_group_of(population: str, status) -> str:
+  if population != 'BranchedCortex':
+    return 'Bare' if population in ('Empty', 'Bare') else population
+  status = str(status)
+  if status == 'CORTEX':
+    return 'Branched, cortex'
+  if status == 'NO_CORTEX':
+    return 'Branched, lumenal only'
+  if status == 'AMBIGUOUS':
+    return 'Branched, ambiguous'
+  return 'Branched, unclassified'
+
+def cortex_status_for(exp_dir: Path):
+  files = [f for f in exp_dir.glob("**/*_actin_cortex_status.csv")
+           if RESULTS_SUBFOLDER not in f.parts]
+  if not files:
+    return None
+  try:
+    cx = pd.read_csv(files[0])
+    ids = cx['guv_id'].astype(str)
+    return {'status': dict(zip(ids, cx.get('cortex_status',
+                                           pd.Series(dtype=str))))}
+  except Exception:
+    return None
 
 def voltage_of(name: str) -> float:
-  import re
   m = re.search(r'-(\d+)V-', name)
   return float(m.group(1)) if m else np.nan
 
-
 def load() -> pd.DataFrame:
   frames = []
+  n_excluded = 0
   for f in sorted(OUTPUTS_ROOT.glob("**/*_fit_parameters.csv")):
-    # Never re-ingest anything this script itself wrote.
     if f.parent == OUTPUTS_ROOT or RESULTS_SUBFOLDER in f.parts:
       continue
     exp = f.parents[2].name if f.parent.name == 'fitting' else f.parent.name
+    if is_excluded_experiment(exp):
+      n_excluded += 1
+      continue
     df = pd.read_csv(f)
     df['experiment'] = exp
     df['population'] = population_of(exp)
     df['voltage_V'] = voltage_of(exp)
+
+    exp_dir = f.parents[2] if f.parent.name == 'fitting' else f.parents[1]
+    cx = cortex_status_for(exp_dir)
+    gid = df['guv_id'].astype(str)
+    df['cortex_status'] = gid.map(cx['status']) if cx else None
+    df['cortex_group'] = [cortex_group_of(p, s_)
+                          for p, s_ in zip(df['population'],
+                                               df['cortex_status'])]
     frames.append(df)
   if not frames:
     raise SystemExit(f"No *_fit_parameters.csv found under {OUTPUTS_ROOT}")
-  return pd.concat(frames, ignore_index=True)
+  if n_excluded:
+    print(f"Excluded {n_excluded} experiment(s) via "
+          f"process.EXCLUDE_EXPERIMENTS: {EXCLUDE_EXPERIMENTS}")
+  out = pd.concat(frames, ignore_index=True)
 
+  if EXCLUDE_GROUPS:
+    drop = out['cortex_group'].isin(EXCLUDE_GROUPS)
+    if drop.any():
+      print(f"Excluding {int(drop.sum())} unclassifiable GUV(s) "
+            f"({drop.mean():.1%}):")
+      for g, n in out.loc[drop, 'cortex_group'].value_counts().items():
+        print(f"    {g:<24} {n}")
+      n_ident = int(out.loc[drop, 'tau_identifiable'].fillna(False).sum())
+      if n_ident:
+        print(f"    of which {n_ident} had an identifiable tau -- excluding "
+              "them removes measurements, not just noise")
+      out = out[~drop].copy()
+  return out
 
 def summarise(df: pd.DataFrame) -> None:
   n = len(df)
@@ -95,16 +132,16 @@ def summarise(df: pd.DataFrame) -> None:
     print(f"    not responding at all             "
           f"{(failed & ~resp).sum():5d}  ({(failed & ~resp).sum() / failed.sum():.1%})")
 
-  # Record length is not exported directly; tau_over_record = tau / t_span
-  # recovers it, which lets the median tau be quoted in units of the record.
   with np.errstate(divide='ignore', invalid='ignore'):
     df = df.assign(record_s=df['tau'] / df['tau_over_record'])
   print("\n  Record length and tau, per population"
         "  (record medians taken over experiments, not GUVs, since a")
   print("  long experiment with many vesicles would otherwise dominate):")
-  for pop, sub in df.groupby('population'):
+  for pop, sub in df.groupby('cortex_group'
+                             if 'cortex_group' in df.columns
+                             else 'population'):
     rec = sub.groupby('experiment')['record_s'].median()
-    print(f"    {pop:<16} record {rec.median():8.1f} s "
+    print(f"    {pop:<24} record {rec.median():8.1f} s "
           f"({rec.min():.1f}-{rec.max():.1f})   "
           f"median tau {sub['tau'].median():9.1f} s   "
           f"tau/record {sub['tau_over_record'].median():6.2f}")
@@ -114,24 +151,24 @@ def summarise(df: pd.DataFrame) -> None:
     print(f"    {cls:<16} {cnt:5d}  ({cnt / n:.1%})")
 
   print("\n  Model-free response amplitude (response_drop), responding GUVs:")
-  for pop, sub in df[resp].groupby('population'):
-    print(f"    {pop:<16} median {sub['response_drop'].median():.3f}  "
+  grp = 'cortex_group' if 'cortex_group' in df.columns else 'population'
+  for pop, sub in df[resp].groupby(grp):
+    print(f"    {pop:<24} median {sub['response_drop'].median():.3f}  "
           f"IQR {sub['response_drop'].quantile(.25):.3f}-"
           f"{sub['response_drop'].quantile(.75):.3f}  (n={len(sub)})")
 
-
 def figure(df: pd.DataFrame, out_path: Path) -> None:
   colours = POPULATION_COLORS
+  key = 'cortex_group' if 'cortex_group' in df.columns else 'population'
   fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4.6))
 
-  # --- Panel A: where each GUV sits relative to the two gate constraints ---
   x = df['tau_over_record'].to_numpy(float)
   y = df['tau_se_ratio'].to_numpy(float)
   ok = np.isfinite(x) & np.isfinite(y) & (x > 0) & (y > 0)
 
   ax1.axvspan(TAU_OVER_RECORD_MAX, 1e6, color=PALETTE['light_grey'], alpha=0.45, zorder=0)
   ax1.axhspan(SE_RATIO_MAX, 1e6, color=PALETTE['light_grey'], alpha=0.45, zorder=0)
-  for pop, sub in df[ok].groupby('population'):
+  for pop, sub in df[ok].groupby(key):
     ax1.scatter(sub['tau_over_record'], sub['tau_se_ratio'], s=14, alpha=0.6,
                 edgecolors='none', color=colours.get(pop, PALETTE['grey']), label=pop)
   ax1.axvline(TAU_OVER_RECORD_MAX, color=PALETTE['grey'], lw=0.8, ls='--')
@@ -145,11 +182,10 @@ def figure(df: pd.DataFrame, out_path: Path) -> None:
   ax1.text(0.03, 0.95, 'identifiable\nregion', transform=ax1.transAxes,
            fontsize=8, va='top', color=PALETTE['grey'])
 
-  # --- Panel B: the amplitude IS resolved where the timescale is not -------
   d = df['response_drop'].to_numpy(float)
   nz = df['response_noise'].to_numpy(float)
   ok2 = np.isfinite(d) & np.isfinite(nz) & (nz > 0)
-  for pop, sub in df[ok2].groupby('population'):
+  for pop, sub in df[ok2].groupby(key):
     ax2.scatter(sub['response_noise'], sub['response_drop'], s=14, alpha=0.6,
                 edgecolors='none', color=colours.get(pop, PALETTE['grey']), label=pop)
   lim = np.nanpercentile(nz[ok2], 99) if ok2.any() else 1.0
@@ -166,17 +202,12 @@ def figure(df: pd.DataFrame, out_path: Path) -> None:
   fig.savefig(out_path.with_suffix('.png'), dpi=200, bbox_inches='tight')
   print(f"\nSaved {out_path}")
 
-
 def main(outputs_root=None, results_dir=None) -> pd.DataFrame:
-  """Run the whole report. Importable so run_bulk.py can drive it.
-
-  outputs_root : tree of per-experiment folders to READ from.
-  results_dir  : where to WRITE. Defaults to outputs_root/RESULTS_SUBFOLDER.
-  """
   global OUTPUTS_ROOT
   if outputs_root is not None:
     OUTPUTS_ROOT = Path(outputs_root)
-  results = Path(results_dir) if results_dir else OUTPUTS_ROOT / RESULTS_SUBFOLDER
+  base = Path(results_dir) if results_dir else OUTPUTS_ROOT / RESULTS_SUBFOLDER
+  results = base / "05_kinetics"
   results.mkdir(parents=True, exist_ok=True)
 
   data = load()
@@ -186,7 +217,6 @@ def main(outputs_root=None, results_dir=None) -> pd.DataFrame:
   data.to_csv(pooled, index=False)
   print(f"Saved {pooled}")
   return data
-
 
 if __name__ == '__main__':
   main()

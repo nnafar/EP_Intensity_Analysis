@@ -95,6 +95,25 @@ FRAME_INTERVAL_SCHEDULE = [
     (22, None, 5.0)  # Post-pulse: remaining frames, 5 s interval
 ]
 
+# --- Per-experiment frame truncation -----------------------------------------
+# Keys are EXPERIMENT_BASE_NAME, values the number of frames to KEEP
+# (indices 0 .. n-1). Applied in run_analysis.load_input_data by shrinking the
+# declared memmap shape, so the .dat files themselves are untouched.
+#
+# Used where the synchronized-exit QC fires and the video confirms the
+# vesicles are intact after the event: cutting the record at the last good
+# frame recovers the GUVs for analysis, whereas discarding the field of view
+# loses them. Note that t_final shortens accordingly, so these GUVs will have
+# a shorter record than their siblings -- check any fixed-time descriptor
+# (frac_remaining_300s and later) is NaN rather than extrapolated for them.
+FRAME_TRUNCATION = {
+    # Focal-plane excursion at frames 78-91: all 25 GUVs exit within 3 frames
+    # of frame 79 (t = 291.6 s) and are visibly intact at frame 95. Confirmed
+    # from the ALL_TRACKING video and from a synchronized dye step at
+    # 291.6 s in 24/24 GUVs (std = 0.00).
+    'DOPC_Empty_Experiment2-360V-500us-frame5': 78,
+}
+
 # -----------------------------------------------------------------------------
 # --- 2. ANALYSIS & MASKING PARAMETERS ---
 # -----------------------------------------------------------------------------
@@ -544,6 +563,22 @@ SHRINKAGE_FRACTION_THRESHOLD = 0.15
 # detection noise right at the endpoint rather than keying the whole
 # fate classification off one potentially noisy frame.
 SHRINKAGE_TERMINAL_N_FRAMES = 3
+
+# --- Synchronized-exit QC ----------------------------------------------------
+# Fails a field of view when this fraction or more of its GUVs stop tracking
+# within QC_SYNC_EXIT_WINDOW_FRAMES of each other, away from the pulse.
+# Vesicles porate independently, so their exit frames scatter; simultaneous
+# loss of the whole field is a focal-plane excursion, stage bump or
+# illumination dropout, not lysis. Every affected GUV is tagged RUPTURED and
+# never re-acquired, because RUPTURED is a terminal exit state.
+#
+# 0.5 is deliberately permissive. The failure mode produces fractions at or
+# near 1.0, so a tighter gate buys nothing and would start flagging genuine
+# high-field poration. Clusters inside the pulse window are reported but not
+# failed: mass poration at the pulse is the experiment working.
+QC_SYNC_EXIT_MIN_FRACTION  = 0.5
+QC_SYNC_EXIT_WINDOW_FRAMES = 3
+QC_SYNC_EXIT_MIN_GUVS      = 3
 
 # GUV fate: GROWTH threshold. A GUV whose radius has increased by at least
 # this fraction above its own pre-pulse baseline, with tracking intact

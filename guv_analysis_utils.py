@@ -4233,3 +4233,109 @@ def plot_dye_summary(
     fig.savefig(out_path, dpi=300)
     plt.close(fig)
     return out_path
+
+
+def check_synchronized_exit(df_track,
+                            fate_map,
+                            n_frames,
+                            logger,
+                            pulse_frame=None,
+                            min_fraction=0.5,
+                            window_frames=3,
+                            min_guvs=3):
+    """Flag fields of view where the tracker lost every GUV at the same instant.
+
+    Genuine electroporative rupture is stochastic across vesicles: each one
+    fails at its own time, so exit frames scatter. A focal-plane excursion,
+    stage bump or illumination dropout removes every vesicle from the image
+    simultaneously, and the tracker emits RUPTURED for all of them within a
+    frame or two. The vesicles are usually intact once the plane returns, but
+    RUPTURED is a terminal exit state, so the tracker never re-acquires and
+    the fate table records a field-wide lysis event that did not happen.
+
+    The test is on exit-frame CLUSTERING, not on the rupture count. A high
+    rupture fraction can be real at high field strength; a rupture fraction
+    that is high AND concentrated in one frame cannot be. GUVs tracked to the
+    final frame stay in the denominator but cannot join a cluster, so a field
+    where most vesicles survive cannot trip the gate.
+
+    Clusters inside the pulse window are reported and not failed: mass
+    poration at the pulse is the experiment working, not an artefact.
+
+    Returns a dict. Also prints one machine-readable '[QC:SYNC_EXIT]' line so
+    batch_run.py can surface the result without parsing the log file. Nothing
+    is written to disk and no exported column is altered.
+    """
+    result = {'status': 'PASS', 'n_guv': 0, 'cluster_n': 0,
+              'cluster_frac': 0.0, 'exit_frame': None, 'reason': ''}
+
+    if df_track is None or len(df_track) == 0 or 'frame' not in df_track.columns:
+        result['status'] = 'SKIP'
+        result['reason'] = 'no tracking data'
+        print("[QC:SYNC_EXIT] SKIP  no tracking data", flush=True)
+        return result
+
+    if 'radius' in df_track.columns:
+        valid = df_track[pd.to_numeric(df_track['radius'], errors='coerce').notna()]
+    else:
+        valid = df_track
+    if len(valid) == 0:
+        result['status'] = 'SKIP'
+        result['reason'] = 'no valid radii'
+        print("[QC:SYNC_EXIT] SKIP  no valid radii", flush=True)
+        return result
+
+    last_frame = valid.groupby('guv_id')['frame'].max()
+    n_guv = int(last_frame.size)
+    result['n_guv'] = n_guv
+
+    # A GUV tracked to the final frame did not exit.
+    exited = last_frame[last_frame < (int(n_frames) - 1)]
+    if n_guv < min_guvs or exited.empty:
+        print(f"[QC:SYNC_EXIT] PASS  {int(exited.size)}/{n_guv} exited early",
+              flush=True)
+        return result
+
+    frames = np.sort(exited.to_numpy(dtype=float))
+    best_n, best_f = 0, float('nan')
+    for f in frames:
+        n_in = int(((frames >= f) & (frames <= f + window_frames)).sum())
+        if n_in > best_n:
+            best_n, best_f = n_in, f
+
+    frac = best_n / n_guv
+    result.update(cluster_n=int(best_n),
+                  cluster_frac=round(float(frac), 3),
+                  exit_frame=int(best_f))
+
+    at_pulse = (pulse_frame is not None
+                and best_f <= float(pulse_frame) + window_frames)
+    clustered = (best_n >= min_guvs and frac >= min_fraction)
+
+    if clustered and not at_pulse:
+        result['status'] = 'FAIL'
+        result['reason'] = 'synchronized exit away from the pulse'
+        msg = (f"{best_n}/{n_guv} GUV(s) ({frac:.0%}) stopped tracking within "
+               f"{window_frames} frame(s) of frame {int(best_f)}")
+        logger.warning(
+            f"SYNCHRONIZED EXIT: {msg}. Vesicles do not rupture in unison, so "
+            f"this is the signature of a focal-plane excursion, stage bump or "
+            f"illumination dropout, and every affected GUV will have been "
+            f"labelled RUPTURED. Open the ALL_TRACKING video around frame "
+            f"{int(best_f)} before trusting any fate from this experiment. If "
+            f"the vesicles are intact after the event, truncate the record via "
+            f"cfg.FRAME_TRUNCATION rather than discarding the field of view."
+        )
+        print(f"[QC:SYNC_EXIT] FAIL  {msg}", flush=True)
+    else:
+        if clustered and at_pulse:
+            result['reason'] = 'cluster at pulse, not flagged'
+            logger.info(
+                f"{best_n}/{n_guv} GUV(s) exited within {window_frames} "
+                f"frame(s) of frame {int(best_f)}, at the pulse. Clustering "
+                f"there is expected for mass poration and is not flagged."
+            )
+        print(f"[QC:SYNC_EXIT] PASS  largest cluster {best_n}/{n_guv} "
+              f"at frame {int(best_f)}", flush=True)
+
+    return result
