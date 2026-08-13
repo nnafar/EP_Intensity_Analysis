@@ -742,6 +742,20 @@ def _score_at_center(frame: np.ndarray, cx: int, cy: int,
     return _ring_score_from_profile(prof, expected_r, search_factor, detect_bright)
 
 
+def _edge_clearance(px: float, py: float, extent: float,
+                    img_h: int, img_w: int) -> float:
+    """
+    Distance from (px, py) to the nearest frame edge, minus `extent`.
+
+    Negative means a disc of radius `extent` centred at that point is
+    clipped by the field of view. Used to decide whether a tracking exit
+    was geometric (the vesicle, or the window needed to measure it, left
+    the frame) or biological (the ring disappeared while the vesicle was
+    still fully inside).
+    """
+    return min(px, py, (img_w - 1) - px, (img_h - 1) - py) - extent
+
+
 def find_best_guv_center(
         frame: np.ndarray,
         prev_center: Tuple[int, int],
@@ -765,11 +779,15 @@ def find_best_guv_center(
     (best_center, best_score, in_bounds)
         in_bounds is False only when EVERY candidate in the search grid was
         too close to the frame edge to fit a full radial profile — i.e. the
-        vesicle has drifted to (or past) the field-of-view boundary. This is
-        the signal used upstream to distinguish "lost because it left the
-        frame" from "lost because the ring genuinely disappeared" (rupture).
+        vesicle has drifted to (or past) the field-of-view boundary.
         When True, at least one candidate was scored normally, even if the
         best score is still low for other reasons (e.g. rupture).
+
+        NOTE: this flag no longer decides OUT_OF_FRAME vs RUPTURED. That
+        call is made from the measured edge clearance at the exit — see
+        _classify_exit in track_guv_across_frames — because a boolean over
+        the whole search grid cannot distinguish "partly clipped" from
+        "fully outside", and fires only in the latter case.
     """
     cx, cy  = prev_center
     r       = prev_radius
@@ -922,21 +940,45 @@ def track_guv_across_frames(
     exit_reason     = None   # 'RUPTURED' | 'OUT_OF_FRAME' | None
     n_valid         = 0
 
-    # Flags for the CURRENT consecutive-low-score streak: True where that
-    # frame's failure was because the search grid fell outside the frame
-    # (find_best_guv_center found no evaluable candidate), False where a
-    # candidate WAS evaluated but scored poorly (consistent with rupture).
-    # Reset whenever a good-quality frame breaks the streak.
-    streak_boundary_flags: List[bool] = []
+    img_h, img_w = int(roi_stack.shape[1]), int(roi_stack.shape[2])
+    exit_clearance_profile_r = np.nan   # units of the vesicle's mean radius
+    exit_clearance_vesicle_r = np.nan
+
+    def _classify_exit(n_streak: int):
+        """
+        Decide OUT_OF_FRAME vs RUPTURED from the geometry at the exit.
+
+        cx, cy, axes, vx and vy still hold the LAST SUCCESSFULLY TRACKED
+        state, because they are only updated on a frame that scored above
+        threshold. Clearance is evaluated twice — at that last valid
+        detection, and at the centre extrapolated forward across the
+        failing streak — and the worse of the two is taken, since a vesicle
+        can be inside the frame when last seen and outside by the time the
+        streak completes. The velocity is a two-frame EMA, so the
+        extrapolation is crude; it only has to resolve a sign.
+
+        Returns (exit_reason, profile_clearance_r, vesicle_clearance_r).
+        """
+        avg_r = max(1.0, (axes[0] + axes[1]) / 2.0)
+        ext_prof = avg_r * (1.0 + search_factor) + 5.0   # what the scorer reads
+        ext_ves = max(axes)                              # bounding circle on the ellipse
+        px, py = cx + vx * n_streak, cy + vy * n_streak
+        clr_prof = min(_edge_clearance(cx, cy, ext_prof, img_h, img_w),
+                       _edge_clearance(px, py, ext_prof, img_h, img_w)) / avg_r
+        clr_ves = min(_edge_clearance(cx, cy, ext_ves, img_h, img_w),
+                      _edge_clearance(px, py, ext_ves, img_h, img_w)) / avg_r
+        thresh = float(getattr(cfg, 'OUT_OF_FRAME_CLEARANCE_R', 0.0))
+        reason = 'OUT_OF_FRAME' if clr_prof < thresh else 'RUPTURED'
+        return reason, float(clr_prof), float(clr_ves)
 
     for i in range(n_frames):
         frame = roi_stack[i]
         if frame is None:
             consecutive_low += 1
-            streak_boundary_flags.append(False)  # missing frame, not a boundary issue
             if consecutive_low >= rupture_consecutive_fails:
                 ruptured_at = i - consecutive_low + 1
-                exit_reason = 'RUPTURED'
+                (exit_reason, exit_clearance_profile_r,
+                 exit_clearance_vesicle_r) = _classify_exit(consecutive_low)
                 break
             continue
 
@@ -953,21 +995,21 @@ def track_guv_across_frames(
 
         if score < rupture_score_threshold:
             consecutive_low += 1
-            streak_boundary_flags.append(not in_bounds)
             if consecutive_low >= rupture_consecutive_fails:
                 ruptured_at = i - consecutive_low + 1
-                # Majority vote over the streak: if most of the failing
-                # frames had no evaluable ring candidate at all (vesicle at
-                # or past the FOV edge), this is a tracking limitation, not
-                # a biological rupture.
-                n_boundary = sum(streak_boundary_flags)
-                exit_reason = ('OUT_OF_FRAME'
-                                if n_boundary > len(streak_boundary_flags) / 2.0
-                                else 'RUPTURED')
+                # Geometry decides, not a vote. The previous version took a
+                # majority over the in_bounds flags of the failing streak,
+                # which is a binary call on three samples; worse, it could
+                # only ever fire when EVERY grid candidate was unscorable,
+                # so a vesicle whose profile window was partly clipped —
+                # still inside the frame, but no longer measurable — was
+                # recorded as a biological rupture. _classify_exit measures
+                # the clearance instead and exports it for audit.
+                (exit_reason, exit_clearance_profile_r,
+                 exit_clearance_vesicle_r) = _classify_exit(consecutive_low)
                 break
         else:
             consecutive_low = 0
-            streak_boundary_flags = []
 
         det_center, det_axes, det_angle, r_ok = detect_membrane_ellipse(
             frame, (new_cx, new_cy), axes, search_factor, detect_bright
@@ -1036,6 +1078,10 @@ def track_guv_across_frames(
         'ruptured_at':    ruptured_at,
         'exit_reason':    exit_reason,   # 'RUPTURED' | 'OUT_OF_FRAME' | None
         'n_valid_frames': n_valid,
+        # Geometry behind the exit_reason call, in units of the vesicle's
+        # own mean radius. NaN when tracking ran to the end of the movie.
+        'exit_clearance_profile_r': exit_clearance_profile_r,
+        'exit_clearance_vesicle_r': exit_clearance_vesicle_r,
     }
 
 
@@ -1500,6 +1546,8 @@ def process_single_guv(guv_id: str,
     quality_entry = {
         'guv_id': guv_id, 'initial_radius': initial_radius, 'failed': ruptured_at is not None,
         'ruptured_at_frame': ruptured_at, 'exit_reason': exit_reason, 'n_valid_frames': n_valid,
+        'exit_clearance_profile_r': tracking.get('exit_clearance_profile_r'),
+        'exit_clearance_vesicle_r': tracking.get('exit_clearance_vesicle_r'),
         'mean_ring_score': float(np.mean([s for s in tracking['ring_scores'] if s > 0])) if n_valid > 0 else 0.0,
         'comments': f"{exit_reason}_AT_F{ruptured_at}" if ruptured_at is not None else 'OK',
     }
@@ -1631,10 +1679,19 @@ def classify_guv_fates(
         terminal_n_frames: int = 3,
         growth_use_peak_radius: bool = False,
         pulse_frame: Optional[int] = None,
+        exit_frames: Optional[Dict[str, int]] = None,
 ) -> Tuple[Dict[str, str], pd.DataFrame]:
     """
     Refines the tracker's binary RUPTURED/OUT_OF_FRAME exit classification
-    into five mutually exclusive fates, adding SHRUNK and GROWN categories.
+    into six mutually exclusive fates, adding SHRUNK, GROWN and
+    LOST_PREPULSE categories.
+
+    'LOST_PREPULSE' sits above everything else in the priority order when
+    exit_frames is supplied: a vesicle whose track ended before the pulse
+    frame cannot have been porated by that pulse, so calling it RUPTURED
+    fabricates an observation.  process.py drops these rows entirely rather
+    than binning them, so they leave both the numerator and the denominator
+    of every population statistic.
 
     The five fates are assigned by a STRICT PRIORITY ORDER, because the
     underlying criteria are not mutually exclusive on their own (a vesicle
@@ -1720,9 +1777,15 @@ def classify_guv_fates(
         be persistent (the more conservative, symmetric-with-SHRUNK
         definition).  Requires pulse_frame; silently falls back to the
         terminal criterion if pulse_frame is None.
-    pulse_frame : frame index of the electroporation pulse.  Only used to
+    pulse_frame : frame index of the electroporation pulse.  Used to
         restrict the peak-radius search to post-pulse frames when
-        growth_use_peak_radius is True.
+        growth_use_peak_radius is True, and to identify exits that happened
+        before the pulse was delivered (see exit_frames).
+    exit_frames : optional map of guv_id -> the frame at which tracking
+        ended, for vesicles that exited early.  Supplied so that a raw
+        'RUPTURED' tag whose exit predates pulse_frame can be separated out
+        as 'LOST_PREPULSE'.  Without it the pre-pulse test is skipped and
+        those vesicles keep their raw tag, as before.
 
     Requires df_track already have 'norm_radius' (radius / pre-pulse mean
     radius per GUV) — i.e. normalize_tracking_data() must be called first.
@@ -1802,7 +1865,19 @@ def classify_guv_fates(
             growth_metric = terminal_norm_r
 
         # --- fate assignment, in strict priority order --------------------
-        if exit_reason_raw == 'OUT_OF_FRAME':
+        _exit_f = (exit_frames or {}).get(gid)
+        if (exit_reason_raw == 'RUPTURED' and pulse_frame is not None
+                and _exit_f is not None and _exit_f < pulse_frame):
+            # Tracking ended BEFORE the pulse was delivered, so this
+            # vesicle's response to the pulse is unobserved, not negative.
+            # It belongs in neither the rupture count nor the survivor
+            # denominator — the same reasoning as OUT_OF_FRAME, a different
+            # cause. The comparison is strict: an exit AT the pulse frame
+            # is kept as RUPTURED, since instantaneous poration is the
+            # expected failure mode and discarding it would bias the count
+            # against exactly the events being measured.
+            fate = 'LOST_PREPULSE'
+        elif exit_reason_raw == 'OUT_OF_FRAME':
             fate = 'OUT_OF_FRAME'
         elif not np.isfinite(frac_change):
             # No usable radius data at all: fall back to the tracker's tag.
@@ -2928,6 +3003,67 @@ def compute_pole_vs_equator_trace(
         'equator_mean':       eq_mean,
         'polarization_index': pol_index,
     }
+
+
+def export_pole_vs_equator_csv(
+        pe_by_guv: dict,
+        output_folder: str,
+        experiment_name: str,
+) -> Optional[str]:
+    """
+    Write every GUV's pole/equator trace to one wide CSV.
+
+    Until now these traces existed only inside the per-GUV PNG, which means
+    the pole-vs-equator question could be looked at one vesicle at a time and
+    never pooled. Pooling is the whole point: a single vesicle rotates, so
+    directional actin loss is only separable from rotation across a
+    population.
+
+    Layout matches *_actin_cortex_traces.csv so the bulk stage can parse it
+    the same way: a `time_s` column (post-pulse aligned, negative before the
+    pulse) plus three columns per GUV --
+
+        GUV_{id}_pole_mean            fold-change within the electrode-facing
+                                      windows
+        GUV_{id}_equator_mean         same, 90 deg away
+        GUV_{id}_polarization_index   (equator - pole) / (equator + pole);
+                                      > 0 means the pole lost more
+
+    GUVs whose trace length disagrees with the first are skipped rather than
+    padded, since a mismatch means their kymograph was built on a different
+    frame set and silently aligning them by index would fabricate timepoints.
+    Returns the path written, or None if there was nothing to write.
+    """
+    if not pe_by_guv:
+        return None
+
+    gids = list(pe_by_guv.keys())
+    t_ref = np.asarray(pe_by_guv[gids[0]]['t'], dtype=float)
+    out = {'time_s': t_ref}
+
+    n_skipped = 0
+    for gid in gids:
+        pe = pe_by_guv[gid]
+        t = np.asarray(pe['t'], dtype=float)
+        if t.shape != t_ref.shape:
+            n_skipped += 1
+            continue
+        out[f'GUV_{gid}_pole_mean'] = np.asarray(pe['pole_mean'], dtype=float)
+        out[f'GUV_{gid}_equator_mean'] = np.asarray(pe['equator_mean'], dtype=float)
+        out[f'GUV_{gid}_polarization_index'] = np.asarray(
+            pe['polarization_index'], dtype=float)
+
+    if len(out) == 1:          # only the time column survived
+        return None
+
+    path = os.path.join(output_folder,
+                        f'{experiment_name}_pole_vs_equator_traces.csv')
+    pd.DataFrame(out).to_csv(path, index=False,
+                             float_format='%.6f', na_rep='NaN')
+    if n_skipped:
+        print(f"  [pole/equator] {n_skipped} GUV(s) skipped: trace length "
+              f"differs from the first GUV in this experiment")
+    return path
 
 
 def plot_pole_vs_equator(

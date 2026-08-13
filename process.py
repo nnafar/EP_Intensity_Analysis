@@ -4,6 +4,7 @@ import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from scipy.optimize import curve_fit
 
 import config as cfg
 
@@ -27,6 +28,143 @@ from palette import (
     SUMMARY_LINE,
     ANNOTATION_TEXT,
 )
+
+
+# -----------------------------------------------------------------------------
+# --- FIGURE STYLE ---
+# Per-figure size and font control, so a figure can be resized for a thesis
+# page without editing the plotting function it lives in.
+#
+# Every entry defaults to None, which means "leave whatever the plotting code
+# already set". Nothing changes until a value is filled in, so existing figures
+# come out of a re-run byte-identical to before. Fill in only the fields you
+# want to take over.
+#
+# Sizes are inches, font sizes are points.
+#
+#   width            total figure width. Overrides everything else.
+#   width_per_panel  width of ONE panel; the figure is this times the number
+#                    of panels drawn. Only meaningful for the multi-panel
+#                    figures (noted below) -- ignored elsewhere. Use this
+#                    rather than `width` if you want the size to keep tracking
+#                    how many populations are present.
+#   height           total figure height.
+#   axis_label       x and y axis label text.
+#   tick_label       numbers and category names along both axes.
+#   legend           legend entries.
+#   legend_title     the legend's own title, where one is set.
+#   title            per-axes title.
+#   suptitle         the figure-wide title, where one is set.
+#   annotation       text drawn inside the axes (n = counts, percentages).
+#
+# Example -- a single-column figure for the thesis:
+#
+#   "lumen_abs_histogram": dict(
+#       width=3.4, height=2.6,
+#       axis_label=8, tick_label=7, legend=7, annotation=6,
+#   ),
+#
+# The keys below are the eleven figures this script writes, named after their
+# PDF. Panel counts scale with the number of populations present unless noted.
+# -----------------------------------------------------------------------------
+
+_FIG_FIELDS = ("width", "width_per_panel", "height", "axis_label",
+               "tick_label", "legend", "legend_title", "title",
+               "suptitle", "annotation")
+
+
+def _fig(**kwargs):
+    """One figure's overrides. Unspecified fields stay None (= don't touch)."""
+    bad = set(kwargs) - set(_FIG_FIELDS)
+    if bad:
+        raise ValueError(f"unknown figure style field(s): {sorted(bad)}. "
+                         f"Valid fields: {list(_FIG_FIELDS)}")
+    return {f: kwargs.get(f) for f in _FIG_FIELDS}
+
+
+FIGURE_STYLE = {
+    # 01_dye_release
+    "released_fraction_by_voltage":  _fig(),   # single panel
+    "intensity_drop_trajectories":   _fig(),   # one panel per population
+    "stagnate_intensity_counts":     _fig(),   # single panel
+    "drop_by_size_per_voltage":      _fig(),   # one panel per population
+    # 02_size_and_fate
+    "size_category_distribution":    _fig(),   # single panel
+    # 03_cortex_classification
+    "lumen_abs_histogram":           _fig(),   # single panel
+    "cortex_contrast_histogram":     _fig(),   # single panel
+    "drop_by_cortex_status":         _fig(),   # one panel per population
+    # 04_cortex_breakdown
+    "onset_fields":                  _fig(),   # one panel per population
+    "cortex_peak_breakdown":         _fig(),   # single panel
+    "cortex_peak_timecourse":        _fig(),   # fixed at 2 panels
+    # 05_kinetics
+    "tau_by_size_voltage":           _fig(),   # one panel per population
+}
+
+
+def _style(key: str) -> dict:
+    return FIGURE_STYLE.get(key) or {f: None for f in _FIG_FIELDS}
+
+
+def fig_size(key: str, default_w: float, default_h: float, n_panels: int = 1):
+    """Figure size for `key`, falling back to what the plotting code computed.
+
+    `default_w` is the width the code would have used, already multiplied out
+    for the panel count, so an untouched entry reproduces the old figure
+    exactly.
+    """
+    s = _style(key)
+    if s["width"] is not None:
+        w = float(s["width"])
+    elif s["width_per_panel"] is not None:
+        w = float(s["width_per_panel"]) * max(1, int(n_panels))
+    else:
+        w = float(default_w)
+    h = float(default_h) if s["height"] is None else float(s["height"])
+    return (w, h)
+
+
+def style_figure(key: str) -> None:
+    """Apply the font sizes for `key` to the current figure.
+
+    Called immediately before tight_layout so the new sizes are what the
+    layout is computed against; calling it after would leave labels clipped
+    or floating. Applied at the end rather than at each draw call because the
+    inline fontsize= arguments are scattered through the plotting functions,
+    and overriding them in one place keeps the knob in one place too.
+
+    Anything left as None is not touched, so a figure with no overrides keeps
+    the sizes its plotting function chose.
+    """
+    s = _style(key)
+    fig = plt.gcf()
+
+    for ax in fig.get_axes():
+        if s["axis_label"] is not None:
+            ax.xaxis.label.set_size(s["axis_label"])
+            ax.yaxis.label.set_size(s["axis_label"])
+        if s["tick_label"] is not None:
+            ax.tick_params(axis="both", which="both",
+                           labelsize=s["tick_label"])
+        if s["title"] is not None and ax.get_title():
+            ax.title.set_size(s["title"])
+        if s["annotation"] is not None:
+            for txt in ax.texts:
+                txt.set_fontsize(s["annotation"])
+        leg = ax.get_legend()
+        if leg is not None:
+            if s["legend"] is not None:
+                for txt in leg.get_texts():
+                    txt.set_fontsize(s["legend"])
+            if s["legend_title"] is not None and leg.get_title() is not None:
+                leg.get_title().set_fontsize(s["legend_title"])
+
+    if s["suptitle"] is not None:
+        sup = getattr(fig, "_suptitle", None)
+        if sup is not None:
+            sup.set_size(s["suptitle"])
+
 
 RESULTS_SUBFOLDER = "Bulk_Analysis_Results"
 
@@ -202,6 +340,18 @@ def aggregate_pipeline_results(outputs_root: str) -> pd.DataFrame:
       else:
         size_cat = "Stagnate"
 
+      # Terminal radius relative to the vesicle's own pre-pulse baseline.
+      # Already computed by classify_guv_fates and sitting in the fate CSV;
+      # carried through here because the area-loss onset needs a CONTINUOUS
+      # measure, and size_category alone collapses it to four labels.
+      terminal_norm_radius = np.nan
+      try:
+        _tnr = row.get("terminal_norm_radius", np.nan)
+        if pd.notna(_tnr):
+          terminal_norm_radius = float(_tnr)
+      except Exception:
+        pass
+
       radius_um = np.nan
       tau = np.nan
       tau_se = np.nan
@@ -268,6 +418,7 @@ def aggregate_pipeline_results(outputs_root: str) -> pd.DataFrame:
           "size_category": size_cat,
           "radius_um": radius_um,
           "radius_bin": radius_bin,
+          "terminal_norm_radius": terminal_norm_radius,
           "cortex_status": cortex_status,
           "cortex_contrast": cortex_contrast,
           "prepulse_lumen_abs": prepulse_lumen_abs,
@@ -286,6 +437,231 @@ def aggregate_pipeline_results(outputs_root: str) -> pd.DataFrame:
       })
 
   return pd.DataFrame(records)
+
+
+# -----------------------------------------------------------------------------
+# --- ONSET FIELDS ---
+# Perrier et al. (2019) read the field at which the actin shell breaks down,
+# and the field at which the GUV starts to shrink, off sigmoids fitted "to
+# guide the eye". The ordering of those two onsets is their mechanism: the
+# cortex holds the membrane until it fails, and only then does the vesicle
+# lose area. Testing that ordering needs the onsets as numbers with
+# uncertainties, not as curves read by eye -- if the two confidence intervals
+# overlap, there is no ordering to report.
+#
+# A single pulse per vesicle across a voltage series (this work) rather than a
+# ramp on one vesicle (theirs) means these midpoints are not expected to match
+# theirs numerically: they showed themselves that a ramp shifts the apparent
+# onset relative to a single pulse of the same amplitude.
+# -----------------------------------------------------------------------------
+
+ONSET_N_BOOTSTRAP = 2000      # resamples for the V50 confidence interval
+ONSET_MIN_N = 8               # GUVs required before a fit is attempted
+ONSET_MIN_VOLTAGES = 4        # distinct voltages required
+# Minimum fitted step, in units of the residual scatter about the fit. A
+# logistic will happily fit flat, noisy data by placing an arbitrary midpoint
+# under a step no larger than the noise; the CI can even come out narrow,
+# because every bootstrap replicate agrees on the same meaningless value.
+# Requiring the step to exceed the scatter is what separates "the onset is
+# here" from "there is no onset in this range".
+ONSET_MIN_AMPLITUDE_SD = 2.0
+
+
+def _sigmoid(v, lo, hi, v50, k):
+    """Logistic in voltage. lo/hi are the plateaus, v50 the midpoint."""
+    return lo + (hi - lo) / (1.0 + np.exp(-k * (v - v50)))
+
+
+def _fit_sigmoid_once(v, y):
+    """One least-squares fit. Returns (lo, hi, v50, k) or None."""
+    v = np.asarray(v, float)
+    y = np.asarray(y, float)
+    if len(v) < 4 or len(np.unique(v)) < 3:
+        return None
+    lo0, hi0 = float(np.nanmin(y)), float(np.nanmax(y))
+    v50_0 = float(np.median(v))
+    span = max(float(np.ptp(v)), 1.0)
+    try:
+        p, _ = curve_fit(
+            _sigmoid, v, y,
+            p0=[lo0, hi0, v50_0, 4.0 / span],
+            bounds=([-np.inf, -np.inf, float(np.min(v)) - span,
+                     1e-4 / span],
+                    [np.inf, np.inf, float(np.max(v)) + span,
+                     100.0 / span]),
+            maxfev=20000,
+        )
+    except Exception:
+        return None
+    return tuple(float(x) for x in p)
+
+
+def fit_onset(df: pd.DataFrame, value_col: str, label: str,
+              n_boot: int = ONSET_N_BOOTSTRAP) -> dict:
+    """Sigmoid midpoint in volts, with a bootstrap CI, for one population.
+
+    The CI comes from resampling GUVs with replacement rather than from the
+    covariance matrix, because the residuals are neither independent (several
+    GUVs share a field of view) nor homoscedastic (spread grows with voltage),
+    which is exactly where the asymptotic standard error misleads.
+
+    The returned `v50_ci_low`/`v50_ci_high` are the honest output. A midpoint
+    whose CI spans most of the voltage range means the sigmoid is not
+    identified by these data -- usually because no upper plateau was reached
+    -- and it should be reported as such rather than quoted as an onset. This
+    is the same failure the tau fits have, and it is not made better by
+    reporting the point estimate alone.
+    """
+    sub = df[["voltage", value_col]].copy()
+    sub["v_num"] = sub["voltage"].map(_voltage_key)
+    sub = sub.dropna(subset=["v_num", value_col])
+    out = {
+        "measure": label, "n_guv": int(len(sub)),
+        "n_voltages": int(sub["v_num"].nunique()),
+        "v50": np.nan, "v50_ci_low": np.nan, "v50_ci_high": np.nan,
+        "slope_k": np.nan, "plateau_low": np.nan, "plateau_high": np.nan,
+        "amplitude": np.nan, "resid_sd": np.nan, "amplitude_over_sd": np.nan,
+        "n_boot_ok": 0, "identified": False, "note": "",
+    }
+    if out["n_guv"] < ONSET_MIN_N or out["n_voltages"] < ONSET_MIN_VOLTAGES:
+        out["note"] = (f"too few data: {out['n_guv']} GUV(s) across "
+                       f"{out['n_voltages']} voltage(s)")
+        return out
+
+    v = sub["v_num"].to_numpy(float)
+    y = sub[value_col].to_numpy(float)
+    p = _fit_sigmoid_once(v, y)
+    if p is None:
+        out["note"] = "fit did not converge on the full sample"
+        return out
+    lo, hi, v50, k = p
+    out.update(v50=v50, slope_k=k, plateau_low=lo, plateau_high=hi)
+
+    resid = y - _sigmoid(v, lo, hi, v50, k)
+    sd = float(np.std(resid))
+    amp = abs(hi - lo)
+    out["amplitude"] = amp
+    out["resid_sd"] = sd
+    out["amplitude_over_sd"] = (amp / sd) if sd > 0 else np.inf
+    amplitude_ok = (sd <= 0) or (amp >= ONSET_MIN_AMPLITUDE_SD * sd)
+
+    rng = np.random.default_rng(0)          # fixed seed: reruns reproduce
+    n = len(v)
+    boot = []
+    for _ in range(int(n_boot)):
+        idx = rng.integers(0, n, n)
+        pb = _fit_sigmoid_once(v[idx], y[idx])
+        if pb is not None:
+            boot.append(pb[2])
+    out["n_boot_ok"] = len(boot)
+    if len(boot) < 0.5 * n_boot:
+        out["note"] = (f"only {len(boot)}/{n_boot} bootstrap fits converged; "
+                       f"CI unreliable")
+    if boot:
+        out["v50_ci_low"] = float(np.percentile(boot, 2.5))
+        out["v50_ci_high"] = float(np.percentile(boot, 97.5))
+        width = out["v50_ci_high"] - out["v50_ci_low"]
+        v_span = float(np.ptp(v))
+        # A midpoint is only meaningful if the CI is narrow against the range
+        # that was actually sampled, and if the midpoint sits inside it.
+        inside = float(np.min(v)) <= v50 <= float(np.max(v))
+        out["identified"] = bool(inside and v_span > 0
+                                 and width < 0.5 * v_span and amplitude_ok)
+        if not out["identified"] and not out["note"]:
+            if not amplitude_ok:
+                out["note"] = (f"no step to locate: fitted amplitude "
+                               f"{amp:.3f} is only {out['amplitude_over_sd']:.1f}x "
+                               f"the residual scatter")
+            else:
+                out["note"] = ("midpoint not constrained by these voltages "
+                               "(CI spans >50% of the sampled range, or the "
+                               "midpoint lies outside it)")
+    return out
+
+
+def report_onset_fields(df: pd.DataFrame, output_dir: str) -> pd.DataFrame:
+    """Cortex-breakdown and area-loss onsets per population, fitted and plotted.
+
+    Area loss is expressed as fractional projected-area loss,
+    1 - (terminal_norm_radius)^2, so it is directly comparable to the
+    normalised area Perrier et al. plot rather than to a radius.
+    """
+    out_path = sub_dir(output_dir, "cortex_breakdown")
+    work = df.copy()
+    work = work[work["size_category"] != "Rupture/Collapse"]
+
+    if "terminal_norm_radius" in work.columns:
+      with np.errstate(invalid="ignore"):
+        work["area_loss_frac"] = 1.0 - work["terminal_norm_radius"] ** 2
+
+    measures = []
+    if "area_loss_frac" in work.columns:
+      measures.append(("area_loss_frac", "fractional area loss"))
+    if "peak_drop_final" in work.columns:
+      measures.append(("peak_drop_final", "cortex peak drop"))
+    if not measures:
+      print("Onset fields skipped: neither area nor cortex peak data present.")
+      return pd.DataFrame()
+
+    pops = _present_populations(work)
+    rows = []
+    fig, axes = plt.subplots(
+        1, len(pops),
+        figsize=fig_size("onset_fields", 6.0 * len(pops), 4.8, len(pops)),
+        sharey=True, squeeze=False,
+    )
+    for ax, pop in zip(axes[0], pops):
+      pop_df = work[work["population"] == pop]
+      for value_col, label in measures:
+        if value_col not in pop_df.columns:
+          continue
+        res = fit_onset(pop_df, value_col, label)
+        res["population"] = pop
+        rows.append(res)
+
+        sub = pop_df[["voltage", value_col]].dropna()
+        if sub.empty:
+          continue
+        vx = sub["voltage"].map(_voltage_key).to_numpy(float)
+        ax.plot(vx, sub[value_col].to_numpy(float), "o", ms=3, alpha=0.35,
+                label=f"{label} (n = {len(sub)})")
+        if np.isfinite(res["v50"]):
+          grid = np.linspace(vx.min(), vx.max(), 200)
+          ax.plot(grid, _sigmoid(grid, res["plateau_low"],
+                                 res["plateau_high"], res["v50"],
+                                 res["slope_k"]), "-", lw=1.6)
+          if res["identified"]:
+            ax.axvline(res["v50"], ls="--", lw=1.0, color="0.3")
+            ax.axvspan(res["v50_ci_low"], res["v50_ci_high"],
+                       color="0.6", alpha=0.15)
+      ax.set_title(pop)
+      ax.set_xlabel("Voltage (V)")
+      ax.axhline(0.0, color="0.7", lw=0.8, ls=":")
+      ax.legend(frameon=False, loc="upper left")
+    axes[0][0].set_ylabel("fractional loss")
+
+    style_figure("onset_fields")
+    plt.tight_layout()
+    pdf_path = out_path / "guv_onset_fields.pdf"
+    plt.savefig(pdf_path, format="pdf", dpi=300)
+    plt.close(fig)
+
+    res_df = pd.DataFrame(rows)
+    csv_path = out_path / "onset_fields.csv"
+    res_df.to_csv(csv_path, index=False, float_format="%.4f")
+
+    print("\nOnset fields (sigmoid midpoint, 95% bootstrap CI):")
+    for _, r in res_df.iterrows():
+      if r["identified"]:
+        print(f"  {r['population']:<20} {r['measure']:<20} "
+              f"V50 = {r['v50']:.0f} V  [{r['v50_ci_low']:.0f}, "
+              f"{r['v50_ci_high']:.0f}]  (n = {r['n_guv']})")
+      else:
+        print(f"  {r['population']:<20} {r['measure']:<20} "
+              f"not identified -- {r['note']}")
+    print("  Two onsets are only ordered if their intervals do not overlap.")
+    return res_df
+
 
 def report_endpoint_times(df: pd.DataFrame):
   if df.empty:
@@ -369,7 +745,7 @@ def plot_drop_by_cortex_status(df: pd.DataFrame, output_dir: str):
               if g.startswith("Branched") and g in set(df_st["cortex_status"])]
 
   fig, axes = plt.subplots(
-      1, len(pops), figsize=(6.5 * len(pops), 5.5), sharey=True, squeeze=False
+      1, len(pops), figsize=fig_size("drop_by_cortex_status", 6.5 * len(pops), 5.5, len(pops)), sharey=True, squeeze=False
   )
   x = np.arange(len(voltages))
   slot_w = 0.8 / max(len(statuses), 1)
@@ -422,6 +798,7 @@ def plot_drop_by_cortex_status(df: pd.DataFrame, output_dir: str):
       "Dye retention change split by pre-pulse cortex presence"
       "\n(Stagnate GUVs; bars = median)"
   )
+  style_figure("drop_by_cortex_status")
   plt.tight_layout()
   pdf_path = out_path / "guv_drop_by_cortex_status.pdf"
   plt.savefig(pdf_path, format="pdf", dpi=300)
@@ -456,7 +833,7 @@ def plot_tau_by_size_and_voltage(df: pd.DataFrame, output_dir: str):
     return
 
   fig, axes = plt.subplots(
-      1, len(pops), figsize=(6.5 * len(pops), 5.5), sharey=True, squeeze=False
+      1, len(pops), figsize=fig_size("tau_by_size_voltage", 6.5 * len(pops), 5.5, len(pops)), sharey=True, squeeze=False
   )
   x = np.arange(len(voltages))
   slot_w = 0.8 / len(BIN_ORDER)
@@ -542,6 +919,7 @@ def plot_tau_by_size_and_voltage(df: pd.DataFrame, output_dir: str):
       r"Dye efflux time constant $\tau$ vs. voltage, by size group"
       f"\n(bars = median; {gate_txt})"
   )
+  style_figure("tau_by_size_voltage")
   plt.tight_layout()
   pdf_path = out_path / "guv_tau_by_size_voltage.pdf"
   plt.savefig(pdf_path, format="pdf", dpi=300)
@@ -752,7 +1130,7 @@ def plot_cortex_peak_timecourse(df: pd.DataFrame, outputs_root: str,
   shades = {v: cmap(0.3 + 0.7 * i / max(len(pulsed) - 1, 1))
             for i, v in enumerate(pulsed)}
 
-  fig, axes = plt.subplots(1, 2, figsize=(13, 5.2))
+  fig, axes = plt.subplots(1, 2, figsize=fig_size("cortex_peak_timecourse", 13, 5.2, 2))
   rows, curves = [], {}
 
   for ax, (t_lo, t_hi, title) in zip(
@@ -795,6 +1173,7 @@ def plot_cortex_peak_timecourse(df: pd.DataFrame, outputs_root: str,
                   f"(median and IQR; dashed red = {CONTROL_VOLTAGE} "
                   "bleach reference, uncorrected)"),
                fontsize=11)
+  style_figure("cortex_peak_timecourse")
   fig.tight_layout(rect=(0, 0, 1, 0.93))
   pdf_path = out_path / ("guv_cortex_peak_timecourse"
                          + ("_bleach_corrected" if corrected else "")
@@ -919,7 +1298,7 @@ def plot_cortex_peak_breakdown(df: pd.DataFrame, output_dir: str):
   offset_w = 0.16
   rng = np.random.default_rng(0)
 
-  fig, ax = plt.subplots(figsize=(max(8, 1.1 * len(voltages) + 3), 5.5))
+  fig, ax = plt.subplots(figsize=fig_size("cortex_peak_breakdown", max(8, 1.1 * len(voltages) + 3), 5.5))
 
   if len(ctrl) and len(ctrl) < MIN_CONTROL_N:
     print(f"  NOTE: the {CONTROL_VOLTAGE} band is drawn from {len(ctrl)} GUV(s), below "
@@ -967,6 +1346,7 @@ def plot_cortex_peak_breakdown(df: pd.DataFrame, output_dir: str):
                "reference, no measurable response)")
   ax.legend(frameon=False, loc="upper left", fontsize=8)
   ax.grid(axis="y", linestyle="--", alpha=0.5)
+  style_figure("cortex_peak_breakdown")
   plt.tight_layout()
 
   pdf_path = out_path / "guv_cortex_peak_breakdown.pdf"
@@ -998,13 +1378,14 @@ def plot_lumen_abs_histogram(df: pd.DataFrame, output_dir: str):
     print("Lumen histogram skipped: no prepulse_lumen_abs values.")
     return
 
-  fig, ax = plt.subplots(figsize=(7.5, 4.8))
+  fig, ax = plt.subplots(figsize=fig_size("lumen_abs_histogram", 7.5, 4.8))
   ax.hist(vals, bins=40, color=PALETTE["light_blue"],
           edgecolor=PALETTE["white"], linewidth=0.4)
   ax.set_xlabel("pre-pulse lumen above background (camera counts)")
   ax.set_ylabel("GUV count")
   ax.set_title("Lumenal actin level, BranchedCortex population")
   ax.grid(axis="y", linestyle="--", alpha=0.4)
+  style_figure("lumen_abs_histogram")
   plt.tight_layout()
 
   pdf_path = out_path / "guv_lumen_abs_histogram.pdf"
@@ -1034,7 +1415,7 @@ def plot_cortex_contrast_histogram(df: pd.DataFrame, output_dir: str):
   lo = getattr(cfg, "CORTEX_CONTRAST_LOW", None)
   hi = getattr(cfg, "CORTEX_CONTRAST_HIGH", None)
 
-  fig, ax = plt.subplots(figsize=(7.5, 4.8))
+  fig, ax = plt.subplots(figsize=fig_size("cortex_contrast_histogram", 7.5, 4.8))
   ax.hist(vals, bins=40, color=PALETTE["medium_blue"],
           edgecolor=PALETTE["white"], linewidth=0.4)
   for thr, name in ((lo, "CORTEX_CONTRAST_LOW"), (hi, "CORTEX_CONTRAST_HIGH")):
@@ -1049,6 +1430,7 @@ def plot_cortex_contrast_histogram(df: pd.DataFrame, output_dir: str):
   ax.set_title("Cortex contrast, BranchedCortex population\n"
                f"n={len(vals)} classified, {n_nan} NaN of {n_total}")
   ax.grid(axis="y", linestyle="--", alpha=0.4)
+  style_figure("cortex_contrast_histogram")
   plt.tight_layout()
 
   pdf_path = out_path / "guv_cortex_contrast_histogram.pdf"
@@ -1095,7 +1477,7 @@ def plot_released_fraction_by_voltage(df: pd.DataFrame, output_dir: str,
   x = np.arange(len(voltages))
   offset_w = 0.18 if len(pops) <= 2 else 0.11
 
-  fig, ax = plt.subplots(figsize=(max(8, 1.1 * len(voltages) + 3), 5.5))
+  fig, ax = plt.subplots(figsize=fig_size("released_fraction_by_voltage", max(8, 1.1 * len(voltages) + 3), 5.5))
   rng = np.random.default_rng(0)
 
   rows = []
@@ -1138,6 +1520,7 @@ def plot_released_fraction_by_voltage(df: pd.DataFrame, output_dir: str,
   )
   ax.legend(frameon=False, loc="upper left")
   ax.grid(axis="y", linestyle="--", alpha=0.5)
+  style_figure("released_fraction_by_voltage")
   plt.tight_layout()
 
   pdf_path = out_path / f"guv_released_fraction_by_voltage{suffix}.pdf"
@@ -1169,7 +1552,7 @@ def generate_separate_pdf_plots(df: pd.DataFrame, output_dir: str):
   size_colors = {c: SIZE_CATEGORY_COLORS[c] for c in size_categories}
   intensity_categories = ["Lose Intensity", "Flatline"]
 
-  fig1, ax1 = plt.subplots(figsize=(max(8, 1.1 * len(voltages) + 3), 5.5))
+  fig1, ax1 = plt.subplots(figsize=fig_size("size_category_distribution", max(8, 1.1 * len(voltages) + 3), 5.5))
   x = np.arange(len(voltages))
   bar_w = 0.7 / max(len(pops), 1)
 
@@ -1218,6 +1601,7 @@ def generate_separate_pdf_plots(df: pd.DataFrame, output_dir: str):
   ax1.set_ylabel("GUV Count")
   ax1.legend(title="Size Category", bbox_to_anchor=(1.02, 1), loc="upper left")
   ax1.grid(axis="y", linestyle="--", alpha=0.5)
+  style_figure("size_category_distribution")
   plt.tight_layout()
 
   pdf_path1 = sub_dir(output_dir, "fate") / "guv_size_category_distribution.pdf"
@@ -1225,7 +1609,7 @@ def generate_separate_pdf_plots(df: pd.DataFrame, output_dir: str):
   plt.close(fig1)
   print(f"Saved Graph 1: {pdf_path1}")
 
-  fig2, ax2 = plt.subplots(figsize=(max(8, 1.1 * len(voltages) + 3), 5.5))
+  fig2, ax2 = plt.subplots(figsize=fig_size("stagnate_intensity_counts", max(8, 1.1 * len(voltages) + 3), 5.5))
   n_series = len(pops) * len(intensity_categories)
   bar_w = 0.8 / max(n_series, 1)
   hatches = {"Lose Intensity": "", "Flatline": "///"}
@@ -1268,6 +1652,7 @@ def generate_separate_pdf_plots(df: pd.DataFrame, output_dir: str):
       title="Population / Behaviour", bbox_to_anchor=(1.02, 1), loc="upper left"
   )
   ax2.grid(axis="y", linestyle="--", alpha=0.5)
+  style_figure("stagnate_intensity_counts")
   plt.tight_layout()
 
   pdf_path2 = sub_dir(output_dir, "dye") / "guv_stagnate_intensity_counts.pdf"
@@ -1276,7 +1661,7 @@ def generate_separate_pdf_plots(df: pd.DataFrame, output_dir: str):
   print(f"Saved Graph 2: {pdf_path2}")
 
   fig3, axes3 = plt.subplots(
-      1, len(pops), figsize=(7 * len(pops), 5.5), sharey=True, squeeze=False
+      1, len(pops), figsize=fig_size("intensity_drop_trajectories", 7 * len(pops), 5.5, len(pops)), sharey=True, squeeze=False
   )
   width = 0.22
 
@@ -1339,6 +1724,7 @@ def generate_separate_pdf_plots(df: pd.DataFrame, output_dir: str):
       "Intensity Drop Trajectories per Voltage"
       f"\n(Pre-Pulse → Final {ENDPOINT_N_FRAMES}-Frame Average)"
   )
+  style_figure("intensity_drop_trajectories")
   plt.tight_layout()
 
   pdf_path3 = sub_dir(output_dir, "dye") / "guv_intensity_drop_trajectories.pdf"
@@ -1351,7 +1737,7 @@ def generate_separate_pdf_plots(df: pd.DataFrame, output_dir: str):
 
   for v in voltages:
     fig_v, axes_v = plt.subplots(
-        1, len(pops), figsize=(5.5 * len(pops), 5), sharey=True, squeeze=False
+        1, len(pops), figsize=fig_size("drop_by_size_per_voltage", 5.5 * len(pops), 5, len(pops)), sharey=True, squeeze=False
     )
 
     for p_idx, pop in enumerate(pops):
@@ -1406,6 +1792,7 @@ def generate_separate_pdf_plots(df: pd.DataFrame, output_dir: str):
         ax_v.set_ylabel("Normalized Intensity")
 
     fig_v.suptitle(f"{v} — Size Group vs. Intensity Drop")
+    style_figure("drop_by_size_per_voltage")
     plt.tight_layout()
 
     pdf_v_path = (sub_dir(output_dir, "dye_by_voltage")
@@ -1425,6 +1812,15 @@ if __name__ == "__main__":
   plot_lumen_abs_histogram(df_summary, str(results_dir))
   df_peak = add_cortex_peak_metrics(df_summary, outputs_root)
   plot_cortex_peak_breakdown(df_peak, str(results_dir))
+  # Onsets are fitted on df_peak, not df_summary: the cortex-loss curve needs
+  # peak_drop_final, which only exists after the merge above. Bare GUVs carry
+  # no actin columns, so their onset is fitted on area loss alone.
+  report_onset_fields(
+      df_summary.merge(
+          df_peak[["experiment", "guv_id", "peak_drop_final"]],
+          on=["experiment", "guv_id"], how="left")
+      if not df_peak.empty else df_summary,
+      str(results_dir))
   report_bleach_comparability(outputs_root)
   plot_cortex_peak_timecourse(df_summary, outputs_root, str(results_dir))
   plot_cortex_contrast_histogram(df_summary, str(results_dir))

@@ -25,8 +25,10 @@ In Spyder:
 """
 
 import argparse
+import io
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -49,6 +51,20 @@ FORCE   = True    # True = re-run experiments that already have outputs.
                   # exporter was added: previously analysed experiments
                   # have fate CSVs, so already_analysed() would skip the
                   # very runs that need to produce *_actin_cortex_status.csv.
+
+# How the child's tqdm bars are relayed. The child emits them with carriage
+# returns, so each update is a rewrite of the same line rather than a new
+# one; the previous version read the pipe with text=True, whose universal
+# newline translation turned every '\r' into '\n' and so printed one line
+# per update — hundreds of them per experiment.
+#   "live"  - rewrite the bar in place, one line per bar. Needs a console
+#             that honours '\r'. Spyder's does; the plain Windows console
+#             does; a redirected log file does not.
+#   "final" - drop the intermediate updates, keep only each bar's completed
+#             state. Safe everywhere, and the right choice when piping to a
+#             file, since a log full of '\r' is unreadable either way.
+#   "all"   - every update on its own line (the old behaviour).
+PROGRESS = "live"
 
 # Root scanned for .nd2 files.
 DATA_ROOT = r"D:\Data\EP"
@@ -103,30 +119,76 @@ def run_one(data_folder: str, base_name: str, repo_dir: Path) -> int:
   # Guard against a stale variable left in a long-lived Spyder kernel:
   # os.environ.copy() would carry it into every child.
 
-  # Piped and re-printed line by line rather than inherited. Spyder's
-  # console is not a real terminal, so a child writing straight to the
-  # inherited stdout produces nothing visible until the process exits —
-  # hours of apparent silence. flush=True is required for the same reason.
+  # Piped and re-printed rather than inherited. Spyder's console is not a
+  # real terminal, so a child writing straight to the inherited stdout
+  # produces nothing visible until the process exits — hours of apparent
+  # silence. flush=True is required for the same reason.
+  #
+  # Opened in BINARY and wrapped by hand with newline="". text=True would
+  # apply universal newline translation, which rewrites the '\r' tqdm uses
+  # to rewind the line as '\n' — that is what turned each progress bar into
+  # hundreds of separate lines. bufsize=0 keeps the raw pipe unbuffered so
+  # partial writes arrive as they happen instead of a screenful at a time.
   proc = subprocess.Popen(
       [sys.executable, "-u", str(repo_dir / "run_analysis.py")],
       cwd=str(repo_dir),
       env=env,
       stdout=subprocess.PIPE,
       stderr=subprocess.STDOUT,
-      text=True,
-      bufsize=1,
+      bufsize=0,
   )
+  stream = io.TextIOWrapper(proc.stdout, encoding="utf-8",
+                            errors="replace", newline="")
+
   # QC markers are picked out of the stream as it goes past rather than by
   # re-reading the log afterwards: the child already prints them, and this
   # way an interrupted or crashed run still reports whatever it emitted.
   qc_lines = []
-  for line in proc.stdout:
-      line = line.rstrip()
-      print(line, flush=True)
-      if "[QC:" in line:
-          qc_lines.append(line[line.index("[QC:"):])
+  mode = str(globals().get("PROGRESS", "live")).lower()
+  width = max(40, min(shutil.get_terminal_size((100, 24)).columns - 1, 200))
+  bar_open = False   # a bar is currently occupying the cursor's line
+
+  def _clear():
+    """Return the cursor to a clean line before writing something else."""
+    sys.stdout.write("\r" + " " * width + "\r")
+
+  for chunk in stream:
+    if chunk.endswith("\r"):
+      # A progress update: same line, rewritten. Never a QC marker, since
+      # those are printed with a trailing newline.
+      if mode == "live":
+        sys.stdout.write("\r" + chunk[:-1].rstrip()[:width].ljust(width))
+        sys.stdout.flush()
+        bar_open = True
+      elif mode == "all":
+        print(chunk[:-1].rstrip(), flush=True)
+      # "final" discards these entirely.
+      continue
+
+    line = chunk.rstrip("\r\n")
+    if bar_open:
+      _clear()
+      bar_open = False
+    print(line, flush=True)
+    if "[QC:" in line:
+      qc_lines.append(line[line.index("[QC:"):])
+
+  if bar_open:
+    _clear()
   proc.wait()
+  stream.close()
   return proc.returncode, qc_lines
+
+
+def _markers(qc_lines, tag):
+  """QC lines carrying a given tag, e.g. 'SYNC_EXIT'.
+
+  Markers from different checks share one stream, so every consumer has to
+  select by tag. Counting untagged lines would let one check's output stand
+  in for another's and report an experiment as screened when it was not.
+  """
+  prefix = f"[QC:{tag}]"
+  return [q for q in qc_lines if q.startswith(prefix)]
 
 
 def main():
@@ -217,7 +279,8 @@ def main():
   print(f"\n{'=' * 70}\nBatch summary\n{'=' * 70}")
   for base_name, code, elapsed, qc in results:
     status = "ok  " if code == 0 else f"FAIL({code})"
-    flag = "  <-- QC FLAG" if any("FAIL" in q for q in qc) else ""
+    flag = ("  <-- QC FLAG"
+            if any("FAIL" in q for q in _markers(qc, "SYNC_EXIT")) else "")
     print(f"  {status}  {elapsed / 60:6.1f} min  {base_name}{flag}")
   n_failed = sum(1 for _, code, _, _ in results if code != 0)
   print(f"\n{len(results) - n_failed} succeeded, {n_failed} failed.")
@@ -226,8 +289,9 @@ def main():
 
   # A run that exits 0 can still have produced unusable fates, so the QC
   # result is reported separately from the exit code and never folded into it.
-  flagged = [(b, q) for b, _, _, qc in results for q in qc if "FAIL" in q]
-  n_checked = sum(1 for _, _, _, qc in results if qc)
+  flagged = [(b, q) for b, _, _, qc in results
+             for q in _markers(qc, "SYNC_EXIT") if "FAIL" in q]
+  n_checked = sum(1 for _, _, _, qc in results if _markers(qc, "SYNC_EXIT"))
   print(f"\n{'=' * 70}\nQC: synchronized exit\n{'=' * 70}")
   if flagged:
     print(f"  {len(flagged)} of {n_checked} experiment(s) flagged. Vesicles do")
@@ -244,6 +308,33 @@ def main():
   if n_checked < len(results):
     print(f"  {len(results) - n_checked} experiment(s) emitted no QC line "
           f"(check they reached fate classification).")
+
+  # Pre-pulse exits. A vesicle whose track ended before the pulse cannot
+  # have been porated by it, so run_analysis drops it from the fate table
+  # rather than scoring it RUPTURED. That is a silent deletion at the
+  # per-experiment level, so the count is surfaced here: a field losing
+  # several vesicles before the pulse is worth looking at even though
+  # nothing failed.
+  pp_lines = [(b, q) for b, _, _, qc in results
+              for q in _markers(qc, "PREPULSE_EXIT")]
+  pp_checked = sum(1 for _, _, _, qc in results if _markers(qc, "PREPULSE_EXIT"))
+  pp_hits = [(b, q) for b, q in pp_lines if "none of" not in q]
+  print(f"\n{'=' * 70}\nQC: pre-pulse exits\n{'=' * 70}")
+  if pp_hits:
+    print(f"  {len(pp_hits)} of {pp_checked} experiment(s) lost vesicles "
+          f"before the pulse. These are excluded from the fate table, so")
+    print("  they leave both the rupture count and the survivor denominator:")
+    for base_name, q in pp_hits:
+      print(f"    {base_name}")
+      print(f"        {q}")
+    print("\n  Exits at frame 0-1 usually mean the circle was placed on")
+    print("  something that was never a trackable vesicle; check the ring")
+    print("  scores in *_detection_quality.csv before assuming otherwise.")
+  else:
+    print(f"  No pre-pulse exits across {pp_checked} experiment(s) checked.")
+  if pp_checked < len(results):
+    print(f"  {len(results) - pp_checked} experiment(s) emitted no pre-pulse "
+          f"line (older code, or the run stopped before fate classification).")
 
 
 if __name__ == "__main__":

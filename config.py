@@ -549,6 +549,31 @@ RUPTURE_SCORE_THRESHOLD = 4.0
 # to declare rupture (reduces false positives from single bad frames).
 RUPTURE_DETECTION_CONSECUTIVE_FAILS = 3
 
+# Exit classification: OUT_OF_FRAME vs RUPTURED is decided by the geometry
+# of the vesicle at the exit, not by a majority vote over the failing
+# streak. "Clearance" is the distance from the vesicle to the nearest frame
+# edge MINUS the extent that has to be visible, expressed in units of the
+# vesicle's own mean radius. Negative means part of what we need to see
+# lies outside the frame, so the vesicle is out of frame rather than burst.
+#
+# Two clearances are recorded per exit in *_detection_quality.csv:
+#   exit_clearance_profile_r  - against the window the ring scorer actually
+#                               reads, MEMBRANE_SEARCH_FACTOR beyond the
+#                               membrane plus a 5 px margin (1.35 r + 5 at
+#                               the default). This is the one that decides
+#                               the label: a vesicle whose profile window is
+#                               clipped cannot be scored, so its ring
+#                               disappears for a geometric reason.
+#   exit_clearance_vesicle_r  - against the fitted ellipse itself (bounding
+#                               circle on the semi-major axis). Recorded for
+#                               audit only. A GUV with this positive and the
+#                               profile clearance negative is one whose
+#                               outline was visible but not measurable.
+#
+# 0.0 means "any clipping at all is out of frame". Calibrate from the two
+# columns once a full run exists rather than trusting this default.
+OUT_OF_FRAME_CLEARANCE_R = 0.0
+
 # GUV fate refinement: distinguishes gradual SHRINKAGE (deflation) from
 # abrupt RUPTURE. A GUV whose radius has declined by at least this fraction
 # from its own pre-pulse baseline is classified SHRUNK regardless of how

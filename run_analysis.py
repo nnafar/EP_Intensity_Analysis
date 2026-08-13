@@ -470,6 +470,13 @@ def process_all_guvs(circles: list[dict],
         'tracking_dataframe':    df_track,
         'ruptured_guv_ids':      ruptured_ids,      # set of str IDs that genuinely ruptured
         'out_of_frame_guv_ids':  out_of_frame_ids,   # set of str IDs lost to the FOV edge (not a rupture)
+        # Frame at which each early-exiting GUV stopped being tracked, so
+        # fate classification can tell a pre-pulse loss from a poration.
+        'exit_frame_by_guv': {
+            str(qe['guv_id']): qe['ruptured_at_frame']
+            for qe in quality_log
+            if qe.get('ruptured_at_frame') is not None
+        },
     }
 
 
@@ -1989,12 +1996,45 @@ def main():
                 terminal_n_frames=getattr(cfg, 'SHRINKAGE_TERMINAL_N_FRAMES', 3),
                 growth_use_peak_radius=getattr(cfg, 'GROWTH_USE_PEAK_RADIUS', False),
                 pulse_frame=PULSE_FRAME,
+                exit_frames=guv_results.get('exit_frame_by_guv', {}),
             )
-            df_fate.to_csv(
+            lost_prepulse_ids = {g for g, f in fate_map.items()
+                                 if f == 'LOST_PREPULSE'}
+
+            # Vesicles whose track ended before the pulse are written out of
+            # the fate table rather than exported with a label of their own.
+            # Their response to the pulse was never observed, so any label
+            # would be a claim about an event that was not witnessed, and
+            # anything downstream reading this CSV would have to know to
+            # special-case it. They stay fully auditable in
+            # *_detection_quality.csv, which keeps ruptured_at_frame and
+            # exit_reason for every GUV including these.
+            n_prepulse = len(lost_prepulse_ids)
+            df_fate_export = (
+                df_fate[~df_fate['guv_id'].astype(str).isin(lost_prepulse_ids)]
+                if n_prepulse and 'guv_id' in df_fate.columns else df_fate
+            )
+            df_fate_export.to_csv(
                 os.path.join(cfg.FOLDER_TRACKING,
                              f"{cfg.EXPERIMENT_BASE_NAME}_guv_fate_classification.csv"),
                 index=False, float_format='%.4f'
             )
+            # Marker for batch_run.py, which sniffs '[QC:' out of the child's
+            # stdout. Printed even when clean, so the batch summary can tell
+            # "checked, nothing to exclude" from "never got this far".
+            if n_prepulse:
+                _pp_frames = sorted(
+                    guv_results.get('exit_frame_by_guv', {}).get(g)
+                    for g in lost_prepulse_ids
+                )
+                print(f"[QC:PREPULSE_EXIT] {n_prepulse}/{len(fate_map)} GUV(s) "
+                      f"exited before the pulse (frame {PULSE_FRAME}) at "
+                      f"frames {_pp_frames} - dropped from the fate table",
+                      flush=True)
+            else:
+                print(f"[QC:PREPULSE_EXIT] none of {len(fate_map)} GUV(s) "
+                      f"exited before the pulse (frame {PULSE_FRAME})",
+                      flush=True)
             ruptured_guv_ids = {g for g, f in fate_map.items() if f == 'RUPTURED'}
             shrunk_guv_ids   = {g for g, f in fate_map.items() if f == 'SHRUNK'}
             grown_guv_ids    = {g for g, f in fate_map.items() if f == 'GROWN'}
@@ -2008,6 +2048,7 @@ def main():
                 f"{getattr(cfg, 'GROWTH_FRACTION_THRESHOLD', 0.15)*100:.0f}% radius gain, "
                 f"{'peak' if getattr(cfg, 'GROWTH_USE_PEAK_RADIUS', False) else 'terminal'} radius), "
                 f"{len(out_of_frame_ids_refined)} lost out of frame, "
+                f"{len(lost_prepulse_ids)} lost before the pulse (excluded), "
                 f"{n_survived} survived intact → "
                 f"{cfg.EXPERIMENT_BASE_NAME}_guv_fate_classification.csv"
             )
@@ -2265,6 +2306,7 @@ def main():
                 ]
 
                 kymo_ids, kymo_data_list = [], []
+                pe_by_guv = {}
                 for gid, ad in actin_gid_ad_pairs:
                     kd = utils.build_actin_angular_kymograph(
                         ad, PULSE_FRAME, data['time_array'], n_angles=n_angles_cfg
@@ -2286,9 +2328,20 @@ def main():
                         pe_data, gid, cfg.FOLDER_ACTIN, cfg.EXPERIMENT_BASE_NAME
                     )
                     logger.info(f"  GUV {gid}: saved pole-vs-equator trace → {pe_path}")
+                    pe_by_guv[gid] = pe_data
 
                     kymo_ids.append(gid)
                     kymo_data_list.append(kd)
+
+                # One CSV per experiment holding every GUV's trace. The PNGs
+                # stay as the per-vesicle view; this is what the bulk stage
+                # pools, since directional loss can only be separated from
+                # vesicle rotation across a population.
+                pe_csv = utils.export_pole_vs_equator_csv(
+                    pe_by_guv, cfg.FOLDER_ACTIN, cfg.EXPERIMENT_BASE_NAME
+                )
+                if pe_csv:
+                    logger.info(f"Saved pole-vs-equator traces → {pe_csv}")
 
                 if kymo_data_list:
                     group_path = utils.plot_actin_angular_kymograph_group(
