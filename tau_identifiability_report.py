@@ -17,12 +17,14 @@ OUTPUTS_ROOT = Path(getattr(cfg, 'PARENT_OUTPUT_FOLDER', r"D:\Data\EP\Outputs"))
 RESULTS_SUBFOLDER = 'Bulk_Analysis_Results'
 
 try:
-  from process import EXCLUDE_EXPERIMENTS, is_excluded_experiment
+  from process import (EXCLUDE_EXPERIMENTS, is_excluded_experiment,
+                       SIZE_WINDOW_UM)
 except Exception as _e:
   print(f"WARNING: could not import EXCLUDE_EXPERIMENTS from process.py "
         f"({type(_e).__name__}: {_e}). No experiments will be excluded from "
         "this report; its counts may not match the figures.")
   EXCLUDE_EXPERIMENTS = []
+  SIZE_WINDOW_UM = None
 
   def is_excluded_experiment(name: str) -> bool:
     return any(re.search(pat, name) for pat in EXCLUDE_EXPERIMENTS)
@@ -93,6 +95,17 @@ def load() -> pd.DataFrame:
     print(f"Excluded {n_excluded} experiment(s) via "
           f"process.EXCLUDE_EXPERIMENTS: {EXCLUDE_EXPERIMENTS}")
   out = pd.concat(frames, ignore_index=True)
+
+  # Same size window process.py applies to the bulk table. This report reads
+  # the per-experiment fit files directly rather than guv_bulk_summary.csv, so
+  # without this it would describe a different population from every other
+  # stage and its identifiability percentages would not be comparable to them.
+  if SIZE_WINDOW_UM is not None and 'radius_um' in out.columns:
+    lo, hi = SIZE_WINDOW_UM
+    keep = out['radius_um'].between(lo, hi)
+    print(f"Size window {lo}-{hi} um: {int(keep.sum())} of {len(out)} GUV(s) "
+          f"retained ({int((~keep).sum())} outside or unmeasured).")
+    out = out[keep].copy()
 
   if EXCLUDE_GROUPS:
     drop = out['cortex_group'].isin(EXCLUDE_GROUPS)

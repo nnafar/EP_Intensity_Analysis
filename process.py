@@ -400,6 +400,75 @@ def _responding_at(t_c: np.ndarray, y_c: np.ndarray):
   return bool(drop > max(min_amp, k * noise))
 
 
+# -----------------------------------------------------------------------------
+# --- SIZE WINDOW ---
+# Radius range, in micrometres, that every vesicle must fall inside to enter
+# the bulk table. None disables the filter and restores the whole population.
+#
+# The two preparations differ by 2.09 um in median radius (6.58 vs 4.49), and
+# the induced transmembrane potential scales with radius, so a comparison at
+# matched applied field is also a comparison at mismatched dose. There are two
+# ways to answer that. Correct for it, by plotting against 1.5*E*R; or remove
+# it, by comparing only vesicles of the same size. This constant does the
+# second.
+#
+# The correction is the more powerful option and the restriction is the more
+# conservative one. Mercadal et al. (2016) report that the inverse
+# radius-field relationship Schwan's equation predicts is often not observed
+# experimentally, or is much shallower than predicted, so dividing a dose axis
+# by radius imports an assumption that may not hold in this regime. Matching
+# on size assumes nothing about how dose scales.
+#
+# Inside 4.5-5.5 um the two preparations are indistinguishable in radius
+# (medians 4.99 and 4.97 um, Mann-Whitney p = 0.27), so applied field is the
+# dose and no model is needed.
+#
+# It is expensive. Roughly four vesicles in five fall outside, and the loss is
+# not spread evenly: conditions where one preparation happens to be large or
+# small lose almost everything. The report printed at aggregation time lists
+# what each condition costs, and it should be read before the results are
+# trusted -- a condition reduced to a handful of vesicles is not a condition.
+SIZE_WINDOW_UM = (4.5, 5.5)
+
+
+def _report_size_window(kept: dict, dropped: dict, n_no_radius: int) -> None:
+  """What the size window cost, per phenotype and per condition.
+
+  Built from tallies rather than from the finished table, because a vesicle
+  outside the window is rejected inside the aggregation loop and never
+  becomes a row. The condition list is the part worth reading: the loss is
+  not spread evenly, and a condition reduced to one or two vesicles has
+  stopped being a condition whatever the group totals say.
+  """
+  lo, hi = SIZE_WINDOW_UM
+  n_keep, n_drop = sum(kept.values()), sum(dropped.values())
+  total = n_keep + n_drop
+  if total == 0:
+    return
+  print(f"\nSIZE WINDOW {lo}-{hi} um, applied before any endpoint is read.")
+  print(f"  {n_keep} of {total} vesicle(s) retained ({100 * n_keep / total:.0f}%); "
+        f"{n_no_radius} of the {n_drop} rejected had no measured radius.")
+
+  groups = sorted({g for g, _ in kept} | {g for g, _ in dropped})
+  print("  per group:")
+  for g in groups:
+    k = sum(v for (gg, _), v in kept.items() if gg == g)
+    dd = sum(v for (gg, _), v in dropped.items() if gg == g)
+    print(f"    {g:<24} {k + dd:4d} -> {k:4d}")
+
+  thin = [(g, v, sum(x for (gg, vv), x in kept.items()
+                     if (gg, vv) == (g, v)),
+           sum(x for (gg, vv), x in dropped.items() if (gg, vv) == (g, v)))
+          for g, v in sorted({*kept, *dropped})]
+  thin = [t for t in thin if t[2] < 3]
+  if thin:
+    print(f"  {len(thin)} condition(s) left with fewer than 3 vesicles; these "
+          "should not be read as conditions:")
+    for g, v, k, dd in sorted(thin, key=lambda t: -(t[2] + t[3])):
+      print(f"    {g:<24} {v:>5}  {k + dd:3d} -> {k:d}")
+  print("  Set SIZE_WINDOW_UM = None to restore the whole population.")
+
+
 def aggregate_pipeline_results(outputs_root: str) -> pd.DataFrame:
   root = Path(outputs_root)
   records = []
@@ -420,6 +489,10 @@ def aggregate_pipeline_results(outputs_root: str) -> pd.DataFrame:
   # deliberately truncated field whose vesicles are still present in the fate
   # and rupture analyses. Keyed (population, voltage, experiment).
   endpoint_censored_by = {}
+  # Size-window tallies, accumulated in the loop because the rejected
+  # vesicles never become rows and so cannot be counted from the table.
+  size_kept, size_dropped = {}, {}
+  n_size_no_radius = 0
 
   all_fate = [f for f in root.glob("**/*_guv_fate_classification.csv")
               if RESULTS_SUBFOLDER not in f.parts]
@@ -548,6 +621,30 @@ def aggregate_pipeline_results(outputs_root: str) -> pd.DataFrame:
           cortex_status = str(guv_cx.iloc[0].get("cortex_status", "UNKNOWN"))
           cortex_contrast = guv_cx.iloc[0].get("cortex_contrast", np.nan)
           prepulse_lumen_abs = guv_cx.iloc[0].get("prepulse_lumen_abs", np.nan)
+
+      # SIZE WINDOW, applied here rather than to the finished table.
+      # Everything below this point -- the endpoint read, the truncated-trace
+      # response call, the per-frame column lookups -- is work done per
+      # vesicle, and four vesicles in five are about to be discarded. Placing
+      # the test after the cortex status lookup, which is a cheap row match,
+      # lets the tally below break the loss down by phenotype rather than by
+      # raw preparation.
+      if SIZE_WINDOW_UM is not None:
+        _lo, _hi = SIZE_WINDOW_UM
+        if not (np.isfinite(radius_um) and _lo <= radius_um <= _hi):
+          _g = assign_cortex_group({"population": population,
+                                    "cortex_status": cortex_status,
+                                    "cortex_contrast": cortex_contrast})
+          _k = (_g, voltage)
+          size_dropped[_k] = size_dropped.get(_k, 0) + 1
+          if not np.isfinite(radius_um):
+            n_size_no_radius += 1
+          continue
+        _g = assign_cortex_group({"population": population,
+                                  "cortex_status": cortex_status,
+                                  "cortex_contrast": cortex_contrast})
+        _k = (_g, voltage)
+        size_kept[_k] = size_kept.get(_k, 0) + 1
 
       radius_bin = assign_size_bin(radius_um)
       intensity_cat = None
@@ -680,6 +777,9 @@ def aggregate_pipeline_results(outputs_root: str) -> pd.DataFrame:
     for exp_name, n_dropped in worst:
       print(f"    {n_dropped:>3}  {exp_name}")
 
+  if SIZE_WINDOW_UM is not None:
+    _report_size_window(size_kept, size_dropped, n_size_no_radius)
+
   out = pd.DataFrame(records)
 
   # A censored vesicle has no response call, so this column carries missing
@@ -709,7 +809,22 @@ def aggregate_pipeline_results(outputs_root: str) -> pd.DataFrame:
 # onset relative to a single pulse of the same amplitude.
 # -----------------------------------------------------------------------------
 
-ONSET_N_BOOTSTRAP = 2000      # resamples for the V50 confidence interval
+ONSET_N_BOOTSTRAP = 300       # resamples for the V50 confidence interval
+# 300, not 2000. The interval is only ever read to answer a yes/no question --
+# does the CI span more than half the sampled range -- and 300 resamples pin a
+# percentile interval far more tightly than that decision needs. The cost is
+# not small: six fits (three populations x two measures) over several hundred
+# vesicles each, at roughly 30-100 ms per resample, is 10-25 minutes at 2000
+# and about two at 300.
+#
+# It also buys nothing for the gate that is actually binding here. The
+# full-sample fit, the residual scatter and `amplitude_ok` are all computed
+# BEFORE the bootstrap loop; when a fit fails on amplitude, as every fit on
+# this dataset currently does, the interval is never quoted at all and the
+# resamples are spent on a number that is discarded.
+#
+# Raise it back to 2000 if a fit ever clears the amplitude gate and an
+# interval has to be reported to three figures.
 ONSET_MIN_N = 8               # GUVs required before a fit is attempted
 ONSET_MIN_VOLTAGES = 4        # distinct voltages required
 # Minimum fitted step, in units of the residual scatter about the fit. A
@@ -751,7 +866,7 @@ def _fit_sigmoid_once(v, y):
 
 
 def fit_onset(df: pd.DataFrame, value_col: str, label: str,
-              n_boot: int = ONSET_N_BOOTSTRAP) -> dict:
+              n_boot: int = None) -> dict:
     """Sigmoid midpoint in kV/cm, with a bootstrap CI, for one population.
 
     The CI comes from resampling GUVs with replacement rather than from the
@@ -767,6 +882,11 @@ def fit_onset(df: pd.DataFrame, value_col: str, label: str,
     reporting the point estimate alone.
     """
     sub = df[["voltage", value_col]].copy()
+    # Resolved here rather than in the signature. A default bound at import
+    # cannot be changed from the console afterwards, which is a trap when
+    # cutting the count down for an exploratory run; _boot_median_ci already
+    # does it this way and the two should match.
+    n_boot = int(ONSET_N_BOOTSTRAP if n_boot is None else n_boot)
     # Field strength, not applied volts, so the fitted midpoint is an E50 in
     # kV/cm and comparable to work using a different electrode geometry. The
     # conversion is one constant, so the fit, the bootstrap and `identified`
@@ -802,6 +922,22 @@ def fit_onset(df: pd.DataFrame, value_col: str, label: str,
     out["resid_sd"] = sd
     out["amplitude_over_sd"] = (amp / sd) if sd > 0 else np.inf
     amplitude_ok = (sd <= 0) or (amp >= ONSET_MIN_AMPLITUDE_SD * sd)
+
+    # Stop here when there is no step to locate. The bootstrap only sets the
+    # width of the interval around v50, and a v50 under a step smaller than
+    # the noise is not reported at all, so the resamples would be spent on a
+    # number that is discarded either way.
+    #
+    # It is also the expensive branch, and gets more expensive as the data
+    # get sparser: on a thin, noisy sample curve_fit runs to maxfev on most
+    # resamples, which measured at roughly 0.4 s each against 0.03 s on the
+    # full population. Six fits at 300 resamples is then minutes rather than
+    # seconds, all of it to compute an interval that is thrown away.
+    if not amplitude_ok:
+        out["note"] = (f"no step to locate: fitted amplitude {amp:.3f} is "
+                       f"only {out['amplitude_over_sd']:.1f}x the residual "
+                       "scatter; bootstrap not attempted")
+        return out
 
     rng = np.random.default_rng(0)          # fixed seed: reruns reproduce
     n = len(v)
@@ -2972,7 +3108,7 @@ def generate_separate_pdf_plots(df: pd.DataFrame, output_dir: str):
         ax3.legend(loc="lower left", fontsize=9)
 
   fig3.suptitle(
-      "Intensity Drop Trajectories per Voltage"
+      "Intensity Drop Trajectories per Field Strength"
       f"\n(Pre-Pulse → Final {ENDPOINT_N_FRAMES}-Frame Average)"
   )
   style_figure("intensity_drop_trajectories")

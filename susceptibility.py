@@ -383,8 +383,12 @@ def plot_experiment_level(df: pd.DataFrame, out: Path):
                label=f"{POP_LABEL[pop]} ({len(p_df)} experiments)")
   ax.axhline(0, color=PALETTE["grey"], lw=0.8, ls="--")
   ax.set_xticks(range(len(volts)))
-  ax.set_xticklabels([f"{int(v)}V" for v in volts], rotation=45)
-  ax.set_xlabel("Voltage")
+  # Field strength, matching every other axis in the chapter. The grouping
+  # stays on voltage_V because the conversion is one constant and the
+  # ordering is identical; only the label changes.
+  ax.set_xticklabels([f"{v / ELECTRODE_GAP_CM / 1000:.2f}" for v in volts],
+                     rotation=45)
+  ax.set_xlabel("Field strength (kV/cm)")
   ax.set_ylabel("experiment median released fraction")
   ax.set_title("One point per experiment, not per vesicle\n"
                "(the unit of replication the design supports)")
@@ -450,6 +454,12 @@ def load_guv_qc(outputs_root) -> pd.DataFrame:
   return out
 
 
+# Fate whose vesicles carry a matched-endpoint response call. process.py
+# recomputes is_responding at ENDPOINT_MATCHED_T_S for this fate only, so it
+# is the only one whose responding rate is on a single clock.
+FATE_FOR_RESPONSE = "Stagnate"
+
+
 def check_detectability(df: pd.DataFrame, outputs_root, out: Path):
   """Is one population simply easier to score as responding?
 
@@ -470,6 +480,33 @@ def check_detectability(df: pd.DataFrame, outputs_root, out: Path):
   if merged.empty:
     print("Detectability check skipped: no GUVs matched between tables.")
     return
+
+  # Stagnate only, matching every other response figure in this module.
+  #
+  # Two things go wrong without this. The responding RATE printed below is
+  # taken from the same `is_responding` column the dose-response uses, but
+  # process.py only recomputes that column at the matched endpoint for
+  # Stagnate vesicles; Grow, Reduce and Rupture rows keep the whole-record
+  # call read straight from _fit_parameters.csv. Pooling the two puts three
+  # definitions in one percentage -- matched-endpoint, whole-record, and NaN
+  # for the censored -- and the resulting figure disagrees with the
+  # dose-response panels drawn from the same file.
+  #
+  # The noise and contrast distributions move with it deliberately. This
+  # function asks whether one population is easier to SCORE as responding, so
+  # it has to describe the vesicles whose responding rate is being explained,
+  # not a wider set that includes vesicles no rate was computed for.
+  n_before = len(merged)
+  merged = merged[merged["size_category"] == FATE_FOR_RESPONSE]
+  if merged.empty:
+    print(f"Detectability check skipped: no {FATE_FOR_RESPONSE} GUVs after "
+          "the merge.")
+    return
+  if n_before != len(merged):
+    print(f"\n  Detectability restricted to {FATE_FOR_RESPONSE} vesicles: "
+          f"{n_before - len(merged)} of {n_before} dropped, {len(merged)} "
+          "retained. The responding rate below is on the same vesicles as "
+          "the dose-response figures.")
 
   pops = [p for p in POP_LABEL if p in set(merged["population"])]
   cols = [c for c in ("response_noise", "sep0_over_sigma") if c in merged]
@@ -649,7 +686,11 @@ def check_per_experiment_within_bins(df: pd.DataFrame, out: Path):
                color=_colour(pop), alpha=0.85, edgecolors="white",
                linewidth=0.6, label=f"{POP_LABEL[pop]} (1 point = 1 experiment)")
   ax.set_xticks(range(len(edges) - 1))
-  ax.set_xticklabels([f"{edges[i]:.0f}-\n{edges[i+1]:.0f}"
+  # Two decimals, not zero. These edges were hundreds of V.um before the dose
+  # axis became a potential in volts; at the new scale ".0f" collapses
+  # 0.036, 0.345 and 0.558 to "0", "0" and "1", which is what the axis was
+  # showing.
+  ax.set_xticklabels([f"{edges[i]:.2f}-\n{edges[i+1]:.2f}"
                       for i in range(len(edges) - 1)], fontsize=8)
   ax.set_xlabel(r"dose bin  ($\Delta V_m$, V)")
   ax.set_ylabel("fraction responding")
@@ -661,6 +702,125 @@ def check_per_experiment_within_bins(df: pd.DataFrame, out: Path):
   fig.tight_layout()
   fig.savefig(out / "per_experiment_within_bin.pdf", dpi=300)
   plt.close(fig)
+
+
+# Radius window over which Bare and Branched cortex vesicles overlap closely
+# enough to be compared without any dose correction, in micrometres.
+#
+# The two preparations differ by 2.09 um in median radius, which is the whole
+# reason the dV_m axis exists. Inside 4.5-5.5 um they do not: 92 Bare and 82
+# cortex vesicles, medians 4.99 and 4.97 um, Mann-Whitney p = 0.27. At matched
+# radius AND matched field the induced potential is matched too, so a
+# comparison here rests on no model at all -- not the Schwan expression, not
+# the 1.5 factor, not the assumption of a sphere in a uniform field.
+#
+# What it costs is power and chambers. See the printed output.
+SIZE_MATCHED_WINDOW = (4.5, 5.5)
+
+# Field at or above which any vesicle in this window responds. Below it both
+# groups are at the assay floor and contribute only zeros to both arms, so
+# pooling across the whole series dilutes the comparison with conditions that
+# cannot distinguish anything. Read the per-field table before trusting the
+# pooled row: this cut is chosen from the data, not prespecified.
+SIZE_MATCHED_MIN_FIELD = 1.0
+
+
+def check_size_matched(df: pd.DataFrame, out: Path):
+  """Bare vs cortex at matched radius, without the dose correction.
+
+  The dV_m analysis answers the confound by modelling it. This answers it by
+  removing it: restrict to vesicles of the same size and the applied field is
+  the dose. The two should agree, and if they do the result does not depend
+  on the Schwan expression being right.
+  """
+  lo, hi = SIZE_MATCHED_WINDOW
+  sub = df[(df["size_category"] == FATE_FOR_RESPONSE)
+           & df["released"].notna() & df["radius_um"].notna()]
+  m = sub[(sub["radius_um"] >= lo) & (sub["radius_um"] <= hi)].copy()
+  if m.empty:
+    print("Size-matched check skipped: no vesicles in the window.")
+    return
+
+  print(f"\n{'=' * 70}")
+  print(f"Size-matched comparison, radius {lo}-{hi} um "
+        "(no dose correction applied)")
+  print("=" * 70)
+  pops = [p for p in POP_LABEL if p in set(m["population"])]
+  for p in pops:
+    v = m[m["population"] == p]
+    k = int((v["is_responding"] == True).sum())
+    print(f"  {POP_LABEL[p]:<24} n={len(v):3d}  median r={v['radius_um'].median():.2f} um"
+          f"  responding {k}  chambers {v['experiment'].nunique()}")
+
+  a = m[m["population"] == "Bare"]
+  b = m[m["population"] == "Branched, cortex"]
+  if len(a) < 5 or len(b) < 5:
+    print("  Too few vesicles of both kinds in the window to compare.")
+    return
+  try:
+    from scipy.stats import mannwhitneyu
+    p_r = float(mannwhitneyu(a["radius_um"], b["radius_um"]).pvalue)
+    print(f"\n  Residual radius difference inside the window: p = {p_r:.2f} "
+          "(large is what this check needs).")
+  except Exception:
+    pass
+
+  print(f"\n  Per field strength (cells with >=5 of both):")
+  print(f"    {'kV/cm':>6} {'Bare':>12} {'cortex':>12}   median radius")
+  for E, cell in m.groupby(m["field_kV_cm"].round(2)):
+    va = cell[cell["population"] == "Bare"]
+    vb = cell[cell["population"] == "Branched, cortex"]
+    if len(va) < 5 or len(vb) < 5:
+      continue
+    print(f"    {E:6.2f} {int((va['is_responding'] == True).sum()):5d}/{len(va):<6d}"
+          f" {int((vb['is_responding'] == True).sum()):5d}/{len(vb):<6d}"
+          f"   {va['radius_um'].median():.2f} vs {vb['radius_um'].median():.2f} um")
+
+  _report_matched_cell(a, b, "whole window")
+  ah = a[a["field_kV_cm"] >= SIZE_MATCHED_MIN_FIELD]
+  bh = b[b["field_kV_cm"] >= SIZE_MATCHED_MIN_FIELD]
+  if len(ah) >= 5 and len(bh) >= 5:
+    _report_matched_cell(ah, bh,
+                         f"E >= {SIZE_MATCHED_MIN_FIELD} kV/cm")
+
+  m.to_csv(out / "size_matched_window.csv", index=False)
+
+
+def _report_matched_cell(a: pd.DataFrame, b: pd.DataFrame, label: str):
+  """Responding fraction, mean release and chamber counts for one cell."""
+  ka = int((a["is_responding"] == True).sum())
+  kb = int((b["is_responding"] == True).sum())
+  print(f"\n  {label}:")
+  print(f"    responding   Bare {ka}/{len(a)} ({100 * ka / len(a):.1f}%)"
+        f"   cortex {kb}/{len(b)} ({100 * kb / len(b):.1f}%)")
+  try:
+    from scipy.stats import fisher_exact
+    tab = [[ka, len(a) - ka], [kb, len(b) - kb]]
+    print(f"    Fisher exact p = {fisher_exact(tab)[1]:.4f}")
+  except Exception:
+    pass
+
+  rng = np.random.default_rng(0)
+  for name, v in (("Bare", a["released"].dropna().to_numpy(float)),
+                  ("cortex", b["released"].dropna().to_numpy(float))):
+    if len(v) < 3:
+      continue
+    boot = np.mean(v[rng.integers(0, len(v), (4000, len(v)))], axis=1)
+    print(f"    mean released {name:<7} {v.mean():.4f} "
+          f"[{np.percentile(boot, 2.5):.4f}, {np.percentile(boot, 97.5):.4f}]")
+
+  # The chamber count is the check that matters most and the one this window
+  # is least able to supply. A vesicle-level p built on a handful of chambers
+  # is a statement about those chambers.
+  for name, v in (("Bare", a), ("cortex", b)):
+    per = [(x["is_responding"] == True).mean()
+           for _, x in v.groupby("experiment") if len(x) >= 3]
+    if not per:
+      print(f"    {name:<7} no chamber contributes 3+ vesicles here")
+      continue
+    print(f"    {name:<7} {len(per)} chamber(s) with 3+ vesicles, "
+          f"{sum(f > 0 for f in per)} with any responder, "
+          f"median {np.median(per):.2f}")
 
 
 def main(results_dir=None, root=None):
@@ -676,6 +836,7 @@ def main(results_dir=None, root=None):
   plot_dose_response(df, out)
   check_per_experiment_within_bins(df, out)
   check_detectability(df, tree, out)
+  check_size_matched(df, out)
   plot_experiment_level(df, out)
   print(f"\nSaved susceptibility figures to {out}")
   return df

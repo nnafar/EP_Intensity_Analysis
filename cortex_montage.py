@@ -62,7 +62,8 @@ RESULTS_SUBFOLDER = "Bulk_Analysis_Results"
 # figures for the same run. Only the list is taken, none of process.py's
 # gating, so the montage stays independent of its filters.
 try:
-  from process import EXCLUDE_EXPERIMENTS, is_excluded_experiment
+  from process import (EXCLUDE_EXPERIMENTS, is_excluded_experiment,
+                       SIZE_WINDOW_UM)
 except Exception as _e:
   print(f"WARNING: could not import EXCLUDE_EXPERIMENTS from process.py "
         f"({type(_e).__name__}: {_e}). No experiments will be excluded from "
@@ -71,6 +72,7 @@ except Exception as _e:
 
   def is_excluded_experiment(name: str) -> bool:
     return any(re.search(pat, name) for pat in EXCLUDE_EXPERIMENTS)
+  SIZE_WINDOW_UM = None
 
 
 # -----------------------------------------------------------------------------
@@ -304,6 +306,28 @@ def main(data_root=None, results_dir=None):
   df = collect(root, nd2_index)
   if df.empty:
     raise SystemExit("No classified GUVs with tracking data found.")
+  # Same size window as the rest of the pipeline. The montage reads the
+  # per-experiment status and tracking files directly rather than
+  # guv_bulk_summary.csv, so without this it would show panels drawn from the
+  # whole population while every number in the analysis comes from the
+  # window, and the counts printed here would match nothing else.
+  #
+  # The tracked radius is in PIXELS here, not micrometres -- cut_crops uses it
+  # as a pixel offset -- so it has to be converted before it can be compared
+  # with a window given in um.
+  if SIZE_WINDOW_UM is not None and not df.empty:
+    lo, hi = SIZE_WINDOW_UM
+    um_per_px = float(getattr(cfg, "MICRONS_PER_PIXEL", 0.11))
+    r_um = df["radius"] * um_per_px
+    keep = r_um.between(lo, hi)
+    print(f"Size window {lo}-{hi} um "
+          f"(MICRONS_PER_PIXEL = {um_per_px}): {int(keep.sum())} of "
+          f"{len(df)} classified GUV(s) retained.")
+    df = df[keep].copy()
+    if df.empty:
+      raise SystemExit("No classified GUVs left inside the size window. "
+                       "Set process.SIZE_WINDOW_UM = None to restore them.")
+
   print(f"Classified GUVs: {len(df)}")
   print(df["status"].value_counts().to_string())
 
