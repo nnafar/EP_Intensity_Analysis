@@ -20,10 +20,37 @@ Four questions, in the order they have to be answered:
      day; they are not independent, so the effective n is the number of
      experiments, not the number of GUVs.
 
-The dose axis is `dvm_proxy = voltage_V * radius_um`, in V.um. This is
-proportional to dV_m only if the electrode gap is the same in every
-experiment, since E = U/d and d is not recorded in these outputs. If gaps
-differed between sessions, the proxy is not comparable across them.
+Vesicles are compared as THREE groups, not two. A BranchedCortex
+preparation contains vesicles that assembled a shell and vesicles that
+merely hold unpolymerised actin in the lumen; pooling them dilutes any
+cortex effect toward the bare result, and the lumenal-only vesicles are
+the better control for the bare ones anyway, since they carry the same
+protein load without the shell. The split is process.apply_cortex_split,
+imported rather than reimplemented so both stages cannot drift apart, and
+it drops the ambiguous and unclassified vesicles (process.EXCLUDE_GROUPS).
+It rests on the provisional cortex_contrast thresholds in config.py; if
+those move, every figure here moves with them.
+
+The dose axis is the induced transmembrane potential at the pole, in volts:
+
+    dV_m = 1.5 * E * R,   E = U / ELECTRODE_GAP_CM
+
+Reported this way rather than as an applied voltage because the voltage is a
+property of this generator and this chamber and transfers to no other study,
+while the field and the potential it induces do. The gap is fixed by the
+3D-printed chamber and is NOT recorded per experiment in these outputs, so a
+session run with a different chamber would be silently mis-scaled. Set
+ELECTRODE_GAP_CM to whatever the chamber actually was.
+
+The conversion is one multiplicative constant, so quantile bin membership,
+every median and every test below are identical to the old V.um axis. Only
+the units change.
+
+The 1.5 factor is the steady-state Schwan result and assumes the pulse
+outlasts the membrane charging time. That holds here by a wide margin: with
+Cm = 1 uF/cm^2 and the measured outer conductivity of 416.1 uS/cm,
+tau_c = R*Cm*(1/sigma_in + 1/(2*sigma_out)) is 1-5 us across the observed
+radius range, against a 500 us pulse.
 
 In Spyder: open and press F5.
 """
@@ -57,7 +84,11 @@ N_DOSE_BINS = 6            # quantile bins on the pooled dose axis
 MIN_BIN_N = 5              # a bin below this is dropped, not drawn thin
 SUBFOLDER = "07_susceptibility"
 
-POP_LABEL = {"Empty": "Bare", "BranchedCortex": "Branched cortex"}
+# Keys are the group names process.assign_cortex_group emits; the order
+# here sets plotting and print order everywhere in this module.
+POP_LABEL = {"Bare": "Bare",
+             "Branched, cortex": "Branched cortex",
+             "Branched, lumenal only": "Branched lumenal only"}
 
 
 def outputs_root() -> Path:
@@ -72,14 +103,48 @@ def _colour(pop: str):
                                POPULATION_COLORS.get(pop, PALETTE["grey"]))
 
 
+# Electrode separation in the 3D-printed chamber, in centimetres. E = U / gap,
+# so this one number sets the whole dose axis. It is not recorded per
+# experiment in the pipeline outputs and has to be stated here.
+ELECTRODE_GAP_CM = 0.3
+
+
 def load_summary(results_dir: Path) -> pd.DataFrame:
   path = results_dir / "guv_bulk_summary.csv"
   if not path.exists():
     raise SystemExit(f"{path} not found -- run the intensity stage first.")
   df = pd.read_csv(path)
+
+  # Split BranchedCortex into cortex-bearing and lumenal-only before anything
+  # is measured, so no figure in this module can silently pool the two. This
+  # is a hard failure rather than a fallback to the old two-group behaviour:
+  # a two-group figure and a three-group figure are not distinguishable once
+  # written to disk, and a run that quietly produced the wrong one would be
+  # worse than a run that did not finish.
+  if process is None:
+    raise SystemExit(
+        "process.py could not be imported, so the cortex split cannot be "
+        "applied. Every figure here would pool cortex-bearing and "
+        "lumenal-only vesicles under one label. Fix the import first.")
+  df = process.apply_cortex_split(df)
+
   df["voltage_V"] = df["voltage"].astype(str).str.extract(r"(\d+)").astype(float)
-  df["dvm_proxy"] = df["voltage_V"] * df["radius_um"]
+  # Field strength, and the potential it induces at the pole. Both are kept:
+  # the field is what a reader of another study can match their own protocol
+  # against, the potential is what the membrane responds to.
+  df["field_kV_cm"] = df["voltage_V"] / ELECTRODE_GAP_CM / 1000.0
+  df["dvm_proxy"] = (1.5 * (df["voltage_V"] / (ELECTRODE_GAP_CM * 1e-2))
+                     * df["radius_um"] * 1e-6)
   df["released"] = -df["diff"]
+
+  present = [p for p in POP_LABEL if p in set(df["population"])]
+  missing = [p for p in POP_LABEL if p not in present]
+  print("Groups after the split: "
+        + ", ".join(f"{POP_LABEL[p]} n={int((df['population'] == p).sum())}"
+                    for p in present))
+  if missing:
+    print("  Not present at all: "
+          + ", ".join(POP_LABEL[p] for p in missing))
   return df
 
 
@@ -111,21 +176,54 @@ def report_size_distributions(df: pd.DataFrame, out: Path):
   tbl.to_csv(out / "size_by_condition.csv", index=False)
 
   pops = [p for p in POP_LABEL if p in set(sub["population"])]
-  if len(pops) == 2:
-    a = sub[sub["population"] == pops[0]]["radius_um"]
-    b = sub[sub["population"] == pops[1]]["radius_um"]
-    print(f"\n  {POP_LABEL[pops[0]]}: median {a.median():.2f} um (n={len(a)})")
-    print(f"  {POP_LABEL[pops[1]]}: median {b.median():.2f} um (n={len(b)})")
+  for p in pops:
+    v = sub[sub["population"] == p]["radius_um"]
+    print(f"\n  {POP_LABEL[p]}: median {v.median():.2f} um (n={len(v)})")
+
+  # Every pair, not one comparison: with three groups the question is not
+  # only bare vs cortex but also whether lumenal-only sits with the bare
+  # vesicles or with the corticated ones, and that is the pair that decides
+  # whether it is usable as a same-preparation control. Holm-adjusted because
+  # three tests are run on one table; both p values are printed so the
+  # correction can be seen rather than taken on trust.
+  pairs = [(a, b) for i, a in enumerate(pops) for b in pops[i + 1:]]
+  if pairs:
     try:
       from scipy.stats import mannwhitneyu
-      u, p = mannwhitneyu(a, b, alternative="two-sided")
-      print(f"  Mann-Whitney p = {p:.3g}")
     except Exception:
-      pass
-    if abs(a.median() - b.median()) > 0.5:
-      print("  The populations differ in size. Any comparison at matched "
-            "VOLTAGE therefore confounds cortex with transmembrane potential; "
-            "use the dose axis below.")
+      mannwhitneyu = None
+    if mannwhitneyu is not None:
+      raw = []
+      for a, b in pairs:
+        va = sub[sub["population"] == a]["radius_um"]
+        vb = sub[sub["population"] == b]["radius_um"]
+        if len(va) < 3 or len(vb) < 3:
+          continue
+        p = float(mannwhitneyu(va, vb, alternative="two-sided").pvalue)
+        raw.append({"group_a": POP_LABEL[a], "group_b": POP_LABEL[b],
+                    "n_a": len(va), "n_b": len(vb),
+                    "median_a": float(va.median()),
+                    "median_b": float(vb.median()),
+                    "median_diff_um": float(va.median() - vb.median()),
+                    "p_raw": p})
+      if raw:
+        # process.holm, not a second copy: two implementations of the same
+        # correction in one codebase is how they end up disagreeing.
+        adj = process.holm([r["p_raw"] for r in raw])
+        for r, a in zip(raw, adj):
+          r["p_holm"] = float(a)
+        pw = pd.DataFrame(raw)
+        print("\n  Pairwise size comparison (Mann-Whitney, Holm-adjusted):")
+        print(pw.to_string(index=False))
+        pw.to_csv(out / "size_pairwise_tests.csv", index=False)
+        big = pw[pw["median_diff_um"].abs() > 0.5]
+        if not big.empty:
+          print("  Groups differing by more than 0.5 um in median radius: "
+                + "; ".join(f"{r.group_a} vs {r.group_b}"
+                            for r in big.itertuples()))
+          print("  Any comparison at matched VOLTAGE therefore confounds "
+                "cortex with transmembrane potential; use the dose axis "
+                "below.")
 
   fig, ax = plt.subplots(figsize=(7.5, 4.8))
   for pop in pops:
@@ -184,7 +282,13 @@ def plot_dose_response(df: pd.DataFrame, out: Path):
       if len(cell) < MIN_BIN_N:
         continue
       rel = cell["released"].dropna()
-      resp = cell["is_responding"].fillna(False).astype(bool)
+      # dropna, not fillna(False): under process.ENDPOINT_MATCHED_T_S a
+      # censored vesicle has no response call at all, and scoring it as a
+      # non-responder would put every censored GUV in the denominator as
+      # evidence of not responding.
+      resp = cell["is_responding"].dropna().astype(bool)
+      if resp.empty:
+        continue
       xs.append(float(cell["dvm_proxy"].median()))
       med.append(rel.median())
       lo.append(rel.quantile(.25))
@@ -216,10 +320,10 @@ def plot_dose_response(df: pd.DataFrame, out: Path):
   ax2.set_ylim(-0.02, 1.02)
   ax2.set_title("Responding fraction vs dose (Wilson 95% CI)", fontsize=10)
   for ax in (ax1, ax2):
-    ax.set_xlabel(r"voltage $\times$ radius  (V$\cdot\mu$m)  $\propto \Delta V_m$")
+    ax.set_xlabel(r"induced transmembrane potential  $\Delta V_m = 1.5\,E\,R$  (V)")
     ax.legend(frameon=False, fontsize=9)
     ax.grid(alpha=0.35, linestyle="--")
-  fig.suptitle("Bare vs branched cortex at matched transmembrane potential\n"
+  fig.suptitle("Vesicle groups at matched transmembrane potential\n"
                "(shared dose bins; stagnate GUVs)", fontsize=11)
   fig.tight_layout(rect=(0, 0, 1, 0.91))
   fig.savefig(out / "dose_response_by_population.pdf", dpi=300)
@@ -233,7 +337,7 @@ def plot_dose_response(df: pd.DataFrame, out: Path):
     widths = tbl["dose_hi"] - tbl["dose_lo"]
     if len(widths) and widths.max() > 3 * widths.median():
       w = tbl.loc[widths.idxmax()]
-      print(f"\n  NOTE: the bin {w['dose_lo']:.0f}-{w['dose_hi']:.0f} V.um is "
+      print(f"\n  NOTE: the bin {w['dose_lo']:.2f}-{w['dose_hi']:.2f} V is "
             f"{widths.max() / widths.median():.1f}x wider than the median bin. "
             "Quantile bins spread out where the data thins, so this one pools "
             "doses that are not really comparable -- treat any reversal in it "
@@ -257,7 +361,7 @@ def plot_experiment_level(df: pd.DataFrame, out: Path):
   per_exp = (stag.groupby(["population", "voltage", "voltage_V", "experiment"])
              .agg(median_released=("released", "median"),
                   frac_responding=("is_responding",
-                                   lambda s: s.fillna(False).mean()),
+                                   lambda s: s.dropna().mean()),
                   n_guv=("released", "size"),
                   median_radius=("radius_um", "median"))
              .reset_index())
@@ -353,7 +457,7 @@ def check_detectability(df: pd.DataFrame, outputs_root, out: Path):
   floor derived from its own trace. A population with quieter traces, or with
   better pre-pulse dye contrast, clears that floor on a smaller real change --
   which would produce a susceptibility difference with no difference in
-  poration at all. This asks whether the two populations can be scored
+  poration at all. This asks whether all three groups can be scored
   equally well, before any response is interpreted.
   """
   qc = load_guv_qc(outputs_root)
@@ -388,45 +492,54 @@ def check_detectability(df: pd.DataFrame, outputs_root, out: Path):
   print(tbl.to_string(index=False))
   tbl.to_csv(out / "detectability_by_population.csv", index=False)
 
-  # A population with LOWER noise or HIGHER contrast is easier to score. But
-  # a detectability difference only explains away the result if it favours
-  # the population that responds MORE. If the easier-to-score population is
-  # the one responding LESS, the bias runs against the observed effect and
-  # the result is conservative -- the opposite conclusion from the same
-  # numbers, so the direction has to be checked, not just the magnitude.
+  # A group with LOWER noise or HIGHER contrast is easier to score. But a
+  # detectability difference only explains away the result if it favours the
+  # group that responds MORE. If the easier-to-score group is the one
+  # responding LESS, the bias runs against the observed effect and the result
+  # is conservative -- the opposite conclusion from the same numbers, so the
+  # direction has to be checked, not just the magnitude.
+  #
+  # With three groups the comparison is between the extremes of the spread:
+  # the easiest group to score against the hardest. A ratio taken over a
+  # middle group would understate how far apart the ends are.
   resp_rate = {POP_LABEL[p]:
                merged[merged["population"] == p]["is_responding"]
-               .fillna(False).mean() for p in pops}
+               .dropna().mean() for p in pops}
   more_responsive = max(resp_rate, key=resp_rate.get)
   print(f"  responding overall: "
         + ", ".join(f"{k} {v:.1%}" for k, v in resp_rate.items()))
 
   for col in cols:
-    sub = tbl[tbl["measure"] == col]
-    if len(sub) != 2:
+    s = tbl[tbl["measure"] == col]
+    if len(s) < 2:
       continue
-    med = sub["median"].to_numpy()
+    med = s["median"].to_numpy()
     if min(med) <= 0:
       continue
     ratio = max(med) / min(med)
-    easier = (sub.iloc[int(np.argmin(med))]["population"]
-              if col == "response_noise"
-              else sub.iloc[int(np.argmax(med))]["population"])
+    # response_noise: lower is easier to score. sep0_over_sigma: higher is.
+    easiest = (s.iloc[int(np.argmin(med))]["population"]
+               if col == "response_noise"
+               else s.iloc[int(np.argmax(med))]["population"])
+    hardest = (s.iloc[int(np.argmax(med))]["population"]
+               if col == "response_noise"
+               else s.iloc[int(np.argmin(med))]["population"])
     why = ("quieter traces" if col == "response_noise"
            else "better pre-pulse contrast")
     if ratio <= 1.3:
-      print(f"  {col}: medians within {ratio:.2f}x -- comparable, so this "
-            "does not explain a susceptibility difference.")
-    elif easier == more_responsive:
-      print(f"  {col}: medians differ by {ratio:.2f}x. {easier} has {why} "
-            "AND responds more, so being easier to score could produce the "
-            "difference on its own -- CONFOUNDED.")
+      print(f"  {col}: medians within {ratio:.2f}x across all groups -- "
+            "comparable, so this does not explain a susceptibility "
+            "difference.")
+    elif easiest == more_responsive:
+      print(f"  {col}: {easiest} to {hardest} spans {ratio:.2f}x. {easiest} "
+            f"has {why} AND responds most, so being easier to score could "
+            "produce the difference on its own -- CONFOUNDED.")
     else:
-      print(f"  {col}: medians differ by {ratio:.2f}x. {easier} has {why} "
-            f"but responds LESS, while {more_responsive} responds more "
-            "despite being harder to score. The bias runs against the "
-            "observed effect, so the difference is CONSERVATIVE, not "
-            "explained away.")
+      print(f"  {col}: {easiest} to {hardest} spans {ratio:.2f}x. {easiest} "
+            f"has {why} but does not respond most, while {more_responsive} "
+            "responds most despite being harder to score. The bias runs "
+            "against the observed effect, so the difference is CONSERVATIVE, "
+            "not explained away.")
 
   fig, axes = plt.subplots(1, len(cols) + 1,
                            figsize=(4.8 * (len(cols) + 1), 4.6))
@@ -460,7 +573,7 @@ def check_detectability(df: pd.DataFrame, outputs_root, out: Path):
     ax.set_title("Signal against its own noise floor", fontsize=10)
     ax.legend(frameon=False, fontsize=8)
     ax.grid(alpha=0.35, linestyle="--")
-  fig.suptitle("Detectability: can both populations be scored equally well?",
+  fig.suptitle("Detectability: can every group be scored equally well?",
                fontsize=11)
   fig.tight_layout(rect=(0, 0, 1, 0.92))
   fig.savefig(out / "detectability_by_population.pdf", dpi=300)
@@ -485,9 +598,9 @@ def check_per_experiment_within_bins(df: pd.DataFrame, out: Path):
   sub["bin"] = pd.cut(sub["dvm_proxy"], edges, include_lowest=True,
                       labels=False)
   per = (sub.groupby(["bin", "population", "experiment"])
-         .agg(n_guv=("is_responding", "size"),
+         .agg(n_guv=("is_responding", "count"),
               frac_responding=("is_responding",
-                               lambda s: s.fillna(False).mean()))
+                               lambda s: s.dropna().mean()))
          .reset_index())
   # An experiment contributing one or two vesicles to a bin can only report
   # 0, 0.5 or 1 by construction; that is not an estimate of a fraction.
@@ -502,13 +615,17 @@ def check_per_experiment_within_bins(df: pd.DataFrame, out: Path):
   pops = [p for p in POP_LABEL if p in counts.columns]
 
   print("\nResponding fraction per EXPERIMENT, within shared dose bins:")
-  print("  (a bin can only separate the populations if BOTH have >=2 "
-        "experiments in it)")
+  print("  (a bin can only separate two groups if BOTH have >=2 experiments "
+        "in it; with three groups a bin may compare some pairs and not "
+        "others)")
   for b in sorted(per["bin"].unique()):
     lo, hi = edges[int(b)], edges[int(b) + 1]
-    ok = len(pops) == 2 and all(counts.loc[b, p] >= 2 for p in pops)
-    mark = "" if ok else "   (too few experiments to compare)"
-    print(f"  bin {lo:.0f}-{hi:.0f} V.um{mark}")
+    have = [p for p in pops if counts.loc[b, p] >= 2]
+    ok = len(have) >= 2
+    mark = ("" if len(have) == len(pops) else
+            f"   (comparable here: {', '.join(POP_LABEL[p] for p in have)})"
+            if ok else "   (too few experiments to compare)")
+    print(f"  bin dV_m {lo:.2f}-{hi:.2f} V{mark}")
     cell = per[per["bin"] == b]
     for pop in pops:
       vals = cell[cell["population"] == pop]
@@ -534,7 +651,7 @@ def check_per_experiment_within_bins(df: pd.DataFrame, out: Path):
   ax.set_xticks(range(len(edges) - 1))
   ax.set_xticklabels([f"{edges[i]:.0f}-\n{edges[i+1]:.0f}"
                       for i in range(len(edges) - 1)], fontsize=8)
-  ax.set_xlabel("dose bin (V.um)")
+  ax.set_xlabel(r"dose bin  ($\Delta V_m$, V)")
   ax.set_ylabel("fraction responding")
   ax.set_ylim(-0.05, 1.05)
   ax.set_title("Responding fraction per experiment, within dose bin\n"

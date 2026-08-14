@@ -5,7 +5,8 @@ run_analysis.py, so batch_run.py must have finished first. The two halves are
 otherwise independent and either can be switched off below.
 
     INTENSITY  process.py  -> per-GUV bulk summary, size/intensity figures,
-                              released fraction vs voltage, cortex split
+                              released fraction vs voltage, cortex split,
+                              cortex-breakdown and area-loss onset fields
     TAU        tau_identifiability_report.py
                            -> why tau is not reportable, pooled over all
                               experiments, with the per-constraint breakdown
@@ -83,8 +84,38 @@ def run_intensity(root: Path):
   # Actin-side metric: how much radial cortex peak height was lost.
   df_peak = process.add_cortex_peak_metrics(df, str(root))
   process.plot_cortex_peak_breakdown(df_peak, str(results))
+  # Onset fields: the sigmoid midpoint in volts for cortex breakdown and for
+  # area loss, each with a bootstrap CI. Fitted on df merged with
+  # peak_drop_final rather than on df_peak itself, because df_peak is an inner
+  # merge and so contains only vesicles with an actin trace -- Bare GUVs have
+  # none, and dropping them would leave the area-loss onset with one
+  # population to fit instead of two. The merge is left, so bare vesicles
+  # carry NaN for the cortex measure and are simply absent from that fit.
+  #
+  # One thing this does NOT yet do, an open decision rather than an
+  # oversight: the two measures do not have to rest on the same vesicles.
+  # Area loss is available for every GUV with a terminal radius, the cortex
+  # drop only for those whose actin trace reached ENDPOINT_MATCHED_T_S. Check
+  # n_guv per measure in onset_fields.csv before reading the two midpoints as
+  # an ordering. The cortex split is applied inside report_onset_fields, so
+  # the frame passed here is deliberately the unsplit one.
+  process.report_onset_fields(
+      df.merge(df_peak[["experiment", "guv_id", "peak_drop_final"]],
+               on=["experiment", "guv_id"], how="left")
+      if not df_peak.empty else df,
+      str(results))
   process.report_bleach_comparability(str(root))
   process.plot_cortex_peak_timecourse(df, str(root), str(results))
+  # Directionality of that loss, pooled across vesicles. Reads the
+  # per-experiment *_pole_vs_equator_traces.csv files, so it needs
+  # EXPORT_ACTIN_KYMOGRAPH = True on the run that produced them.
+  #
+  # Given df_peak, not df: the conditioned test ("of the cortices that broke
+  # down, did they break down directionally?") needs peak_drop_final, which
+  # only exists after the actin merge. Falls back to df so the pooled test
+  # still runs when no actin traces were found.
+  process.plot_pole_equator_pooled(
+      df_peak if not df_peak.empty else df, str(root), str(results))
   process.plot_cortex_contrast_histogram(df, str(results))
   process.report_cortex_status(df)
 
@@ -120,8 +151,8 @@ def run_tau(root: Path):
 def run_susceptibility(root: Path):
   import susceptibility
 
-  print(f"\n{'=' * 70}\nSusceptibility: Bare vs branched at matched dV_m"
-        f"\n{'=' * 70}")
+  print(f"\n{'=' * 70}\nSusceptibility: bare, cortex and lumenal-only "
+        f"at matched dV_m\n{'=' * 70}")
   # Reads guv_bulk_summary.csv, so it must follow the intensity stage.
   return susceptibility.main(results_dir_for(root), root)
 

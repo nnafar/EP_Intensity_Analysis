@@ -98,6 +98,7 @@ FIGURE_STYLE = {
     "onset_fields":                  _fig(),   # one panel per population
     "cortex_peak_breakdown":         _fig(),   # single panel
     "cortex_peak_timecourse":        _fig(),   # fixed at 2 panels
+    "pole_equator_pooled":           _fig(),   # fixed at 2 panels
     # 05_kinetics
     "tau_by_size_voltage":           _fig(),   # one panel per population
 }
@@ -199,8 +200,12 @@ guv_bulk_summary.csv      one row per GUV, every experiment. Start here.
                           The visual check on the two histograms.
 
 04_cortex_breakdown/      what happened to the cortex after the pulse: peak
-                          height lost, and its full time course. Both carry
-                          the 30 V control as a reference.
+                          height lost, its full time course, and whether the
+                          loss is directional (poles vs equator). All three
+                          carry the 30 V control as a reference; the
+                          directional one also carries the pre-pulse index,
+                          which is zero by construction and so measures its
+                          own noise floor.
 
 05_kinetics/              time constants. Last because the records mostly
                           cannot constrain them -- tau_identifiability.pdf
@@ -229,6 +234,56 @@ ENDPOINT_N_FRAMES = 3
 PRE_PULSE_TOLERANCE = 0.05
 INTENSITY_DIFF_THRESHOLD = 0.05
 
+# -----------------------------------------------------------------------------
+# --- WHERE THE ENDPOINT IS READ ---
+#
+# None (default) reads i_final, the cortex peak drop and the response call at
+# each record's OWN last frames. That is the behaviour every earlier run had.
+#
+# It is only safe while every experiment runs for the same length, and these
+# do not: the 260422 and 260428 sessions record for about 721 s, the 260507
+# ones for about 431 s. Dye keeps leaking and fluorophores keep bleaching for
+# the whole record, so a vesicle watched for 67% longer has 67% longer to
+# accumulate both before its endpoint is taken. Voltage is not randomised
+# across sessions here -- 400 V comes almost entirely from the long records --
+# so record length, session and voltage are confounded with each other, and a
+# difference between conditions cannot be attributed to the field.
+#
+# Setting this to a number in seconds reads every endpoint at that same
+# elapsed time after the pulse instead, using the last ENDPOINT_N_FRAMES
+# samples at or before it. report_bleach_comparability already prints the
+# instruction to compare at matched elapsed time; this is what carries it out.
+#
+# 431.0 is the natural value for this dataset: the shortest full-length
+# record. Experiments that end before the target cannot be read there at all,
+# so their GUVs get NaN rather than a substituted earlier endpoint -- a
+# shorter record is censored, and filling it in with its own end is exactly
+# the bias being removed. Which experiments those are, and how many vesicles
+# they cost, is printed at aggregation time.
+#
+# Run it both ways. A result that only exists in one of them is a result about
+# the recording schedule.
+# -----------------------------------------------------------------------------
+ENDPOINT_MATCHED_T_S = 431.0
+
+# How far short of the target a record may end and still be read there.
+#
+# The test was `t_final_s < ENDPOINT_MATCHED_T_S` with nothing to spare, so a
+# record ending at 430.6 s was censored on the same footing as one ending at
+# 100 s. Frames arrive every 5 s and the target is the observed length of the
+# shortest full record, which is itself one of these samples -- so whether a
+# session clears its own nominal length comes down to where the last frame
+# happens to land, and a run can lose half its experiments to a rounding
+# difference.
+#
+# One frame is the honest allowance: it is the resolution at which the record
+# length is known at all. It is NOT a licence to read a materially shorter
+# record at the target -- the endpoint is still taken from the last samples at
+# or before ENDPOINT_MATCHED_T_S, so a record admitted under the tolerance is
+# read a few seconds early, not extrapolated. Set to 0.0 to restore the strict
+# test.
+ENDPOINT_MATCHED_TOLERANCE_S = 5.0
+
 # Fates dropped before any vesicle enters the bulk table.
 #
 # LOST_PREPULSE: the tracker lost the vesicle before the pulse was delivered,
@@ -256,10 +311,22 @@ def extract_voltage(path_str: str) -> str:
   match = re.search(r"(\d+)\s*V", path_str, re.IGNORECASE)
   return f"{match.group(1)}V" if match else "Unknown"
 
+# Folder-name variants that are the same preparation under two names. The
+# protein-free population was recorded as DOPC_Empty in some sessions and
+# DOPC_Bare in others; left alone, extract_population returns two different
+# strings and _present_populations then draws them as two panels, both titled
+# "Bare" by POPULATION_LABELS. apply_cortex_split already merges them, so the
+# split figures were right and the pooled reference and the onset fits were
+# not -- the bare population was halved in exactly the place a sigmoid needs
+# every vesicle it can get. Folding them here means one population name
+# reaches the table and every downstream consumer agrees by construction.
+POPULATION_ALIASES = {"Empty": "Bare"}
+
+
 def extract_population(path_str: str) -> str:
   for pop in POPULATIONS:
     if re.search(pop, path_str, re.IGNORECASE):
-      return pop
+      return POPULATION_ALIASES.get(pop, pop)
   return "Unknown"
 
 def assign_size_bin(r_um: float) -> str:
@@ -298,6 +365,41 @@ def load_cortex_status(exp_dir: Path) -> pd.DataFrame:
     print(f"Skipping cortex status file {files[0]}: {e}")
     return None
 
+_RESPONDING_IMPORT_FAILED = []
+
+
+def _responding_at(t_c: np.ndarray, y_c: np.ndarray):
+  """run_analysis's own response call, applied to a truncated trace.
+
+  _observed_response and the two thresholds are imported rather than
+  reimplemented. A second copy of this rule in this file is precisely the
+  drift that would make the matched-time and whole-record numbers
+  incomparable for a reason that had nothing to do with the data.
+
+  Returns True/False, or None if the rule could not be applied (in which case
+  the caller leaves the original whole-record call in place).
+  """
+  try:
+    from run_analysis import _observed_response
+  except Exception as e:
+    if not _RESPONDING_IMPORT_FAILED:
+      _RESPONDING_IMPORT_FAILED.append(e)
+      print(f"  WARNING: cannot import run_analysis._observed_response ({e}). "
+            "is_responding is left as computed over the whole record, so it "
+            "does not match the truncated i_final. Do not read the responding "
+            "fraction from this run.")
+    return None
+
+  efflux = str(getattr(cfg, "MODEL_TO_USE", "EFFLUX")).startswith("EFFLUX")
+  drop, noise = _observed_response(np.asarray(t_c, float),
+                                   np.asarray(y_c, float), efflux=efflux)
+  k = float(getattr(cfg, "FIT_RESPONSE_AMPLITUDE_SIGMA", 3.0))
+  min_amp = float(getattr(cfg, "FIT_MIN_RESPONSE_AMPLITUDE", 0.05))
+  if not (np.isfinite(drop) and np.isfinite(noise)):
+    return None
+  return bool(drop > max(min_amp, k * noise))
+
+
 def aggregate_pipeline_results(outputs_root: str) -> pd.DataFrame:
   root = Path(outputs_root)
   records = []
@@ -305,6 +407,19 @@ def aggregate_pipeline_results(outputs_root: str) -> pd.DataFrame:
   # the exclusion is visible in the run log rather than silent.
   dropped_fates = {}
   dropped_by_exp = {}
+  # Experiments that cannot supply a matched-time endpoint, and the count of
+  # response calls the matched endpoint changed. Both are reported at the end
+  # rather than per row, so the cost of the setting is one visible number.
+  endpoint_short = {}
+  endpoint_no_time = set()
+  n_response_flipped = 0
+  n_endpoint_censored = 0
+  # Which conditions the censoring falls on, not just how many vesicles it
+  # takes. A total is not enough to write an n from: the loss is not spread
+  # evenly, it lands on whichever sessions ran short, and one of those is a
+  # deliberately truncated field whose vesicles are still present in the fate
+  # and rupture analyses. Keyed (population, voltage, experiment).
+  endpoint_censored_by = {}
 
   all_fate = [f for f in root.glob("**/*_guv_fate_classification.csv")
               if RESULTS_SUBFOLDER not in f.parts]
@@ -350,6 +465,25 @@ def aggregate_pipeline_results(outputs_root: str) -> pd.DataFrame:
       post_mask = _post_pulse_mask(df_norm)
       if "Time (s)" in df_norm.columns and post_mask.any():
         t_final_s = df_norm.loc[post_mask, "Time (s)"].max()
+
+    # Endpoint reference for this experiment. t_final_s keeps meaning "when
+    # this record ended" whatever mode is set, so report_endpoint_times still
+    # shows the raw schedule; t_endpoint_used is where the value was actually
+    # read, which is the two of them being different that matters.
+    t_endpoint_used = t_final_s
+    endpoint_censored = False
+    if ENDPOINT_MATCHED_T_S is not None:
+      if df_norm is None or "Time (s)" not in df_norm.columns:
+        endpoint_no_time.add(exp_dir.name)
+        endpoint_censored = True
+        t_endpoint_used = np.nan
+      elif (not np.isfinite(t_final_s)
+            or t_final_s < ENDPOINT_MATCHED_T_S - ENDPOINT_MATCHED_TOLERANCE_S):
+        endpoint_short[exp_dir.name] = float(t_final_s)
+        endpoint_censored = True
+        t_endpoint_used = np.nan
+      else:
+        t_endpoint_used = float(ENDPOINT_MATCHED_T_S)
 
     for _, row in df_fate.iterrows():
       gid = str(row["guv_id"])
@@ -422,11 +556,19 @@ def aggregate_pipeline_results(outputs_root: str) -> pd.DataFrame:
       diff = np.nan
       n_final_used = 0
 
-      if size_cat == "Stagnate" and df_norm is not None:
+      if size_cat == "Stagnate" and df_norm is not None and not endpoint_censored:
         target_col = f"GUV_{gid}_I_retained"
         if target_col in df_norm.columns:
           pre_vals = df_norm.loc[pre_mask, target_col].dropna().values
-          post_vals = df_norm.loc[post_mask, target_col].dropna().values
+
+          if ENDPOINT_MATCHED_T_S is None:
+            post_vals = df_norm.loc[post_mask, target_col].dropna().values
+            post_t = None
+          else:
+            _p = df_norm.loc[post_mask, ["Time (s)", target_col]].dropna()
+            _p = _p[_p["Time (s)"] <= ENDPOINT_MATCHED_T_S]
+            post_vals = _p[target_col].to_numpy(float)
+            post_t = _p["Time (s)"].to_numpy(float)
 
           if len(pre_vals) > 0 and len(post_vals) > 0:
             i_pre = float(np.mean(pre_vals))
@@ -441,6 +583,30 @@ def aggregate_pipeline_results(outputs_root: str) -> pd.DataFrame:
               intensity_cat = "Flatline"
             else:
               intensity_cat = "Lose Intensity"
+
+            # is_responding came off the FULL record, so leaving it alone
+            # would give a matched-time release magnitude next to a
+            # whole-record response call, and the dose-response figure plots
+            # both. Recomputed here on the truncated trace using
+            # run_analysis's own _observed_response and the same two config
+            # thresholds -- imported, not restated, so there is one
+            # definition of "responding" in the codebase and not two.
+            if post_t is not None and len(post_t) >= 6:
+              new_resp = _responding_at(post_t, post_vals)
+              if new_resp is not None:
+                if bool(new_resp) != bool(is_responding):
+                  n_response_flipped += 1
+                is_responding = bool(new_resp)
+      elif size_cat == "Stagnate" and endpoint_censored:
+        # The release value is unobtainable at the matched time, so the
+        # response call taken over the whole record has to go with it. Left
+        # in place it would put a whole-record verdict in the same column as
+        # matched-time verdicts, and the responding fraction would then be a
+        # mixture of two definitions.
+        n_endpoint_censored += 1
+        _key = (population, voltage, exp_dir.name)
+        endpoint_censored_by[_key] = endpoint_censored_by.get(_key, 0) + 1
+        is_responding = np.nan
 
       records.append({
           "population": population,
@@ -465,8 +631,42 @@ def aggregate_pipeline_results(outputs_root: str) -> pd.DataFrame:
           "diff": diff,
           "intensity_category": intensity_cat,
           "t_final_s": t_final_s,
+          "t_endpoint_used": t_endpoint_used,
           "n_final_used": n_final_used,
       })
+
+  if ENDPOINT_MATCHED_T_S is not None:
+    print(f"\nENDPOINT read at a matched {ENDPOINT_MATCHED_T_S:.0f} s after "
+          "the pulse, not at each record's own end.")
+    if endpoint_no_time:
+      print("  No 'Time (s)' column, so no matched endpoint is possible: "
+            + ", ".join(sorted(endpoint_no_time)))
+    if endpoint_short:
+      print(f"  {len(endpoint_short)} experiment(s) end before the target and "
+            "are censored (i_final = NaN):")
+      for name, t_end in sorted(endpoint_short.items(), key=lambda kv: kv[1]):
+        print(f"    {t_end:7.1f} s  {name}")
+    if n_endpoint_censored:
+      print(f"  {n_endpoint_censored} stagnate GUV(s) lost to censoring. "
+            "Lowering the target keeps them, at the cost of reading every "
+            "condition earlier.")
+      # Broken down, because the total hides where the hole is. These
+      # vesicles are absent from the dye release and responding-fraction
+      # figures but PRESENT in the size, fate and rupture ones, which take
+      # nothing from the endpoint -- so the two sets of numbers have
+      # different denominators and the difference is listed here rather than
+      # left to be discovered from a figure.
+      print("    condition                 experiment"
+            "                                        n")
+      for (pop, volt), _ in sorted(
+          {(p, v): None for p, v, _ in endpoint_censored_by}.items(),
+          key=lambda kv: (kv[0][0], _voltage_key(kv[0][1]))):
+        for (p, v, exp), n in sorted(endpoint_censored_by.items()):
+          if (p, v) == (pop, volt):
+            print(f"    {POPULATION_LABELS.get(pop, pop):<12} {volt:<12} "
+                  f"{exp:<48} {n:>3}")
+    print(f"  {n_response_flipped} response call(s) changed against the "
+          "whole-record version.")
 
   if dropped_fates:
     total = sum(dropped_fates.values())
@@ -480,7 +680,17 @@ def aggregate_pipeline_results(outputs_root: str) -> pd.DataFrame:
     for exp_name, n_dropped in worst:
       print(f"    {n_dropped:>3}  {exp_name}")
 
-  return pd.DataFrame(records)
+  out = pd.DataFrame(records)
+
+  # A censored vesicle has no response call, so this column carries missing
+  # values and is no longer plain bool. NumPy has no missing bool: as object
+  # it raises on being used as a mask, and as float it is silently taken for a
+  # list of column labels, which is how a censoring change surfaced three
+  # functions away as KeyError: 'radius_bin'. The nullable dtype is the only
+  # one where NA both masks as False and stays out of a .sum().
+  if "is_responding" in out.columns:
+    out["is_responding"] = out["is_responding"].astype("boolean")
+  return out
 
 
 # -----------------------------------------------------------------------------
@@ -512,7 +722,7 @@ ONSET_MIN_AMPLITUDE_SD = 2.0
 
 
 def _sigmoid(v, lo, hi, v50, k):
-    """Logistic in voltage. lo/hi are the plateaus, v50 the midpoint."""
+    """Logistic in field strength. lo/hi are the plateaus, v50 the midpoint."""
     return lo + (hi - lo) / (1.0 + np.exp(-k * (v - v50)))
 
 
@@ -542,7 +752,7 @@ def _fit_sigmoid_once(v, y):
 
 def fit_onset(df: pd.DataFrame, value_col: str, label: str,
               n_boot: int = ONSET_N_BOOTSTRAP) -> dict:
-    """Sigmoid midpoint in volts, with a bootstrap CI, for one population.
+    """Sigmoid midpoint in kV/cm, with a bootstrap CI, for one population.
 
     The CI comes from resampling GUVs with replacement rather than from the
     covariance matrix, because the residuals are neither independent (several
@@ -557,7 +767,11 @@ def fit_onset(df: pd.DataFrame, value_col: str, label: str,
     reporting the point estimate alone.
     """
     sub = df[["voltage", value_col]].copy()
-    sub["v_num"] = sub["voltage"].map(_voltage_key)
+    # Field strength, not applied volts, so the fitted midpoint is an E50 in
+    # kV/cm and comparable to work using a different electrode geometry. The
+    # conversion is one constant, so the fit, the bootstrap and `identified`
+    # are unchanged; only the units of v50 and its interval move.
+    sub["v_num"] = sub["voltage"].map(field_kV_cm)
     sub = sub.dropna(subset=["v_num", value_col])
     out = {
         "measure": label, "n_guv": int(len(sub)),
@@ -624,15 +838,33 @@ def fit_onset(df: pd.DataFrame, value_col: str, label: str,
 
 
 def report_onset_fields(df: pd.DataFrame, output_dir: str) -> pd.DataFrame:
-    """Cortex-breakdown and area-loss onsets per population, fitted and plotted.
+    """Cortex-breakdown and area-loss onsets per group, fitted and plotted.
 
     Area loss is expressed as fractional projected-area loss,
     1 - (terminal_norm_radius)^2, so it is directly comparable to the
     normalised area Perrier et al. plot rather than to a radius.
+
+    Fitted on the cortex-split groups. The undivided BranchedCortex population
+    mixes vesicles that assembled a cortex with vesicles that kept their actin
+    in the lumen, and a cortex-breakdown onset taken over the second kind is
+    an onset for a structure that was never there. The area-loss onset has the
+    same problem in weaker form: the two phenotypes differ in radius, so they
+    do not reach a given transmembrane potential at the same applied voltage,
+    and pooling them smears the step this fit exists to locate.
     """
     out_path = sub_dir(output_dir, "cortex_breakdown")
     work = df.copy()
     work = work[work["size_category"] != "Rupture/Collapse"]
+
+    # assign_cortex_group rather than apply_cortex_split: the split itself is
+    # wanted, the several paragraphs of counts it prints are not, having
+    # already been printed once for the figures that follow.
+    work["population"] = work.apply(assign_cortex_group, axis=1)
+    drop = work["population"].isin(EXCLUDE_GROUPS)
+    if drop.any():
+      print(f"\nOnset fields: {int(drop.sum())} unclassifiable GUV(s) "
+            f"excluded, {int((~drop).sum())} fitted.")
+      work = work[~drop]
 
     if "terminal_norm_radius" in work.columns:
       with np.errstate(invalid="ignore"):
@@ -666,7 +898,7 @@ def report_onset_fields(df: pd.DataFrame, output_dir: str) -> pd.DataFrame:
         sub = pop_df[["voltage", value_col]].dropna()
         if sub.empty:
           continue
-        vx = sub["voltage"].map(_voltage_key).to_numpy(float)
+        vx = sub["voltage"].map(field_kV_cm).to_numpy(float)
         ax.plot(vx, sub[value_col].to_numpy(float), "o", ms=3, alpha=0.35,
                 label=f"{label} (n = {len(sub)})")
         if np.isfinite(res["v50"]):
@@ -679,7 +911,7 @@ def report_onset_fields(df: pd.DataFrame, output_dir: str) -> pd.DataFrame:
             ax.axvspan(res["v50_ci_low"], res["v50_ci_high"],
                        color="0.6", alpha=0.15)
       ax.set_title(pop)
-      ax.set_xlabel("Voltage (V)")
+      ax.set_xlabel(FIELD_AXIS_LABEL)
       ax.axhline(0.0, color="0.7", lw=0.8, ls=":")
       ax.legend(frameon=False, loc="upper left")
     axes[0][0].set_ylabel("fractional loss")
@@ -694,12 +926,12 @@ def report_onset_fields(df: pd.DataFrame, output_dir: str) -> pd.DataFrame:
     csv_path = out_path / "onset_fields.csv"
     res_df.to_csv(csv_path, index=False, float_format="%.4f")
 
-    print("\nOnset fields (sigmoid midpoint, 95% bootstrap CI):")
+    print("\nOnset fields (sigmoid midpoint in kV/cm, 95% bootstrap CI):")
     for _, r in res_df.iterrows():
       if r["identified"]:
         print(f"  {r['population']:<20} {r['measure']:<20} "
-              f"V50 = {r['v50']:.0f} V  [{r['v50_ci_low']:.0f}, "
-              f"{r['v50_ci_high']:.0f}]  (n = {r['n_guv']})")
+              f"E50 = {r['v50']:.2f} kV/cm  [{r['v50_ci_low']:.2f}, "
+              f"{r['v50_ci_high']:.2f}]  (n = {r['n_guv']})")
       else:
         print(f"  {r['population']:<20} {r['measure']:<20} "
               f"not identified -- {r['note']}")
@@ -731,6 +963,51 @@ def _voltage_key(v) -> int:
   m = re.search(r"\d+", str(v))
   return int(m.group()) if m else 0
 
+
+# -----------------------------------------------------------------------------
+# --- FIELD STRENGTH ---
+# Electrode separation in the 3D-printed chamber, in centimetres. Figures are
+# labelled in kV/cm rather than in applied volts: the voltage is a property of
+# this generator and this chamber and transfers to no other study, while the
+# field does, and it is the field that appears in the Schwan expression the
+# dose axis is built on.
+#
+# The `voltage` COLUMN is left alone. It stays the grouping key and the string
+# written to every CSV, so nothing that joins, sorts or reads those files
+# changes; only what is printed on an axis does. Sorting still runs through
+# _voltage_key on the original label.
+#
+# The gap is not recorded per experiment anywhere in the pipeline outputs, so
+# a session run with a different chamber would be mis-scaled here with no
+# warning. If that ever happens this constant is not enough and the gap has to
+# be carried per experiment.
+# -----------------------------------------------------------------------------
+ELECTRODE_GAP_CM = 0.3
+
+
+def field_kV_cm(v) -> float:
+  """Applied voltage label -> field strength in kV/cm."""
+  return _voltage_key(v) / ELECTRODE_GAP_CM / 1000.0
+
+
+def field_label(v) -> str:
+  """Tick label in kV/cm, always with at least one decimal.
+
+  Two places only where the amplitude needs them: 400, 650 and 775 V do not
+  land on round fields (1.33, 2.17, 2.58 kV/cm), while the rest do. Trimming
+  all the way to bare integers would print 300 V as "1", which reads as a
+  count rather than a field, so the last zero is kept.
+  """
+  txt = f"{field_kV_cm(v):.2f}"
+  return txt[:-1] if txt.endswith("0") else txt
+
+
+def field_labels(vs) -> list:
+  return [field_label(v) for v in vs]
+
+
+FIELD_AXIS_LABEL = "Field strength (kV/cm)"
+
 def _voltage_order(df: pd.DataFrame) -> list:
   return sorted(df["voltage"].unique(), key=_voltage_key)
 
@@ -760,11 +1037,17 @@ def report_tau_yield(df: pd.DataFrame):
   stag = df[df["size_category"] == "Stagnate"]
   for (pop, v), sub in stag.groupby(["population", "voltage"]):
     fitted = sub["tau"].notna().sum()
+    # .sum() on the nullable dtype counts True only, so a censored vesicle is
+    # not quietly scored as a non-responder. n_no_call carries them instead,
+    # because "we could not tell" and "it did not respond" are different
+    # denominators and only one of them belongs in a response rate.
+    n_call = int(sub["is_responding"].notna().sum())
     rows.append({
         "population": pop,
         "voltage": v,
         "n_guv": len(sub),
         "n_fitted": int(fitted),
+        "n_no_call": int(len(sub) - n_call),
         "n_responding": int(sub["is_responding"].sum()),
         "n_tau_identifiable": int(sub["tau_identifiable"].sum()),
         "n_plotted": len(_filter_tau(sub)),
@@ -772,6 +1055,12 @@ def report_tau_yield(df: pd.DataFrame):
   tbl = pd.DataFrame(rows).sort_values(["population", "voltage"])
   print("\nTau yield per condition:")
   print(tbl.to_string(index=False))
+  n_missing = int(tbl["n_no_call"].sum())
+  if n_missing:
+    print(f"  n_no_call: {n_missing} vesicle(s) whose record ends before "
+          f"ENDPOINT_MATCHED_T_S = {ENDPOINT_MATCHED_T_S}, so they have no "
+          "response call at the matched time. They are out of the numerator "
+          "AND the denominator of n_responding.")
   print()
 
 def plot_drop_by_cortex_status(df: pd.DataFrame, output_dir: str):
@@ -830,8 +1119,8 @@ def plot_drop_by_cortex_status(df: pd.DataFrame, output_dir: str):
 
     ax.axhline(0, color="black", lw=0.8, alpha=0.6)
     ax.set_xticks(x)
-    ax.set_xticklabels(voltages, rotation=45, fontsize=9)
-    ax.set_xlabel("Voltage")
+    ax.set_xticklabels(field_labels(voltages), rotation=45, fontsize=9)
+    ax.set_xlabel(FIELD_AXIS_LABEL)
     ax.set_title(POPULATION_LABELS.get(pop, pop))
     ax.grid(axis="y", linestyle="--", alpha=0.4)
     if p_idx == 0:
@@ -933,8 +1222,8 @@ def plot_tau_by_size_and_voltage(df: pd.DataFrame, output_dir: str):
       )
 
     ax.set_xticks(x)
-    ax.set_xticklabels(voltages, rotation=45, fontsize=9)
-    ax.set_xlabel("Voltage")
+    ax.set_xticklabels(field_labels(voltages), rotation=45, fontsize=9)
+    ax.set_xlabel(FIELD_AXIS_LABEL)
     ax.set_yscale("log")
     ax.set_title(POPULATION_LABELS.get(pop, pop))
     ax.grid(axis="y", which="both", linestyle="--", alpha=0.4)
@@ -1195,7 +1484,7 @@ def plot_cortex_peak_timecourse(df: pd.DataFrame, outputs_root: str,
       colour = PALETTE["dark_red"] if is_ctrl else shades[volt]
       ax.plot(grid[sel], med, color=colour, lw=2.0 if is_ctrl else 1.5,
               ls="--" if is_ctrl else "-", zorder=5 if is_ctrl else 3,
-              label=f"{volt} (n={arr.shape[0]})")
+              label=f"{field_label(volt)} kV/cm (n={arr.shape[0]})")
       ax.fill_between(grid[sel], q1, q3, color=colour, alpha=0.13, lw=0,
                       zorder=2)
       if ax is axes[1]:
@@ -1263,6 +1552,890 @@ def plot_cortex_peak_timecourse(df: pd.DataFrame, outputs_root: str,
     print(tbl.to_string(index=False))
     print()
 
+# -----------------------------------------------------------------------------
+# --- POLE VS EQUATOR: IS CORTEX BREAKDOWN DIRECTIONAL? ---
+#
+# run_analysis.py writes one *_pole_vs_equator_traces.csv per experiment, with
+# three columns per GUV: pole_mean and equator_mean (fold change against that
+# GUV's own pre-pulse level, inside +/- POLE_EQUATOR_HALF_WIDTH_DEG of the
+# electrode axis and of the equator respectively), and their contrast
+#
+#     polarization_index = (equator_mean - pole_mean) / (equator_mean + pole_mean)
+#
+# which is > 0 when the pole has lost more actin than the equator.
+#
+# Those files are only interpretable pooled, which is why this stage exists. A
+# vesicle is free to rotate between frames, and a rotation carries signal
+# between the pole and equator windows with no actin lost at all; on a single
+# vesicle that is not distinguishable from directional breakdown. Rotation is
+# not aligned to the electrode axis and averages out across a population,
+# whereas a real field-driven asymmetry does not. Nothing read off one GUV's
+# kymograph supports a directional claim.
+#
+# Two references have to be carried, because the index is a ratio of two noisy
+# quantities and is not automatically centred on zero:
+#
+#   PRE-PULSE. Both windows are normalised to their own pre-pulse level, so
+#   the index is 0 there by construction. Its scatter before the pulse is
+#   therefore a direct measure of the noise floor, on the same vesicles and in
+#   the same units as the post-pulse number it has to be judged against.
+#
+#   THE 30 V CONTROL. A field too small to porate, over a whole record, shows
+#   what bleaching and rotation produce on their own.
+#
+# A post-pulse median that does not clear both is not a directional effect.
+# -----------------------------------------------------------------------------
+
+POLE_EQUATOR_MIN_GUV = 5          # GUVs required before a voltage is reported
+POLE_EQUATOR_PRE_MIN_S = -30.0    # pre-pulse window, the systematic-offset check
+POLE_EQUATOR_N_BOOTSTRAP = 2000   # resamples for the CI on each cell median
+
+# Add a row per window pooling every pulsed condition, control excluded.
+#
+# n is the binding constraint per voltage: 8 GUVs at 900 V resolve to about
+# +/-0.04, which cannot rule out anything. Cortex breakdown here is a late,
+# slow process, and there is no evidence in these data that its DIRECTION is
+# graded by voltage even though its extent is -- so pooling the pulsed
+# conditions buys roughly an order of magnitude in n for a question that does
+# not obviously need the voltage axis.
+#
+# What it costs: any voltage-dependence of the direction is averaged away, and
+# a strong asymmetry confined to the highest fields would be diluted by the
+# low ones. The per-voltage rows stay in the table for exactly that reason;
+# the pooled row is the better-powered test, not the replacement.
+POLE_EQUATOR_POOL_VOLTAGES = True
+POOLED_LABEL = "pulsed (pooled)"
+
+# Experiments required before a cell's interval is treated as trustworthy.
+#
+# A cluster bootstrap resamples whole chambers, so with only a handful of them
+# there are very few distinct resamples and the interval comes out far too
+# narrow. Measured on pure-null data (12 vesicles per chamber, between-chamber
+# SD 0.010, within 0.030, 200 trials each), the rate at which the 95% interval
+# wrongly excludes zero is:
+#
+#      3 chambers   27%        12 chambers  7.5%
+#      5 chambers   15%        20 chambers  6.0%
+#      8 chambers   11%        29 chambers  4.5%
+#
+# Per-voltage cells here have 2 to 6 experiments, so their intervals cannot
+# support a verdict at all -- which is the quantitative reason the pooled row
+# (29 experiments) is the test and the per-voltage rows are the check on it.
+# Cells below this threshold still report their median and interval, since
+# both are informative, but `resolved` is held at False and `ci_reliable`
+# records why.
+POLE_EQUATOR_MIN_CLUSTERS = 12
+
+# Post-pulse windows the index is summarised over, as (label, t_lo, t_hi) in
+# seconds. More than one because the answer depends on when you look, and a
+# single window hides that.
+#
+# A 60 s window alone is not a test of this question on this dataset. The
+# cortex peak breakdown table shows almost nothing lost immediately after the
+# pulse at any voltage (medians from -0.020 to +0.025) and most of the loss
+# arriving by the end of the record (0.25 at 400 V). Asking whether a loss
+# that has not happened yet is directional returns "no asymmetry" for a reason
+# that has nothing to do with direction. The burst window is kept because
+# whether anything happens in the first minute is worth reporting; the late
+# window is where the loss actually is.
+#
+# The late window ends at 431 s, the shortest full-length record here, so
+# every experiment can supply it. Widening it past that would silently mean
+# "the long sessions only".
+POLE_EQUATOR_WINDOWS = (
+    ("burst", 0.0, 60.0),
+    ("late", 300.0, 431.0),
+)
+
+# When set, the index is reported a second time over only those GUVs whose
+# cortex peak fell by at least this fraction by the end of the record.
+#
+# This is the sharper form of the question. Pooled over every cortex-bearing
+# vesicle, most of which lost no cortex at all, a real asymmetry among the
+# ones that did break down is diluted toward zero by vesicles that had nothing
+# to be asymmetric about. Conditioning asks: of the cortices that failed, did
+# they fail directionally?
+#
+# It is also a selection, and selections invite their own artefacts, so both
+# strata are always reported side by side rather than the conditioned one
+# replacing the pooled one. Set it from the observed peak_drop_final
+# distribution, which is printed below whenever this is None. Requires
+# peak_drop_final on the input frame (pass the output of
+# add_cortex_peak_metrics, not the raw summary).
+POLE_EQUATOR_MIN_PEAK_DROP = None
+
+
+def _time_mean(t, y, lo: float, hi: float):
+  """Time-weighted mean of y over lo < t <= hi, plus the sample count.
+
+  Trapezoidal, and taken on the RAW samples rather than on the interpolated
+  grid, because both are non-uniform in time and a plain mean or median would
+  then report the sampling schedule as much as the signal. The acquisition
+  runs a fast segment of about a second immediately after the pulse and a slow
+  one for the rest of the record, so an unweighted average over the first
+  minute is dominated by that first second.
+
+  Returns (value, n_samples); (NaN, 0) if nothing finite falls in the window.
+  """
+  t = np.asarray(t, dtype=float)
+  y = np.asarray(y, dtype=float)
+  ok = np.isfinite(t) & np.isfinite(y) & (t > lo) & (t <= hi)
+  t, y = t[ok], y[ok]
+  if t.size == 0:
+    return np.nan, 0
+  if t.size == 1:
+    return float(y[0]), 1
+  order = np.argsort(t)
+  t, y = t[order], y[order]
+  span = float(t[-1] - t[0])
+  if span <= 0:
+    return float(np.mean(y)), int(t.size)
+  area = float(np.sum(0.5 * (y[1:] + y[:-1]) * np.diff(t)))
+  return area / span, int(t.size)
+
+
+def _pole_equator_time_grid(t_min: float, t_max: float) -> np.ndarray:
+  """_peak_time_grid extended backwards, since these traces span the pulse.
+
+  The actin cortex traces start at the pulse; the pole/equator traces carry
+  negative times as well, and the pre-pulse segment is the noise floor rather
+  than padding, so it is kept.
+  """
+  pre = np.arange(np.floor(min(t_min, 0.0)), 0.0, 0.5) if t_min < 0 else \
+      np.array([], dtype=float)
+  return np.unique(np.concatenate([pre, _peak_time_grid(t_max)]))
+
+
+def collect_pole_equator_traces(df: pd.DataFrame, outputs_root: str):
+  """Pool every cortex-bearing GUV's pole/equator traces onto one time axis.
+
+  Mirrors collect_cortex_peak_traces: same population filter (cortex-bearing
+  and Stagnate), same walk over the per-experiment folders, same
+  interpolation onto a shared grid with samples outside a GUV's own record
+  left NaN rather than extrapolated.
+
+  Returns (grid, by_voltage, per_guv):
+    grid       shared time axis in seconds, negative before the pulse
+    by_voltage voltage -> dict of (n_guv, n_times) arrays keyed 'pole',
+               'equator', 'polarization'
+    per_guv    LONG format, one row per (vesicle, window). Long rather than a
+               column per window so that adding a window does not change the
+               shape of the table or of anything reading it.
+  Returns (None, None, None) if nothing usable was found.
+  """
+  root = Path(outputs_root)
+  keep = df.assign(group=df.apply(assign_cortex_group, axis=1))
+  keep = keep[(keep["group"] == "Branched, cortex")
+              & (keep["size_category"] == "Stagnate")]
+  if keep.empty:
+    print("Pole/equator pooling skipped: no cortex-bearing stagnate GUVs.")
+    return None, None, None
+  has_drop = "peak_drop_final" in keep.columns
+  wanted = {(r["experiment"], str(r["guv_id"])):
+            (r["voltage"],
+             float(r["peak_drop_final"]) if has_drop else np.nan)
+            for _, r in keep.iterrows()}
+
+  raw, n_files = [], 0
+  t_min, t_max = 0.0, 0.0
+  for exp_dir in sorted(p for p in root.iterdir() if p.is_dir()):
+    if exp_dir.name == RESULTS_SUBFOLDER or is_excluded_experiment(exp_dir.name):
+      continue
+    files = [f for f in exp_dir.glob("**/*_pole_vs_equator_traces.csv")
+             if RESULTS_SUBFOLDER not in f.parts]
+    if not files:
+      continue
+    n_files += 1
+    try:
+      tr = pd.read_csv(files[0])
+    except Exception as e:
+      print(f"Skipping pole/equator file {files[0]}: {e}")
+      continue
+    if "time_s" not in tr:
+      continue
+    t = tr["time_s"].to_numpy(float)
+    for col in tr.columns:
+      m = re.match(r"GUV_(.+)_polarization_index$", col)
+      if not m:
+        continue
+      gid = m.group(1)
+      key = (exp_dir.name, gid)
+      if key not in wanted:
+        continue
+      cols = {"polarization": col,
+              "pole": f"GUV_{gid}_pole_mean",
+              "equator": f"GUV_{gid}_equator_mean"}
+      if not all(c in tr.columns for c in cols.values()):
+        continue
+      vals = {k: tr[c].to_numpy(float) for k, c in cols.items()}
+      ok = np.isfinite(t) & np.isfinite(vals["polarization"])
+      if ok.sum() < 4:
+        continue
+      volt, drop = wanted[key]
+      raw.append((volt, drop, exp_dir.name, gid, t, vals))
+      t_min = min(t_min, float(t[ok].min()))
+      t_max = max(t_max, float(t[ok].max()))
+
+  if not raw:
+    if n_files:
+      print(f"Pole/equator pooling: {n_files} file(s) found, but no GUV in "
+            "them is a cortex-bearing stagnate vesicle in the summary table.")
+    else:
+      print("Pole/equator pooling skipped: no *_pole_vs_equator_traces.csv "
+            "found. Re-run the per-experiment stage with "
+            "EXPORT_ACTIN_KYMOGRAPH = True.")
+    return None, None, None
+
+  grid = _pole_equator_time_grid(t_min, t_max)
+
+  stacks, rows = {}, []
+  for volt, drop, exp, gid, t, vals in raw:
+    # The interpolated grid is for the pooled median curve only. Every
+    # per-GUV number below is taken from that GUV's own raw samples, so the
+    # summary does not inherit the grid's density.
+    for k, y in vals.items():
+      ok = np.isfinite(t) & np.isfinite(y)
+      if ok.sum() < 4:
+        z = np.full(grid.shape, np.nan)
+      else:
+        z = np.interp(grid, t[ok], y[ok])
+        z[(grid < t[ok].min()) | (grid > t[ok].max())] = np.nan
+      stacks.setdefault(volt, {kk: [] for kk in vals})[k].append(z)
+
+    pol_pre, n_pre = _time_mean(t, vals["polarization"],
+                                POLE_EQUATOR_PRE_MIN_S, 0.0)
+    for label, lo, hi in POLE_EQUATOR_WINDOWS:
+      pol, n_w = _time_mean(t, vals["polarization"], lo, hi)
+      pole, _ = _time_mean(t, vals["pole"], lo, hi)
+      eq, _ = _time_mean(t, vals["equator"], lo, hi)
+      rows.append({
+          "experiment": exp, "guv_id": gid, "voltage": volt,
+          "window": label, "t_lo": lo, "t_hi": hi,
+          "peak_drop_final": drop,
+          "pol_pre": pol_pre, "n_pre": n_pre,
+          "pol_post": pol, "pole_post": pole, "equator_post": eq,
+          "n_post": n_w,
+      })
+
+  by_voltage = {v: {k: np.vstack(a) for k, a in d.items()}
+                for v, d in stacks.items()}
+  return grid, by_voltage, pd.DataFrame(rows)
+
+
+def _pole_equator_strata(per_guv: pd.DataFrame):
+  """(label, boolean mask) for each population the index is reported over.
+
+  Always includes every cortex-bearing vesicle. Adds the cortex-loss subset
+  only when POLE_EQUATOR_MIN_PEAK_DROP is set AND peak_drop_final is actually
+  present, so a frame passed without the actin merge degrades to the pooled
+  test with a warning rather than silently reporting an unconditioned result
+  under a conditioned label.
+  """
+  strata = [("all cortex-bearing", pd.Series(True, index=per_guv.index))]
+  if POLE_EQUATOR_MIN_PEAK_DROP is None:
+    return strata
+  if per_guv["peak_drop_final"].notna().sum() == 0:
+    print("  POLE_EQUATOR_MIN_PEAK_DROP is set but no peak_drop_final values "
+          "reached this function. Pass the output of add_cortex_peak_metrics "
+          "rather than the raw summary; reporting the pooled test only.")
+    return strata
+  thr = float(POLE_EQUATOR_MIN_PEAK_DROP)
+  strata.append((f"peak drop >= {thr:.2f}",
+                 per_guv["peak_drop_final"] >= thr))
+  return strata
+
+
+def holm(pvals):
+  """Holm-Bonferroni adjusted p-values, NaN-preserving.
+
+  Lives here rather than in each script so the two places that correct for
+  multiplicity cannot end up doing it differently.
+  """
+  p = np.asarray(pvals, dtype=float)
+  out = np.full(p.shape, np.nan)
+  idx = np.where(np.isfinite(p))[0]
+  if idx.size == 0:
+    return out
+  order = idx[np.argsort(p[idx])]
+  m = len(order)
+  running = 0.0
+  for rank, i in enumerate(order):
+    running = max(running, min(1.0, (m - rank) * float(p[i])))
+    out[i] = running
+  return out
+
+
+def _boot_median_ci(v, clusters=None, n_boot: int = None, seed: int = 0):
+  """Percentile bootstrap CI for a median, and the half-width it implies.
+
+  The CI is what makes a null statement mean anything. Comparing a population
+  median against the spread of INDIVIDUAL pre-pulse values, which is what this
+  function replaces, asks whether one vesicle's asymmetry would have been
+  visible -- a far coarser question than whether the median over thirty of
+  them has moved, and one that reports "not resolved" for effects the data
+  could easily have seen. The per-vesicle scatter here is about 0.033, so a
+  cell of 30 pins its median to roughly 0.008; judging that median against
+  0.043 discards a factor of five.
+
+  Bootstrap rather than a normal approximation because these values are
+  bounded on [-1, 1], skewed when only some vesicles have broken down, and
+  not independent (several GUVs share a field of view). None of those is fatal
+  to a resampled median; all of them are to a standard error.
+
+  When *clusters* is given (one label per value, here the experiment), whole
+  clusters are resampled rather than individual vesicles. Vesicles in one
+  chamber share a preparation, a field and a day; treating them as independent
+  is what makes a naive interval too narrow, and the error grows with pooling
+  -- across 250 vesicles from 29 experiments the difference is roughly the
+  square root of the mean cluster size, so about 3x. Falls back to resampling
+  vesicles when fewer than 3 clusters are present, since a cluster bootstrap
+  over 2 groups estimates nothing.
+
+  Returns (lo, hi, half_width, p). half_width is the resolution: the smallest
+  median this cell could have distinguished from zero. p is the two-sided
+  percentile bootstrap p-value against a median of zero, taken from the SAME
+  resampling as the interval.
+
+  That last point is the reason this replaced the Wilcoxon signed-rank test
+  that used to sit alongside it. Wilcoxon has no notion of clustering, so it
+  treated every vesicle as independent while the interval did not; on the
+  pooled row that produced a p of 0.034 next to a CI spanning zero, two
+  statistics disagreeing for a reason belonging to the code rather than the
+  data. A p and an interval from one resampling cannot contradict each other.
+
+  Resolution floor: with n_boot resamples the smallest reportable p is
+  1/n_boot, so a p at that floor means "below this", not an exact value.
+  """
+  n_boot = int(POLE_EQUATOR_N_BOOTSTRAP if n_boot is None else n_boot)
+  v = np.asarray(v, dtype=float)
+  keep = np.isfinite(v)
+  if clusters is not None:
+    clusters = np.asarray(clusters)[keep]
+  v = v[keep]
+  if v.size < 3:
+    # Four values, not three. Both callers unpack four, so the short return
+    # this used to make raised ValueError on any cell with one or two
+    # measurable vesicles -- which killed report_pole_equator before it
+    # printed anything, and with it every stage after it in __main__.
+    return np.nan, np.nan, np.nan, np.nan
+  rng = np.random.default_rng(seed)          # fixed: reruns reproduce
+
+  if clusters is not None:
+    uniq = list(dict.fromkeys(clusters.tolist()))
+    if len(uniq) >= 3:
+      idx_by_cluster = [np.where(clusters == u)[0] for u in uniq]
+      n_c = len(uniq)
+      meds = np.empty(n_boot, dtype=float)
+      picks = rng.integers(0, n_c, (n_boot, n_c))
+      for b in range(n_boot):
+        take = np.concatenate([idx_by_cluster[j] for j in picks[b]])
+        meds[b] = np.median(v[take])
+    else:
+      meds = np.median(v[rng.integers(0, v.size, (n_boot, v.size))], axis=1)
+  else:
+    meds = np.median(v[rng.integers(0, v.size, (n_boot, v.size))], axis=1)
+
+  lo = float(np.percentile(meds, 2.5))
+  hi = float(np.percentile(meds, 97.5))
+  # Two-sided: twice the smaller tail, floored at one resample so it is never
+  # reported as exactly zero.
+  frac_le = float(np.mean(meds <= 0.0))
+  frac_ge = float(np.mean(meds >= 0.0))
+  p = min(1.0, 2.0 * min(frac_le, frac_ge))
+  p = max(p, 1.0 / len(meds))
+  return lo, hi, float(0.5 * (hi - lo)), float(p)
+
+
+def report_pole_equator(per_guv: pd.DataFrame, out_path: Path) -> pd.DataFrame:
+  """Per-window, per-stratum, per-voltage summary of the polarization index.
+
+  The test is a Wilcoxon signed-rank of each GUV's window value against zero,
+  not a comparison of two group means: every vesicle carries its own
+  pre-pulse normalisation, so zero is a fixed reference rather than an
+  estimated one, and the paired form is what matches that design.
+  """
+  if per_guv is None or per_guv.empty:
+    return pd.DataFrame()
+
+  # One row per GUV for the checks that are about vesicles, not windows.
+  first = per_guv.drop_duplicates(subset=["experiment", "guv_id"])
+
+  pre_all = first["pol_pre"].dropna()
+  if len(pre_all) >= 3:
+    # The pre-pulse index is 0 by construction, so its MEDIAN over hundreds of
+    # vesicles should sit within a standard error or two of zero. Where it does
+    # not, the residue is a systematic offset in the measurement -- unequal
+    # background between the pole and equator windows, or an electrode angle
+    # slightly off the one assumed -- and unlike random scatter it does not
+    # shrink with n. It is therefore a hard floor on accuracy that no sample
+    # size defeats, and it is a different quantity from the bootstrap CI below,
+    # which only bounds precision.
+    sys_offset = float(pre_all.median())
+    pre_sd = float(pre_all.std())
+    se_pre = pre_sd / np.sqrt(len(pre_all)) if len(pre_all) else np.nan
+    print(f"\n  Pre-pulse check: median {sys_offset:+.4f}, "
+          f"IQR [{pre_all.quantile(.25):+.4f}, {pre_all.quantile(.75):+.4f}], "
+          f"per-vesicle SD {pre_sd:.4f}, across {len(pre_all)} GUV(s).")
+    if np.isfinite(se_pre) and se_pre > 0 and abs(sys_offset) > 2 * se_pre:
+      print(f"    This should be 0 by construction but sits {abs(sys_offset) / se_pre:.1f} "
+            f"standard errors off it. Treat |{abs(sys_offset):.4f}| as a "
+            "systematic floor on accuracy: a post-pulse median smaller than "
+            "that is not distinguishable from the offset, however many "
+            "vesicles are pooled.")
+    else:
+      print("    Consistent with zero, so there is no systematic offset to "
+            "subtract; precision alone limits what can be resolved.")
+  else:
+    sys_offset = np.nan
+    print("\n  Pre-pulse check unavailable: fewer than 3 GUVs have pre-pulse "
+          "samples, so there is no way to tell a systematic offset in the "
+          "index from a real post-pulse asymmetry.")
+
+  drops = first["peak_drop_final"].dropna()
+  if len(drops) >= 4:
+    print(f"  Cortex peak lost by end of record, these {len(drops)} GUV(s): "
+          f"quartiles {drops.quantile(.25):+.3f} / {drops.median():+.3f} / "
+          f"{drops.quantile(.75):+.3f}")
+    if POLE_EQUATOR_MIN_PEAK_DROP is None:
+      print("  POLE_EQUATOR_MIN_PEAK_DROP is None, so the index below pools "
+            "every cortex-bearing vesicle, including those that lost no "
+            "cortex and so have no asymmetry to show. Set it from the "
+            "quartiles above to add the conditioned test.")
+
+  strata = _pole_equator_strata(per_guv)
+  rows = []
+  for s_label, s_mask in strata:
+    sub_s = per_guv[s_mask]
+    for w_label, lo, hi in POLE_EQUATOR_WINDOWS:
+      sub_w = sub_s[sub_s["window"] == w_label]
+      volts = sorted(sub_w["voltage"].unique(), key=_voltage_key)
+      # The pooled row is built from the same cell code as a single voltage,
+      # so it cannot drift from the rows it summarises.
+      if POLE_EQUATOR_POOL_VOLTAGES:
+        volts = volts + [POOLED_LABEL]
+      for volt in volts:
+        # cell_all keeps the vesicles with no measurable index. They are not
+        # missing data: the index is undefined exactly when no cortex peak is
+        # detected, which is what complete breakdown looks like. Dropping them
+        # silently would condition the late window on vesicles that STILL HAD
+        # a cortex at the end of it -- selecting against the very population
+        # in which a directional failure would show, and reporting the
+        # survivors as though they were the sample.
+        is_pooled = volt == POOLED_LABEL
+        if is_pooled:
+          cell_all = sub_w[sub_w["voltage"] != CONTROL_VOLTAGE]
+        else:
+          cell_all = sub_w[sub_w["voltage"] == volt]
+        cell = cell_all[cell_all["n_post"] > 0]
+        v = cell["pol_post"].dropna()
+        n_gone = int(len(cell_all) - len(v))
+        base = {
+            "stratum": s_label, "window": w_label,
+            "t_lo": lo, "t_hi": hi, "voltage": volt, "pooled": is_pooled,
+            "n_no_cortex": n_gone,
+            "n_exp": int(cell["experiment"].nunique()) if len(cell) else 0,
+        }
+        if v.empty:
+          rows.append({**base, "n_guv": 0,
+                       "frac_no_cortex": 1.0 if len(cell_all) else np.nan,
+                       "median_pol": np.nan, "q1": np.nan, "q3": np.nan,
+                       "ci_lo": np.nan, "ci_hi": np.nan,
+                       "resolution": np.nan, "median_pole": np.nan,
+                       "median_equator": np.nan,
+                       "boot_p_vs_zero": np.nan, "p_holm": np.nan,
+                       "ci_reliable": False, "resolved": False})
+          continue
+        # Clustered on experiment: vesicles in one chamber are not
+        # independent, and pooling voltages pools chambers as well, so an
+        # unclustered interval here would be badly overconfident. The p comes
+        # out of the same resampling, so it carries the same clustering.
+        ci_lo, ci_hi, half, p = _boot_median_ci(
+            v.to_numpy(float), clusters=cell.loc[v.index, "experiment"])
+        med = float(v.median())
+        excl_zero = bool(np.isfinite(ci_lo) and np.isfinite(ci_hi)
+                         and (ci_lo > 0 or ci_hi < 0))
+        over_sys = bool(not np.isfinite(sys_offset)
+                        or abs(med) > abs(sys_offset))
+        rows.append({**base, "n_guv": int(len(v)),
+                     "frac_no_cortex": float(n_gone / len(cell_all))
+                                       if len(cell_all) else np.nan,
+                     "median_pol": med,
+                     "q1": float(v.quantile(.25)),
+                     "q3": float(v.quantile(.75)),
+                     "ci_lo": ci_lo, "ci_hi": ci_hi, "resolution": half,
+                     "median_pole": float(cell["pole_post"].median()),
+                     "median_equator": float(cell["equator_post"].median()),
+                     "boot_p_vs_zero": p, "p_holm": np.nan,
+                     "ci_reliable": bool(base["n_exp"]
+                                         >= POLE_EQUATOR_MIN_CLUSTERS),
+                     "_excl_zero": excl_zero, "_over_sys": over_sys,
+                     "resolved": False})
+
+  tbl = pd.DataFrame(rows)
+  if tbl.empty:
+    print("  No window produced a usable value. Check that the record "
+          "reaches the window bounds in POLE_EQUATOR_WINDOWS.")
+    return tbl
+
+  # Multiplicity. Without this, `resolved` is a per-cell test run twenty-odd
+  # times per report and will flag roughly one cell per run by chance -- which
+  # is not a bug in the data but in the flag. Holm is applied within each
+  # (stratum, window) family across the per-voltage pulsed cells. The pooled
+  # row is excluded from that family and corrected separately across windows:
+  # it is one prespecified test per window, not one of many.
+  if "p_holm" in tbl.columns:
+    per_volt = (~tbl["pooled"].astype(bool)) & (tbl["voltage"] != CONTROL_VOLTAGE)
+    for (s_label, w_label), grp in tbl[per_volt].groupby(["stratum", "window"]):
+      tbl.loc[grp.index, "p_holm"] = holm(grp["boot_p_vs_zero"].to_numpy())
+    pooled_rows = tbl[tbl["pooled"].astype(bool)]
+    if not pooled_rows.empty:
+      for s_label, grp in pooled_rows.groupby("stratum"):
+        tbl.loc[grp.index, "p_holm"] = holm(
+            grp["boot_p_vs_zero"].to_numpy())
+    ctrl_rows = tbl[tbl["voltage"] == CONTROL_VOLTAGE]
+    tbl.loc[ctrl_rows.index, "p_holm"] = ctrl_rows["boot_p_vs_zero"]
+
+  if "_excl_zero" in tbl.columns:
+    ph = tbl["p_holm"]
+    tbl["resolved"] = (tbl["_excl_zero"].fillna(False).astype(bool)
+                       & tbl["_over_sys"].fillna(False).astype(bool)
+                       & tbl["ci_reliable"].fillna(False).astype(bool)
+                       & (ph.isna() | (ph < 0.05)))
+    tbl = tbl.drop(columns=["_excl_zero", "_over_sys"])
+  tbl.to_csv(out_path / "pole_equator_summary.csv", index=False,
+             float_format="%.4f")
+  per_guv.to_csv(out_path / "pole_equator_per_guv.csv", index=False,
+                 float_format="%.4f")
+
+  for s_label, _ in strata:
+    for w_label, lo, hi in POLE_EQUATOR_WINDOWS:
+      part = tbl[(tbl["stratum"] == s_label) & (tbl["window"] == w_label)]
+      print(f"\n  {s_label}, {w_label} window ({lo:.0f} to {hi:.0f} s)")
+      if part.empty:
+        print("    nothing measurable in this window")
+        continue
+      show = ["voltage", "n_guv", "n_exp", "n_no_cortex", "median_pol",
+              "ci_lo", "ci_hi", "resolution", "median_pole",
+              "median_equator", "boot_p_vs_zero", "p_holm", "ci_reliable",
+              "resolved"]
+      print(part[[c for c in show if c in part.columns]].to_string(index=False))
+      # A window in which neither pole nor equator has moved off 1.0 cannot
+      # answer the question either way, and reads as a null if not said.
+      moved = ((part[~part["pooled"].astype(bool)][["median_pole",
+                                                     "median_equator"]] - 1.0)
+               .abs().max().max())
+      if np.isfinite(moved) and moved < 0.05:
+        print(f"    Neither window has moved more than {moved:.3f} from its "
+              "pre-pulse level here, so there is no cortex loss yet to be "
+              "directional. Read this as 'nothing has happened', not as "
+              "'the loss is symmetric'.")
+      # A near-zero median with a long upper tail is a mixture, not a null:
+      # some vesicles are strongly polarised and the rest, having lost no
+      # cortex, sit at zero and outvote them. The median is the wrong summary
+      # for that and would be reported as "no effect" if only it were read.
+      mix_ref = max(abs(sys_offset) if np.isfinite(sys_offset) else 0.0, 0.01)
+      split = part[(~part["resolved"].astype(bool))
+                   & (~part["pooled"].astype(bool))
+                   & (part["q3"] > 4.0 * mix_ref)]
+      for _, r in split.iterrows():
+        print(f"    {r['voltage']}: median {r['median_pol']:+.3f} is not "
+              f"resolved but the upper quartile is {r['q3']:+.3f}. That is a "
+              "subset of vesicles moving while the rest sit at zero, not an "
+              "absent effect. Set POLE_EQUATOR_MIN_PEAK_DROP to test that "
+              "subset directly.")
+
+      # Vesicles whose cortex has gone entirely by this window. Reported per
+      # window because it grows with time and is the selection that would
+      # otherwise be invisible.
+      per_v = part[~part["pooled"].astype(bool)]
+      gone = per_v[per_v["n_no_cortex"] > 0]
+      if not gone.empty:
+        worst = gone.loc[gone["frac_no_cortex"].idxmax()]
+        total_gone = int(per_v["n_no_cortex"].sum())
+        print(f"    {total_gone} vesicle(s) have no detectable cortex peak "
+              f"anywhere in this window and so carry no index; worst at "
+              f"{worst['voltage']} ({int(worst['n_no_cortex'])} of "
+              f"{int(worst['n_no_cortex'] + worst['n_guv'])}, "
+              f"{worst['frac_no_cortex']:.0%}). The index exists only where a "
+              "cortex still does, so this window describes the vesicles that "
+              "had not finished breaking down -- which is a selection against "
+              "the ones most likely to be asymmetric.")
+
+      # The sensitivity statement, led by the pooled row where there is one.
+      # A null is only a result if it comes with the size of effect that
+      # would have been seen.
+      pooled_row = part[part["pooled"].astype(bool)]
+      if not pooled_row.empty:
+        r = pooled_row.iloc[0]
+        ctrl_row = part[part["voltage"] == CONTROL_VOLTAGE]
+        bound = float(np.nanmax([r["resolution"],
+                                 abs(sys_offset) if np.isfinite(sys_offset)
+                                 else 0.0]))
+        verdict = ("RESOLVED" if bool(r["resolved"]) else "not resolved")
+        print(f"    POOLED over pulsed conditions: median "
+              f"{r['median_pol']:+.4f}, CI [{r['ci_lo']:+.4f}, "
+              f"{r['ci_hi']:+.4f}], {int(r['n_guv'])} GUV(s) from "
+              f"{int(r['n_exp'])} experiment(s) -- {verdict}.")
+        # How much the clustering cost, since it varies with how correlated
+        # vesicles in a chamber turn out to be and is otherwise invisible. A
+        # ratio near 1 means the vesicles behaved independently and the
+        # pooled n is close to its face value; a large one means the
+        # effective n is much smaller than the vesicle count suggests.
+        pool_v = sub_w[(sub_w["voltage"] != CONTROL_VOLTAGE)
+                       & (sub_w["n_post"] > 0)]["pol_post"].dropna()
+        if len(pool_v) >= 3 and np.isfinite(r["resolution"]):
+          naive = _boot_median_ci(pool_v.to_numpy(float))[2]
+          if np.isfinite(naive) and naive > 0:
+            print(f"    Clustering on experiment widened that interval "
+                  f"{r['resolution'] / naive:.1f}x against treating vesicles "
+                  f"as independent. The vesicle count is "
+                  f"{int(r['n_guv'])}; the effective one is nearer "
+                  f"{int(r['n_guv']) / max((r['resolution'] / naive) ** 2, 1):.0f}.")
+        if not bool(r["resolved"]):
+          print(f"    Bounding that: the pooled median resolves to "
+                f"+/-{r['resolution']:.4f}"
+                + (f" and the systematic offset is {abs(sys_offset):.4f}"
+                   if np.isfinite(sys_offset) else "")
+                + f", so any pole-equator asymmetry common to the pulsed "
+                  f"conditions is below about {bound:.3f} on this index. "
+                  "Report the bound, not just the absence.")
+        if not ctrl_row.empty and np.isfinite(ctrl_row["median_pol"].iloc[0]):
+          cm = float(ctrl_row["median_pol"].iloc[0])
+          if abs(cm) >= abs(r["median_pol"]):
+            print(f"    The {CONTROL_VOLTAGE} control median is {cm:+.4f}, at "
+                  f"least as large as the pooled pulsed value "
+                  f"{r['median_pol']:+.4f}. A field-driven asymmetry cannot "
+                  "be largest where there is no field, so the spread across "
+                  "conditions is noise -- which supports the bound "
+                  "independently of the interval.")
+        print("    The per-voltage rows above stay the check on this: pooling "
+              "would hide an asymmetry confined to the highest fields.")
+
+      pulsed = part[(part["voltage"] != CONTROL_VOLTAGE)
+                    & (~part["pooled"].astype(bool))
+                    & part["n_guv"].ge(POLE_EQUATOR_MIN_GUV)]
+      unreliable = pulsed[~pulsed["ci_reliable"].astype(bool)]
+      if not unreliable.empty:
+        print(f"    {len(unreliable)} of {len(pulsed)} per-voltage cells come "
+              f"from fewer than {POLE_EQUATOR_MIN_CLUSTERS} experiments "
+              f"(here {int(pulsed['n_exp'].min())}-{int(pulsed['n_exp'].max())}"
+              "), so their intervals are too narrow to carry a verdict and "
+              "`resolved` is held False for them. Their medians are still "
+              "worth reading as a check on whether the pooled value hides a "
+              "pattern across voltage.")
+      hits = pulsed[pulsed["resolved"].astype(bool)]
+      if not hits.empty:
+        print(f"    Individually resolved after Holm: "
+              f"{', '.join(hits['voltage'])}.")
+      # Name the gate that actually blocked each near-miss. Printing only the
+      # adjusted p implies multiplicity was the reason even when it was not,
+      # and the three gates fail for genuinely different reasons.
+      near = pulsed[(~pulsed["resolved"].astype(bool))
+                    & pulsed["boot_p_vs_zero"].lt(0.05)]
+      for _, r in near.iterrows():
+        if not bool(r["ci_reliable"]):
+          why = (f"only {int(r['n_exp'])} experiment(s), below "
+                 f"{POLE_EQUATOR_MIN_CLUSTERS}, so the interval is not "
+                 "trustworthy")
+        elif np.isfinite(r["p_holm"]) and r["p_holm"] >= 0.05:
+          why = (f"Holm-adjusted p = {r['p_holm']:.3f} across the "
+                 f"{len(pulsed)} pulsed cells in this window")
+        elif np.isfinite(sys_offset) and abs(r["median_pol"]) <= abs(sys_offset):
+          why = (f"median {r['median_pol']:+.4f} does not exceed the "
+                 f"systematic offset {abs(sys_offset):.4f}, so it is a "
+                 "precise measurement of the offset rather than of an effect")
+        else:
+          why = "the interval includes zero"
+        print(f"    {r['voltage']}: raw p = {r['boot_p_vs_zero']:.3f}, but "
+              f"{why}. Not a finding.")
+
+      thin = part[(~part["pooled"].astype(bool))
+                  & (part["n_guv"] < POLE_EQUATOR_MIN_GUV)]["voltage"].tolist()
+      if thin:
+        print(f"    Fewer than {POLE_EQUATOR_MIN_GUV} GUVs at: "
+              f"{', '.join(thin)} -- indicative only.")
+
+  per_v = tbl[(tbl["voltage"] != CONTROL_VOLTAGE)
+              & (~tbl["pooled"].astype(bool))]
+  n_tests = int(len(per_v))
+  if n_tests > 1:
+    n_thin = int((~per_v["ci_reliable"].astype(bool)).sum())
+    print(f"\n  {n_tests} per-voltage tests are reported above. `resolved` "
+          "requires three things of a cell: an interval excluding zero, a "
+          "median above the systematic offset, and a Holm-adjusted p. Read "
+          "boot_p_vs_zero against p_holm and ci_reliable, not against 0.05.")
+    if n_thin:
+      print(f"  For {n_thin} of them the binding constraint is neither p nor "
+            f"the offset but the chamber count: below "
+            f"{POLE_EQUATOR_MIN_CLUSTERS} experiments the interval itself is "
+            "not trustworthy, so no p could rescue them.")
+  return tbl
+
+
+def plot_pole_equator_pooled(df: pd.DataFrame, outputs_root: str,
+                             output_dir: str, min_frac: float = 0.5):
+  """Pooled time course, then one per-GUV panel per post-pulse window.
+
+  Left panel mirrors plot_cortex_peak_timecourse (median and IQR per voltage,
+  drawn only where at least min_frac of the contributing GUVs are still
+  measurable). The window panels mirror plot_cortex_peak_breakdown (per-GUV
+  points with median and IQR against the 30 V control band).
+  """
+  out_path = sub_dir(output_dir, "cortex_breakdown")
+  out_path.mkdir(parents=True, exist_ok=True)
+
+  grid, by_voltage, per_guv = collect_pole_equator_traces(df, outputs_root)
+  if grid is None:
+    return
+
+  n_guv_total = per_guv.drop_duplicates(["experiment", "guv_id"]).shape[0]
+  print(f"\nPooled pole-vs-equator traces from {n_guv_total} cortex-bearing "
+        f"stagnate GUV(s) across {per_guv['experiment'].nunique()} "
+        "experiment(s).")
+
+  tbl = report_pole_equator(per_guv, out_path)
+
+  voltages = sorted(by_voltage, key=_voltage_key)
+  pulsed = [v for v in voltages if v != CONTROL_VOLTAGE]
+  cmap = mcolors.LinearSegmentedColormap.from_list(
+      "ep_blues", [PALETTE["pale_blue"], PALETTE["medium_blue"],
+                   PALETTE["dark_blue"]])
+  shades = {v: cmap(0.3 + 0.7 * i / max(len(pulsed) - 1, 1))
+            for i, v in enumerate(pulsed)}
+
+  t_hi_max = max(hi for _, _, hi in POLE_EQUATOR_WINDOWS)
+  n_panels = 1 + len(POLE_EQUATOR_WINDOWS)
+  fig, axes = plt.subplots(
+      1, n_panels,
+      figsize=fig_size("pole_equator_pooled", 6.0 * n_panels, 5.2, n_panels))
+  axes = np.atleast_1d(axes)
+
+  ax = axes[0]
+  win = grid <= t_hi_max
+  for volt in voltages:
+    arr = by_voltage[volt]["polarization"]
+    n_t = np.sum(np.isfinite(arr), axis=0)
+    enough = n_t >= max(2, int(np.ceil(min_frac * arr.shape[0])))
+    sel = win & enough
+    if not sel.any():
+      continue
+    med = np.nanmedian(arr[:, sel], axis=0)
+    q1 = np.nanpercentile(arr[:, sel], 25, axis=0)
+    q3 = np.nanpercentile(arr[:, sel], 75, axis=0)
+    is_ctrl = volt == CONTROL_VOLTAGE
+    colour = PALETTE["dark_red"] if is_ctrl else shades[volt]
+    ax.plot(grid[sel], med, color=colour, lw=2.0 if is_ctrl else 1.5,
+            ls="--" if is_ctrl else "-", zorder=5 if is_ctrl else 3,
+            label=f"{field_label(volt)} kV/cm (n={arr.shape[0]})")
+    ax.fill_between(grid[sel], q1, q3, color=colour, alpha=0.13, lw=0,
+                    zorder=2)
+  for _, lo, hi in POLE_EQUATOR_WINDOWS:
+    ax.axvspan(lo, hi, color=PALETTE["light_grey"], alpha=0.35, zorder=0)
+  ax.axhline(0.0, color=ANNOTATION_TEXT, lw=0.8, ls=":", zorder=1)
+  ax.axvline(0.0, color=ANNOTATION_TEXT, lw=0.8, ls="-", alpha=0.6, zorder=1)
+  ax.set_xlabel("time relative to pulse (s)")
+  ax.set_ylabel("polarization index  (equator $-$ pole) / (equator $+$ pole)")
+  ax.set_title("Pooled time course (shaded = summary windows)", fontsize=10)
+  ax.legend(frameon=False, fontsize=7, ncol=2, loc="lower left")
+  ax.grid(axis="y", linestyle="--", alpha=0.4)
+
+  usable = per_guv[per_guv["n_post"] > 0]
+  pre_first = per_guv.drop_duplicates(["experiment", "guv_id"])["pol_pre"]
+  pre_first = pre_first.dropna()
+  x_volts = [v for v in voltages if v != CONTROL_VOLTAGE]
+  rng = np.random.default_rng(0)
+
+  for ax, (w_label, lo, hi) in zip(axes[1:], POLE_EQUATOR_WINDOWS):
+    sub_w = usable[usable["window"] == w_label]
+    ctrl = sub_w[sub_w["voltage"] == CONTROL_VOLTAGE]["pol_post"].dropna()
+    if len(ctrl) >= 2:
+      ax.axhspan(float(ctrl.quantile(.25)), float(ctrl.quantile(.75)),
+                 color=PALETTE["pale_red"], alpha=0.55, zorder=0)
+      ax.axhline(float(ctrl.median()), color=PALETTE["dark_red"], lw=1.2,
+                 ls="--", zorder=1,
+                 label=f"{CONTROL_VOLTAGE} control (n={len(ctrl)})")
+    elif len(ctrl) == 1:
+      ax.axhline(float(ctrl.iloc[0]), color=PALETTE["dark_red"], lw=1.2,
+                 ls="--", zorder=1,
+                 label=f"{CONTROL_VOLTAGE} control (n=1)")
+    if len(ctrl) and len(ctrl) < MIN_CONTROL_N:
+      print(f"  NOTE: the {CONTROL_VOLTAGE} band in the {w_label} panel is "
+            f"drawn from {len(ctrl)} GUV(s), below MIN_CONTROL_N="
+            f"{MIN_CONTROL_N}. Indicative only.")
+    if len(pre_first) >= 3:
+      so = abs(float(pre_first.median()))
+      if so > 0:
+        ax.axhspan(-so, so, color=PALETTE["light_grey"], alpha=0.5, zorder=0,
+                   label="systematic offset (pre-pulse median)")
+
+    x = np.arange(len(x_volts))
+    for idx, volt in enumerate(x_volts):
+      cell = sub_w[sub_w["voltage"] == volt]
+      hi_drop = cell
+      if POLE_EQUATOR_MIN_PEAK_DROP is not None:
+        hi_drop = cell[cell["peak_drop_final"]
+                       >= float(POLE_EQUATOR_MIN_PEAK_DROP)]
+      vals = cell["pol_post"].dropna()
+      if vals.empty:
+        continue
+      jitter = rng.uniform(-0.16, 0.16, len(vals))
+      ax.scatter(x[idx] + jitter, vals.values, s=16, alpha=0.35,
+                 color=PALETTE["grey"], edgecolors="none", zorder=2)
+      hv = hi_drop["pol_post"].dropna()
+      if not hv.empty and POLE_EQUATOR_MIN_PEAK_DROP is not None:
+        jl = rng.uniform(-0.16, 0.16, len(hv))
+        ax.scatter(x[idx] + jl, hv.values, s=18, alpha=0.75,
+                   color=PALETTE["dark_blue"], edgecolors="none", zorder=3,
+                   label=("lost cortex" if idx == 0 else ""))
+        med2 = float(hv.median())
+        ax.plot([x[idx] - 0.26, x[idx] + 0.26], [med2, med2],
+                color=PALETTE["dark_blue"], lw=2.2, zorder=5)
+      med = float(vals.median())
+      ax.plot([x[idx] - 0.26, x[idx] + 0.26], [med, med],
+              color=PALETTE["grey"], lw=2.0, zorder=4)
+      ax.plot([x[idx], x[idx]],
+              [float(vals.quantile(.25)), float(vals.quantile(.75))],
+              color=PALETTE["grey"], lw=1.0, alpha=0.8, zorder=3)
+      # 95% CI on the median, drawn heavier than the IQR: the IQR is how much
+      # the vesicles differ from each other, the CI is how well the median is
+      # pinned down, and only the second says what the data can resolve.
+      c_lo, c_hi, _, _ = _boot_median_ci(vals.to_numpy(float))
+      if np.isfinite(c_lo):
+        ax.plot([x[idx], x[idx]], [c_lo, c_hi], color=PALETTE["dark_red"],
+                lw=2.6, alpha=0.9, solid_capstyle="butt", zorder=6,
+                label=("95% CI on median" if idx == 0 else ""))
+      ax.text(x[idx], 0.015, f"n={len(vals)}", ha="center", va="bottom",
+              fontsize=7, color=ANNOTATION_TEXT,
+              transform=ax.get_xaxis_transform())
+    ax.axhline(0.0, color="black", lw=0.8, ls="--", alpha=0.7)
+    ax.set_xticks(np.arange(len(x_volts)))
+    ax.set_xticklabels(field_labels(x_volts), rotation=45)
+    ax.set_xlabel(FIELD_AXIS_LABEL)
+    ax.set_title(f"{w_label}: per-GUV mean, {lo:.0f} to {hi:.0f} s",
+                 fontsize=10)
+    ax.legend(frameon=False, fontsize=7, loc="upper left")
+    ax.grid(axis="y", linestyle="--", alpha=0.4)
+
+  fig.suptitle("Directionality of cortex breakdown: poles vs equator\n"
+               "(> 0 = electrode-facing poles lose more actin; pooled "
+               "because a single vesicle is free to rotate)", fontsize=11)
+  style_figure("pole_equator_pooled")
+  fig.tight_layout(rect=(0, 0, 1, 0.90))
+  pdf_path = out_path / "guv_pole_equator_pooled.pdf"
+  fig.savefig(pdf_path, format="pdf", dpi=300)
+  plt.close(fig)
+  print(f"\nSaved pole/equator figure: {pdf_path}")
+  return tbl
+
+
+# Experiments whose actin trace cannot reach ENDPOINT_MATCHED_T_S. Module
+# level so add_cortex_peak_metrics can report them in one place: dropping a
+# whole experiment's cortex metrics is not something that should happen
+# without a line in the log, and on a 5 s frame grid an experiment can miss
+# the target by less than one frame.
+_ACTIN_SHORT = {}
+
+
 def load_actin_peak_metrics(exp_dir: Path) -> pd.DataFrame:
   files = [f for f in exp_dir.glob("**/*_actin_cortex_traces.csv")
            if RESULTS_SUBFOLDER not in f.parts]
@@ -1274,12 +2447,36 @@ def load_actin_peak_metrics(exp_dir: Path) -> pd.DataFrame:
     print(f"Skipping actin traces {files[0]}: {e}")
     return None
 
+  # Same matched-time rule as the dye endpoint. Without it peak_drop_final is
+  # still read at each record's own end, so the actin and dye halves of the
+  # same figure would be measured on different clocks.
+  t_col = tr["time_s"].to_numpy(float) if "time_s" in tr.columns else None
+  if ENDPOINT_MATCHED_T_S is not None:
+    if t_col is None:
+      print(f"  {exp_dir.name}: actin traces have no time_s column, so no "
+            "matched-time cortex endpoint is possible; skipped.")
+      return None
+    t_max = float(np.nanmax(t_col)) if np.isfinite(np.nanmax(t_col)) else np.nan
+    # Same tolerance as the dye endpoint, and it has to be the same number:
+    # an experiment admitted on the dye side and refused here would put a
+    # matched-time release magnitude and a missing cortex metric on the same
+    # vesicle, which is what the merge in add_cortex_peak_metrics then drops
+    # without saying so.
+    if (not np.isfinite(t_max)
+        or t_max < ENDPOINT_MATCHED_T_S - ENDPOINT_MATCHED_TOLERANCE_S):
+      _ACTIN_SHORT[exp_dir.name] = t_max
+      return None
+
   rows = []
   for col in tr.columns:
     m = re.match(r"GUV_(.+)_cortex_peak$", col)
     if not m:
       continue
-    vals = tr[col].dropna()
+    if ENDPOINT_MATCHED_T_S is None:
+      vals = tr[col].dropna()
+    else:
+      keep = pd.DataFrame({"t": t_col, "y": tr[col]}).dropna()
+      vals = keep.loc[keep["t"] <= ENDPOINT_MATCHED_T_S, "y"]
     if len(vals) < 2 * PEAK_N_FRAMES:
       continue
     burst = float(vals.iloc[:PEAK_N_FRAMES].median())
@@ -1297,6 +2494,7 @@ def load_actin_peak_metrics(exp_dir: Path) -> pd.DataFrame:
 def add_cortex_peak_metrics(df: pd.DataFrame, outputs_root: str) -> pd.DataFrame:
   root = Path(outputs_root)
   frames = []
+  _ACTIN_SHORT.clear()
   for exp_dir in sorted(p for p in root.iterdir() if p.is_dir()):
     if exp_dir.name == RESULTS_SUBFOLDER or is_excluded_experiment(exp_dir.name):
       continue
@@ -1305,6 +2503,15 @@ def add_cortex_peak_metrics(df: pd.DataFrame, outputs_root: str) -> pd.DataFrame
       continue
     pk["experiment"] = exp_dir.name
     frames.append(pk)
+  if _ACTIN_SHORT:
+    print(f"\nCortex peak metrics: {len(_ACTIN_SHORT)} experiment(s) have an "
+          f"actin trace ending before ENDPOINT_MATCHED_T_S = "
+          f"{ENDPOINT_MATCHED_T_S} and contribute no cortex metrics at all:")
+    for name, t_max in sorted(_ACTIN_SHORT.items(), key=lambda kv: kv[1]):
+      print(f"    ends {t_max:7.1f} s  {name}")
+    print("  On a 5 s frame grid an experiment can miss the target by less "
+          "than one frame, so check these against the target before reading "
+          "the cortex figures as a complete set.")
   if not frames:
     print("No actin traces found; cortex peak metrics skipped.")
     return df.iloc[0:0]
@@ -1382,8 +2589,8 @@ def plot_cortex_peak_breakdown(df: pd.DataFrame, output_dir: str):
 
   ax.axhline(0.0, color="black", lw=0.8, ls="--", alpha=0.7)
   ax.set_xticks(x)
-  ax.set_xticklabels(voltages, rotation=45)
-  ax.set_xlabel("Voltage")
+  ax.set_xticklabels(field_labels(voltages), rotation=45)
+  ax.set_xlabel(FIELD_AXIS_LABEL)
   ax.set_ylabel("Cortex peak height lost  (1 - I$_{peak}$ / I$_{peak,pre}$)")
   ax.set_title("Radial cortex peak breakdown, cortex-bearing GUVs\n"
                f"(median and IQR; band = {CONTROL_VOLTAGE} bleach "
@@ -1554,8 +2761,8 @@ def plot_released_fraction_by_voltage(df: pd.DataFrame, output_dir: str,
 
   ax.axhline(0.0, color="black", lw=0.8, ls="--", alpha=0.7)
   ax.set_xticks(x)
-  ax.set_xticklabels(voltages, rotation=45)
-  ax.set_xlabel("Voltage")
+  ax.set_xticklabels(field_labels(voltages), rotation=45)
+  ax.set_xlabel(FIELD_AXIS_LABEL)
   ax.set_ylabel("Released fraction  (I$_{pre}$ - I$_{final}$)")
   ax.set_title(
       f"Dye released per vesicle, by {what}\n"
@@ -1637,11 +2844,11 @@ def generate_separate_pdf_plots(df: pd.DataFrame, output_dir: str):
         )
 
   ax1.set_xticks(x)
-  ax1.set_xticklabels(voltages)
+  ax1.set_xticklabels(field_labels(voltages))
   ax1.set_title(
       "GUV Size Category Distribution\n(Ba = Bare, Br = Branched)"
   )
-  ax1.set_xlabel("Voltage")
+  ax1.set_xlabel(FIELD_AXIS_LABEL)
   ax1.set_ylabel("GUV Count")
   ax1.legend(title="Size Category", bbox_to_anchor=(1.02, 1), loc="upper left")
   ax1.grid(axis="y", linestyle="--", alpha=0.5)
@@ -1685,12 +2892,12 @@ def generate_separate_pdf_plots(df: pd.DataFrame, output_dir: str):
       s_idx += 1
 
   ax2.set_xticks(x)
-  ax2.set_xticklabels(voltages)
+  ax2.set_xticklabels(field_labels(voltages))
   ax2.set_title(
       "Stagnate GUV Intensity Breakdown\n(Pre-Pulse vs. Final"
       f" {ENDPOINT_N_FRAMES} Frames)"
   )
-  ax2.set_xlabel("Voltage")
+  ax2.set_xlabel(FIELD_AXIS_LABEL)
   ax2.set_ylabel("GUV Count")
   ax2.legend(
       title="Population / Behaviour", bbox_to_anchor=(1.02, 1), loc="upper left"
@@ -1754,8 +2961,8 @@ def generate_separate_pdf_plots(df: pd.DataFrame, output_dir: str):
         )
 
     ax3.set_xticks(np.arange(len(voltages)))
-    ax3.set_xticklabels(voltages, fontsize=9, rotation=45)
-    ax3.set_xlabel("Voltage")
+    ax3.set_xticklabels(field_labels(voltages), fontsize=9, rotation=45)
+    ax3.set_xlabel(FIELD_AXIS_LABEL)
     ax3.set_title(POPULATION_LABELS.get(pop, pop))
     ax3.set_ylim(bottom=0)
     ax3.grid(axis="y", linestyle="--", alpha=0.5)
@@ -1835,7 +3042,7 @@ def generate_separate_pdf_plots(df: pd.DataFrame, output_dir: str):
       if p_idx == 0:
         ax_v.set_ylabel("Normalized Intensity")
 
-    fig_v.suptitle(f"{v} — Size Group vs. Intensity Drop")
+    fig_v.suptitle(f"{field_label(v)} kV/cm — Size Group vs. Intensity Drop")
     style_figure("drop_by_size_per_voltage")
     plt.tight_layout()
 
@@ -1867,6 +3074,7 @@ if __name__ == "__main__":
       str(results_dir))
   report_bleach_comparability(outputs_root)
   plot_cortex_peak_timecourse(df_summary, outputs_root, str(results_dir))
+  plot_pole_equator_pooled(df_summary, outputs_root, str(results_dir))
   plot_cortex_contrast_histogram(df_summary, str(results_dir))
   report_cortex_status(df_summary)
 
