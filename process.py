@@ -228,6 +228,26 @@ def sub_dir(output_dir, key: str) -> Path:
 ENDPOINT_N_FRAMES = 3
 PRE_PULSE_TOLERANCE = 0.05
 INTENSITY_DIFF_THRESHOLD = 0.05
+
+# Fates dropped before any vesicle enters the bulk table.
+#
+# LOST_PREPULSE: the tracker lost the vesicle before the pulse was delivered,
+# so there is no post-pulse observation at all. Without this guard the row
+# falls through to the "Stagnate" default below and is counted as a survivor
+# of a pulse it never received.
+#
+# OUT_OF_FRAME: the vesicle left the measurable window. An early exit is the
+# same problem as LOST_PREPULSE; a late exit leaves a partial trace that is
+# real but censored at an unknown point, and the endpoint metrics (i_final,
+# frac_remaining_Xs) would read that censoring as a measurement. Both are
+# dropped, which is the conservative denominator: a vesicle that was not
+# watched to the end is not evidence that it survived.
+#
+# Dropping OUT_OF_FRAME here also decouples the Stagnate population from
+# OUT_OF_FRAME_CLEARANCE_R, which only decides RUPTURED vs OUT_OF_FRAME.
+# Moving that threshold can no longer shift the dye, tau, or susceptibility
+# results -- it is confined to the rupture fraction in 02_size_and_fate/.
+EXCLUDE_FATES = ("LOST_PREPULSE", "OUT_OF_FRAME")
 CORTEX_STATUS_ORDER = ["CORTEX", "AMBIGUOUS", "NO_CORTEX", "UNKNOWN"]
 TAU_REQUIRE_IDENTIFIABLE = True
 TAU_REQUIRE_RESPONDING = True
@@ -281,6 +301,10 @@ def load_cortex_status(exp_dir: Path) -> pd.DataFrame:
 def aggregate_pipeline_results(outputs_root: str) -> pd.DataFrame:
   root = Path(outputs_root)
   records = []
+  # Tally of rows dropped by EXCLUDE_FATES, per fate and per experiment, so
+  # the exclusion is visible in the run log rather than silent.
+  dropped_fates = {}
+  dropped_by_exp = {}
 
   all_fate = [f for f in root.glob("**/*_guv_fate_classification.csv")
               if RESULTS_SUBFOLDER not in f.parts]
@@ -330,6 +354,14 @@ def aggregate_pipeline_results(outputs_root: str) -> pd.DataFrame:
     for _, row in df_fate.iterrows():
       gid = str(row["guv_id"])
       raw_fate = str(row.get("fate", "")).upper()
+
+      # Vesicles without a usable post-pulse observation never reach the
+      # table. This must come before the size_cat mapping, whose else-branch
+      # would otherwise absorb them into "Stagnate".
+      if raw_fate in EXCLUDE_FATES:
+        dropped_fates[raw_fate] = dropped_fates.get(raw_fate, 0) + 1
+        dropped_by_exp[exp_dir.name] = dropped_by_exp.get(exp_dir.name, 0) + 1
+        continue
 
       if raw_fate == "GROWN":
         size_cat = "Grow"
@@ -435,6 +467,18 @@ def aggregate_pipeline_results(outputs_root: str) -> pd.DataFrame:
           "t_final_s": t_final_s,
           "n_final_used": n_final_used,
       })
+
+  if dropped_fates:
+    total = sum(dropped_fates.values())
+    kept = len(records)
+    print(f"\nEXCLUDED by fate (EXCLUDE_FATES): {total} GUVs dropped, "
+          f"{kept} retained")
+    for fate_name in sorted(dropped_fates):
+      print(f"  {fate_name}: {dropped_fates[fate_name]}")
+    worst = sorted(dropped_by_exp.items(), key=lambda kv: -kv[1])[:5]
+    print("  worst-affected experiments:")
+    for exp_name, n_dropped in worst:
+      print(f"    {n_dropped:>3}  {exp_name}")
 
   return pd.DataFrame(records)
 
