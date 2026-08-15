@@ -29,6 +29,33 @@ except Exception as _e:
   def is_excluded_experiment(name: str) -> bool:
     return any(re.search(pat, name) for pat in EXCLUDE_EXPERIMENTS)
 
+def _match_analysis_population(out):
+  """Keep only rows whose (experiment, guv_id) survives process.analysis_population."""
+  path = OUTPUTS_ROOT / RESULTS_SUBFOLDER / 'guv_bulk_summary.csv'
+  if not path.exists():
+    print(f"WARNING: {path} not found, so this report cannot be matched to "
+          "the analysis population. Its counts will not agree with the "
+          "other stages.")
+    return out
+  try:
+    import process
+    bulk = process.analysis_population(process.apply_cortex_split(
+        pd.read_csv(path)), verbose=False)
+  except Exception as _e:
+    print(f"WARNING: could not apply process.analysis_population "
+          f"({type(_e).__name__}: {_e}). Counts here may not match the "
+          "other stages.")
+    return out
+  keys = set(zip(bulk['experiment'].astype(str),
+                 bulk['guv_id'].astype('Int64')))
+  keep = [(str(e), pd.NA if pd.isna(g) else int(g)) in keys
+          for e, g in zip(out['experiment'], out['guv_id'])]
+  keep = pd.Series(keep, index=out.index)
+  print(f"Analysis population: {int(keep.sum())} of {len(out)} GUV(s) "
+        f"retained (matched to guv_bulk_summary.csv).")
+  return out[keep].copy()
+
+
 SE_RATIO_MAX = float(getattr(cfg, 'TAU_SE_RATIO_MAX', 0.5))
 TAU_OVER_RECORD_MAX = float(getattr(cfg, 'TAU_MAX_FRACTION_OF_RECORD', 1 / 3))
 
@@ -106,6 +133,19 @@ def load() -> pd.DataFrame:
     print(f"Size window {lo}-{hi} um: {int(keep.sum())} of {len(out)} GUV(s) "
           f"retained ({int((~keep).sum())} outside or unmeasured).")
     out = out[keep].copy()
+
+  # Restrict to the vesicles every other stage reports on.
+  #
+  # This report reads the per-experiment fit files, which carry no fate,
+  # endpoint or radius-stability column, so process.analysis_population cannot
+  # be applied to them directly. Matching on (experiment, guv_id) against the
+  # already-filtered bulk table gets the same population without restating the
+  # filter here, where it could drift.
+  #
+  # Without this the report ran on 363 GUVs while the susceptibility stage ran
+  # on fewer, and the identifiability percentages quoted next to a results
+  # table did not share its denominator.
+  out = _match_analysis_population(out)
 
   if EXCLUDE_GROUPS:
     drop = out['cortex_group'].isin(EXCLUDE_GROUPS)

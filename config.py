@@ -419,6 +419,48 @@ FOLDER_ACTIN    = os.path.join(OUTPUT_IMAGE_FOLDER, "actin")      # actin cortex
 EXPORT_TIME_POINTS_S     = [0, 50, 100, 200, 300]
 EXPORT_DEBUG_PLOTS       = True
 
+# -----------------------------------------------------------------------------
+# --- BULK ANALYSIS: SIZE WINDOW ---
+#
+# Radius range in micrometres that a vesicle must fall inside to enter the
+# bulk comparison between preparations. None disables the restriction.
+#
+# THIS IS THE ONLY PLACE THE WINDOW IS SET. process.py reads it from here and
+# every other bulk script reads it from process.py, so changing this number
+# changes the whole pipeline. Nothing else should define a radius range.
+#
+# Why it exists. The two preparations differ by 2.09 um in median radius
+# (6.58 for Bare against 4.49 for Branched cortex), and the induced
+# transmembrane potential scales with radius, so a comparison at matched
+# applied field is not a comparison at matched dose. The alternative is to
+# divide the dose axis by radius, which assumes the inverse radius-field
+# relationship Schwan's equation predicts; Mercadal et al. (2016) report that
+# this is often not observed experimentally, or is much shallower than
+# predicted. Restricting on size assumes nothing about how dose scales.
+#
+# Choice of width, measured on the stagnate vesicles with an endpoint:
+#
+#   window      Bare  cortex   median dR   p(size)   responding      p
+#   4.5-5.5       92      82     +0.03 um     0.27   4/92, 11/82   0.055
+#   4.25-5.75    124     126     +0.18 um    0.008   5/124, 19/126 0.004
+#   4.0-6.0      159     154     +0.41 um   <0.001   6/159, 20/154 0.004
+#
+# 4.0-6.0 is used. The narrow window matches almost exactly but leaves too
+# few vesicles per field to read most conditions. The residual 0.41 um at
+# 4.0-6.0 is detectable and must be reported rather than described as a
+# match, but it runs conservatively: Bare vesicles remain the larger, reach
+# the higher induced potential, and should porate more readily than they do.
+#
+# WHAT IS EXEMPT. The cortex-breakdown stages -- radial peak height, its time
+# course, and the pole-versus-equator index -- run on every vesicle regardless
+# of this setting. They describe the cortex-bearing population on its own and
+# contain no Bare-versus-Branched comparison, so the confound this window
+# removes is not present in them; inside the window they would lose three
+# quarters of their vesicles and the 30 V bleach reference they are read
+# against. run_bulk.py routes those stages to the unrestricted frame.
+# -----------------------------------------------------------------------------
+SIZE_WINDOW_UM = (4.0, 6.0)
+
 MICRONS_PER_PIXEL        = 0.11 # Plan Apo λ 60x Oil
 SCALE_BAR_LENGTH_MICRONS = 10
 

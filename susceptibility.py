@@ -12,8 +12,8 @@ Four questions, in the order they have to be answered:
 
   3. Does the FRACTION of vesicles that respond differ? A median over
      responders and non-responders together answers "what does a typical
-     vesicle do"; susceptibility is a dose-response question and needs the
-     responding fraction against dose.
+     vesicle do"; susceptibility asks how many respond at a given field and
+     needs the responding fraction against field strength.
 
   4. Does the difference survive treating the EXPERIMENT as the unit of
      replication? Vesicles in one chamber share a preparation, a field and a
@@ -31,26 +31,20 @@ it drops the ambiguous and unclassified vesicles (process.EXCLUDE_GROUPS).
 It rests on the provisional cortex_contrast thresholds in config.py; if
 those move, every figure here moves with them.
 
-The dose axis is the induced transmembrane potential at the pole, in volts:
+The x axis is the applied field strength in kV/cm, E = U / ELECTRODE_GAP_CM.
 
-    dV_m = 1.5 * E * R,   E = U / ELECTRODE_GAP_CM
+Nothing here is corrected for vesicle size. It does not need to be: process.py
+restricts the whole analysis to a radius window inside which the preparations
+are indistinguishable (SIZE_WINDOW_UM), so two vesicles at the same field are
+also at the same induced transmembrane potential, and the field is the whole
+of the treatment.
 
-Reported this way rather than as an applied voltage because the voltage is a
-property of this generator and this chamber and transfers to no other study,
-while the field and the potential it induces do. The gap is fixed by the
-3D-printed chamber and is NOT recorded per experiment in these outputs, so a
-session run with a different chamber would be silently mis-scaled. Set
-ELECTRODE_GAP_CM to whatever the chamber actually was.
-
-The conversion is one multiplicative constant, so quantile bin membership,
-every median and every test below are identical to the old V.um axis. Only
-the units change.
-
-The 1.5 factor is the steady-state Schwan result and assumes the pulse
-outlasts the membrane charging time. That holds here by a wide margin: with
-Cm = 1 uF/cm^2 and the measured outer conductivity of 416.1 uS/cm,
-tau_c = R*Cm*(1/sigma_in + 1/(2*sigma_out)) is 1-5 us across the observed
-radius range, against a 500 us pulse.
+That is a deliberate choice of the restriction over the correction. Dividing
+an axis by radius assumes the inverse radius-field relationship Schwan's
+equation predicts, and Mercadal et al. (2016) report that this is often not
+observed experimentally, or is far shallower than predicted. Matching on size
+assumes nothing about how the response scales, at the cost of most of the
+vesicles.
 
 In Spyder: open and press F5.
 """
@@ -80,15 +74,32 @@ except Exception:
 # -----------------------------------------------------------------------------
 
 OUTPUTS_ROOT = None        # None = config.PARENT_OUTPUT_FOLDER
-N_DOSE_BINS = 6            # quantile bins on the pooled dose axis
+# Vesicles a population must contribute at one field before that field is
+# plotted or tabulated. The applied fields are 11 discrete values, so there is
+# nothing to bin: each is its own condition. A condition of one or two
+# vesicles reports 0, 0.5 or 1 by construction and is not an estimate.
+MIN_N_PER_FIELD = 4
 MIN_BIN_N = 5              # a bin below this is dropped, not drawn thin
 SUBFOLDER = "07_susceptibility"
+
+# Highest field the dose series can be read across. Fields above this are
+# still measured, plotted and tabulated, but drawn broken and excluded from
+# any statement about how response varies with field, because the sessions
+# supplying them supply nothing else: at the top of the series the field axis
+# and the session axis are the same axis.
+#
+# The value is stated rather than derived so that it is reviewable, but
+# report_session_confound recomputes the cut from the session table on every
+# run and prints a warning if the data no longer agree with it. Set to None to
+# interpret the whole series.
+INTERPRETED_MAX_FIELD = 1.34
 
 # Keys are the group names process.assign_cortex_group emits; the order
 # here sets plotting and print order everywhere in this module.
 POP_LABEL = {"Bare": "Bare",
              "Branched, cortex": "Branched cortex",
              "Branched, lumenal only": "Branched lumenal only"}
+LUMEN_GROUP = "Branched, lumenal only"
 
 
 def outputs_root() -> Path:
@@ -104,7 +115,7 @@ def _colour(pop: str):
 
 
 # Electrode separation in the 3D-printed chamber, in centimetres. E = U / gap,
-# so this one number sets the whole dose axis. It is not recorded per
+# so this one number sets the whole x axis. It is not recorded per
 # experiment in the pipeline outputs and has to be stated here.
 ELECTRODE_GAP_CM = 0.3
 
@@ -127,15 +138,22 @@ def load_summary(results_dir: Path) -> pd.DataFrame:
         "applied. Every figure here would pool cortex-bearing and "
         "lumenal-only vesicles under one label. Fix the import first.")
   df = process.apply_cortex_split(df)
+  # The analysis population, defined once in process.py and applied here so
+  # that this module cannot report a denominator the kinetics stage does not
+  # share. See process.analysis_population for what it removes and why.
+  df = process.analysis_population(df)
 
   df["voltage_V"] = df["voltage"].astype(str).str.extract(r"(\d+)").astype(float)
-  # Field strength, and the potential it induces at the pole. Both are kept:
-  # the field is what a reader of another study can match their own protocol
-  # against, the potential is what the membrane responds to.
+  # Applied field strength. This is the treatment, and inside the size window
+  # it is also the whole of it -- no correction for radius is applied or
+  # needed. See the module docstring.
   df["field_kV_cm"] = df["voltage_V"] / ELECTRODE_GAP_CM / 1000.0
-  df["dvm_proxy"] = (1.5 * (df["voltage_V"] / (ELECTRODE_GAP_CM * 1e-2))
-                     * df["radius_um"] * 1e-6)
   df["released"] = -df["diff"]
+  # Acquisition session, from the yymmdd prefix the output folders carry.
+  # Chambers recorded on one day share a lipid film, a protein prep and a
+  # microscope alignment, so this is the coarsest unit that can confound the
+  # field axis, and the one that does.
+  df["session"] = df["experiment"].astype(str).str.extract(r"^(\d{6})")[0]
 
   present = [p for p in POP_LABEL if p in set(df["population"])]
   missing = [p for p in POP_LABEL if p not in present]
@@ -146,6 +164,132 @@ def load_summary(results_dir: Path) -> pd.DataFrame:
     print("  Not present at all: "
           + ", ".join(POP_LABEL[p] for p in missing))
   return df
+
+
+# Chambers a cell must have on BOTH sides before an interval is attempted.
+# A bootstrap over one or two clusters resamples the same chamber almost every
+# draw, so the interval it returns is a statement about that chamber's spread
+# and can exclude zero on three vesicles. Below this the difference is printed
+# without an interval rather than with a misleading one.
+MIN_CLUSTERS_FOR_CI = 3
+
+
+def cluster_diff(a: pd.DataFrame, b: pd.DataFrame, col: str = "efflux",
+                 n_boot: int = 5000, seed: int = 0):
+  """Difference in the fraction responding, b minus a, with a percentile
+  interval from resampling whole EXPERIMENTS.
+
+  Vesicles in one chamber share a preparation, a field and a day. Resampling
+  vesicles treats them as independent and returns an interval narrower than
+  the design supports; the unit of replication is the chamber. This replaced
+  a vesicle-level Fisher exact test, which had the same defect and reported it
+  as a p-value, which is harder to discount than a visibly wide interval.
+
+  With 5 to 8 chambers per cell the interval is wide. That is the honest
+  width, not a failure of the method.
+  """
+  if col not in a.columns or col not in b.columns:
+    return np.nan, np.nan, np.nan
+  ga = [x for _, x in a.groupby("experiment")]
+  gb = [x for _, x in b.groupby("experiment")]
+  obs = float(b[col].mean() - a[col].mean()) if len(a) and len(b) else np.nan
+  if min(len(ga), len(gb)) < MIN_CLUSTERS_FOR_CI:
+    return obs, np.nan, np.nan
+  rng = np.random.default_rng(seed)
+  draws = np.empty(n_boot)
+  for i in range(n_boot):
+    ra = pd.concat([ga[j] for j in rng.integers(0, len(ga), len(ga))])
+    rb = pd.concat([gb[j] for j in rng.integers(0, len(gb), len(gb))])
+    draws[i] = rb[col].mean() - ra[col].mean()
+  lo, hi = np.percentile(draws, [2.5, 97.5])
+  return obs, float(lo), float(hi)
+
+
+# --- Section 3: flatline vs efflux -------------------------------------------
+
+def report_section3(df: pd.DataFrame, out: Path) -> pd.DataFrame:
+  """Flatline against efflux, per field, for the three cortex groups.
+
+  Two exhaustive classes on the analysis population: a vesicle either holds
+  its intensity to within INTENSITY_DIFF_THRESHOLD or loses more than that.
+  Gainers and endpoint-less records are already gone, so the counts sum to n
+  and the efflux fraction is a proportion of the whole group rather than of
+  whatever survived an unstated filter.
+
+  Intensity is summarised as a MEAN. The median over a population that is
+  mostly flatlines is a statement about the flatlines: it sits near zero at
+  every field regardless of how much dye the responders lost.
+  """
+  d = df.copy()
+  d["efflux"] = d["released"] > process.INTENSITY_DIFF_THRESHOLD
+
+  rows = []
+  for (pop, E), cell in d.groupby(["population", "field_kV_cm"]):
+    n = len(cell)
+    k = int(cell["efflux"].sum())
+    rows.append({
+        "population": POP_LABEL.get(pop, pop),
+        "field_kV_cm": E,
+        "n": n,
+        "n_flatline": n - k,
+        "n_efflux": k,
+        "frac_efflux": k / n if n else np.nan,
+        "mean_released": cell["released"].mean(),
+        "mean_released_efflux": (cell.loc[cell["efflux"], "released"].mean()
+                                 if k else np.nan),
+        "chambers": cell["experiment"].nunique(),
+        "interpreted": interpreted(E),
+    })
+  tbl = pd.DataFrame(rows).sort_values(["population", "field_kV_cm"])
+  tbl.to_csv(out / "section3_flatline_vs_efflux.csv", index=False)
+
+  print("\n" + "=" * 70)
+  print("Section 3: flatline vs efflux on the analysis population")
+  print("=" * 70)
+  print(tbl.to_string(index=False, float_format=lambda v: f"{v:.4f}"))
+  print("  Fields marked interpreted=False share no session with any field "
+        "below them and are reported, not read.")
+
+  # Pooled cells. The series is split at the lowest field where the bare
+  # population first shows any efflux: below it one group is at zero and the
+  # other is not, which is the threshold claim, and pooling the two halves
+  # averages that separation away against the wider high-field cells.
+  ok = d[d["field_kV_cm"].map(interpreted)]
+  bare = ok[ok["population"] == "Bare"]
+  first = bare.loc[bare["efflux"], "field_kV_cm"]
+  cut = float(first.min()) if len(first) else np.inf
+  print(f"\n  Bare first shows efflux at {cut:.2f} kV/cm; the series is split "
+        f"there.")
+
+  for label, part in (("all interpreted fields", ok),
+                      (f"E < {cut:.2f} kV/cm", ok[ok["field_kV_cm"] < cut]),
+                      (f"E >= {cut:.2f} kV/cm", ok[ok["field_kV_cm"] >= cut])):
+    print(f"\n  {label}:")
+    ref = part[part["population"] == "Bare"]
+    for pop in POP_LABEL:
+      cell = part[part["population"] == pop]
+      if cell.empty:
+        continue
+      k, n = int(cell["efflux"].sum()), len(cell)
+      print(f"    {POP_LABEL[pop]:<22} {k:>3}/{n:<4} "
+            f"({k / n:5.1%})  {cell['experiment'].nunique():>2} chamber(s)  "
+            f"mean released {cell['released'].mean():+.4f}")
+    for pop in POP_LABEL:
+      if pop == "Bare" or ref.empty:
+        continue
+      cell = part[part["population"] == pop]
+      if cell.empty:
+        continue
+      diff, lo, hi = cluster_diff(ref, cell)
+      if not np.isfinite(lo):
+        print(f"    {POP_LABEL[pop]} minus Bare: {diff:+.3f} -- no interval, "
+              f"{min(ref['experiment'].nunique(), cell['experiment'].nunique())}"
+              f" chamber(s) on one side (need {MIN_CLUSTERS_FOR_CI})")
+        continue
+      verdict = "resolved" if (lo > 0 or hi < 0) else "not resolved"
+      print(f"    {POP_LABEL[pop]} minus Bare: {diff:+.3f} "
+            f"95% CI [{lo:+.3f}, {hi:+.3f}] -- {verdict}")
+  return tbl
 
 
 def wilson(k: int, n: int, z: float = 1.96):
@@ -222,7 +366,7 @@ def report_size_distributions(df: pd.DataFrame, out: Path):
                 + "; ".join(f"{r.group_a} vs {r.group_b}"
                             for r in big.itertuples()))
           print("  Any comparison at matched VOLTAGE therefore confounds "
-                "cortex with transmembrane potential; use the dose axis "
+                "cortex with transmembrane potential; check the size window "
                 "below.")
 
   fig, ax = plt.subplots(figsize=(7.5, 4.8))
@@ -243,108 +387,653 @@ def report_size_distributions(df: pd.DataFrame, out: Path):
   plt.close(fig)
 
 
-# --- 2 and 3. dose response --------------------------------------------------
+# --- 2 and 3. response against field strength --------------------------------
 
-def _dose_bins(sub: pd.DataFrame):
-  """Quantile edges on the POOLED dose, so both populations share them.
+def _field_cells(df: pd.DataFrame):
+  """Stagnate vesicles with a field and a release value, per population."""
+  return df[(df["size_category"] == "Stagnate")
+            & df["released"].notna()
+            & df["field_kV_cm"].notna()]
 
-  Binning each population separately would compare different dose ranges
-  under the same bin label, which is the error this whole script exists to
-  avoid.
+
+def interpreted(E) -> bool:
+  """Is this field inside the range the dose series can be read across?"""
+  if INTERPRETED_MAX_FIELD is None:
+    return True
+  return float(E) <= INTERPRETED_MAX_FIELD
+
+
+def _mark_uninterpreted(ax, fields):
+  """Shade the field range that is not read as a dose response.
+
+  Drawn rather than dropped. A silent gap at the top of a dose series invites
+  the reader to assume the missing conditions were unfavourable, and here
+  they were measured and are simply not separable from their session.
   """
-  q = np.linspace(0, 1, N_DOSE_BINS + 1)
-  edges = np.unique(np.nanquantile(sub["dvm_proxy"], q))
-  return edges if len(edges) >= 3 else None
+  if INTERPRETED_MAX_FIELD is None:
+    return
+  hi = [E for E in fields if not interpreted(E)]
+  if not hi:
+    return
+  lo_edge = INTERPRETED_MAX_FIELD + 0.05
+  ax.axvspan(lo_edge, max(hi) * 1.05, color=PALETTE["pale_red"], alpha=0.55,
+             lw=0, zorder=0)
+  ax.annotate("one session only;\nnot read as a dose response",
+              xy=((lo_edge + max(hi)) / 2, 0.72),
+              xycoords=("data", "axes fraction"), ha="center", fontsize=7.5,
+              color=PALETTE["grey"], zorder=1)
 
 
-def plot_dose_response(df: pd.DataFrame, out: Path):
-  sub = df[df["dvm_proxy"].notna()]
-  stag = sub[sub["size_category"] == "Stagnate"]
+def plot_field_response(df: pd.DataFrame, out: Path):
+  """Release magnitude and responding fraction against applied field.
+
+  One point per field per population, not per bin. The eleven amplitudes are
+  discrete conditions and binning them would only blur conditions together
+  that were never mixed in the first place.
+
+  Both panels are reported because they answer different questions and can
+  disagree. The mean release is what left the vesicles and needs no
+  threshold; the responding fraction counts how many crossed one. A
+  population where a few vesicles empty and the rest do nothing shows a high
+  mean and a low fraction, and the two together say which is happening.
+  """
+  stag = _field_cells(df)
   if stag.empty:
-    print("Dose response skipped: no stagnate GUVs with a radius.")
+    print("Field response skipped: no stagnate GUVs with a release value.")
     return
-  edges = _dose_bins(stag)
-  if edges is None:
-    print("Dose response skipped: dose range too narrow to bin.")
-    return
-  centres = 0.5 * (edges[:-1] + edges[1:])
   pops = [p for p in POP_LABEL if p in set(stag["population"])]
+  rng = np.random.default_rng(0)
 
   fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12.5, 5.0))
-  rows = []
+  rows, thin = [], []
   for pop in pops:
-    p_df = stag[stag["population"] == pop].copy()
-    p_df["bin"] = pd.cut(p_df["dvm_proxy"], edges, include_lowest=True,
-                         labels=False)
-    xs, med, lo, hi, frac, f_lo, f_hi = [], [], [], [], [], [], []
-    for i in range(len(centres)):
-      cell = p_df[p_df["bin"] == i]
-      if len(cell) < MIN_BIN_N:
-        continue
-      rel = cell["released"].dropna()
-      # dropna, not fillna(False): under process.ENDPOINT_MATCHED_T_S a
-      # censored vesicle has no response call at all, and scoring it as a
-      # non-responder would put every censored GUV in the denominator as
-      # evidence of not responding.
-      resp = cell["is_responding"].dropna().astype(bool)
-      if resp.empty:
-        continue
-      xs.append(float(cell["dvm_proxy"].median()))
-      med.append(rel.median())
-      lo.append(rel.quantile(.25))
-      hi.append(rel.quantile(.75))
-      k, n = int(resp.sum()), len(resp)
-      frac.append(k / n)
-      a, b = wilson(k, n)
-      f_lo.append(a)
-      f_hi.append(b)
-      rows.append({"population": POP_LABEL[pop],
-                   "dose_lo": edges[i], "dose_hi": edges[i + 1],
-                   "dose_median": float(cell["dvm_proxy"].median()),
-                   "n": n, "median_released": rel.median(),
-                   "frac_responding": k / n, "ci_lo": a, "ci_hi": b})
-    if not xs:
-      continue
+    p_df = stag[stag["population"] == pop]
     c = _colour(pop)
-    ax1.scatter(p_df["dvm_proxy"], p_df["released"], s=8, alpha=0.25,
+    xs, mean_r, lo_r, hi_r, frac, f_lo, f_hi = [], [], [], [], [], [], []
+    for E, cell in p_df.groupby("field_kV_cm"):
+      v = cell["released"].dropna().to_numpy(float)
+      if len(v) < MIN_N_PER_FIELD:
+        thin.append((POP_LABEL[pop], E, len(v)))
+        continue
+      boot = np.mean(v[rng.integers(0, len(v), (4000, len(v)))], axis=1)
+      resp = cell["is_responding"].dropna().astype(bool)
+      k, n = int(resp.sum()), int(len(resp))
+      wl, wh = wilson(k, n) if n else (np.nan, np.nan)
+      xs.append(E)
+      mean_r.append(v.mean())
+      lo_r.append(np.percentile(boot, 2.5))
+      hi_r.append(np.percentile(boot, 97.5))
+      frac.append(k / n if n else np.nan)
+      f_lo.append(wl)
+      f_hi.append(wh)
+      rows.append({"population": POP_LABEL[pop], "field_kV_cm": E,
+                   "n": len(v), "median_released": float(np.median(v)),
+                   "mean_released": float(v.mean()),
+                   "mean_ci_lo": float(np.percentile(boot, 2.5)),
+                   "mean_ci_hi": float(np.percentile(boot, 97.5)),
+                   "n_with_call": n, "n_responding": k,
+                   "frac_responding": (k / n if n else np.nan),
+                   "frac_ci_lo": wl, "frac_ci_hi": wh,
+                   "interpreted": interpreted(E),
+                   "sessions": ",".join(sorted(cell["session"].dropna()
+                                               .unique()))})
+    ax1.scatter(p_df["field_kV_cm"], p_df["released"], s=8, alpha=0.22,
                 color=c, edgecolors="none")
-    ax1.plot(xs, med, "-o", color=c, lw=2, ms=5, label=POP_LABEL[pop])
-    ax1.fill_between(xs, lo, hi, color=c, alpha=0.15, lw=0)
-    ax2.plot(xs, frac, "-o", color=c, lw=2, ms=5, label=POP_LABEL[pop])
-    ax2.fill_between(xs, f_lo, f_hi, color=c, alpha=0.18, lw=0)
+    # Drawn as two segments rather than one line. Joining a point that is
+    # read as a dose response to one that is not asserts a trend across the
+    # break, which is the reading the break exists to prevent.
+    xs = np.asarray(xs, float)
+    for keep, style in ((np.array([interpreted(E) for E in xs], bool),
+                         dict(ls="-", mfc=c, label=POP_LABEL[pop])),
+                        (np.array([not interpreted(E) for E in xs], bool),
+                         dict(ls="--", mfc="white", label=None))):
+      if not keep.any():
+        continue
+      x_k = xs[keep]
+      for ax, mid, lo_v, hi_v, alpha in (
+          (ax1, mean_r, lo_r, hi_r, 0.15), (ax2, frac, f_lo, f_hi, 0.18)):
+        y = np.asarray(mid)[keep]
+        lo_a, hi_a = np.asarray(lo_v)[keep], np.asarray(hi_v)[keep]
+        ax.plot(x_k, y, "o", ls=style["ls"], color=c, lw=2, ms=5,
+                mfc=style["mfc"], label=style["label"])
+        if style["ls"] == "-":
+          ax.fill_between(x_k, lo_a, hi_a, color=c, alpha=alpha, lw=0)
+        else:
+          # Bars, not a band. A filled interval reads as a curve with a
+          # width, and these conditions are not a curve -- they are separate
+          # estimates that happen to sit next to each other.
+          ax.errorbar(x_k, y, yerr=[np.clip(y - lo_a, 0, None),
+                                    np.clip(hi_a - y, 0, None)],
+                      fmt="none", ecolor=c, elinewidth=0.9, capsize=2,
+                      alpha=0.8)
 
   ax1.axhline(0, color=PALETTE["grey"], lw=0.8, ls="--")
-  ax1.set_ylabel("released fraction")
-  ax1.set_title("Release magnitude vs dose", fontsize=10)
+  ax1.set_ylabel("released fraction of lumenal signal")
+  ax1.set_title("Release magnitude (mean, bootstrap 95% CI)", fontsize=10)
   ax2.set_ylabel("fraction responding")
   ax2.set_ylim(-0.02, 1.02)
-  ax2.set_title("Responding fraction vs dose (Wilson 95% CI)", fontsize=10)
+  ax2.set_title("Responding fraction (Wilson 95% CI)", fontsize=10)
+  all_fields = sorted(stag["field_kV_cm"].dropna().unique())
   for ax in (ax1, ax2):
-    ax.set_xlabel(r"induced transmembrane potential  $\Delta V_m = 1.5\,E\,R$  (V)")
+    ax.set_xlabel("field strength (kV/cm)")
     ax.legend(frameon=False, fontsize=9)
     ax.grid(alpha=0.35, linestyle="--")
-  fig.suptitle("Vesicle groups at matched transmembrane potential\n"
-               "(shared dose bins; stagnate GUVs)", fontsize=11)
+    _mark_uninterpreted(ax, all_fields)
+  cut = ("" if INTERPRETED_MAX_FIELD is None else
+         f"; open markers above {INTERPRETED_MAX_FIELD} kV/cm are one session")
+  fig.suptitle("Vesicle groups at matched radius and matched field\n"
+               f"(stagnate GUVs; fields with < {MIN_N_PER_FIELD} vesicles "
+               f"omitted{cut})", fontsize=11)
   fig.tight_layout(rect=(0, 0, 1, 0.91))
-  fig.savefig(out / "dose_response_by_population.pdf", dpi=300)
+  fig.savefig(out / "field_response_by_population.pdf", dpi=300)
   plt.close(fig)
 
   if rows:
-    tbl = pd.DataFrame(rows)
-    tbl.to_csv(out / "dose_response_summary.csv", index=False)
-    print("\nDose response (shared bins on voltage x radius):")
-    print(tbl.to_string(index=False))
-    widths = tbl["dose_hi"] - tbl["dose_lo"]
-    if len(widths) and widths.max() > 3 * widths.median():
-      w = tbl.loc[widths.idxmax()]
-      print(f"\n  NOTE: the bin {w['dose_lo']:.2f}-{w['dose_hi']:.2f} V is "
-            f"{widths.max() / widths.median():.1f}x wider than the median bin. "
-            "Quantile bins spread out where the data thins, so this one pools "
-            "doses that are not really comparable -- treat any reversal in it "
-            "as unresolved rather than as a turning point.")
+    tbl = pd.DataFrame(rows).sort_values(["population", "field_kV_cm"])
+    tbl.to_csv(out / "field_response_summary.csv", index=False)
+    print("\nResponse against applied field strength (no size correction):")
+    print(tbl.to_string(index=False, float_format=lambda x: f"{x:.4f}"))
+  if thin:
+    print(f"\n  {len(thin)} population-field cell(s) below "
+          f"{MIN_N_PER_FIELD} vesicles and omitted:")
+    for lab, E, n in sorted(thin, key=lambda t: (t[0], t[1])):
+      print(f"    {lab:<24} {E:.2f} kV/cm  n={n}")
 
 
-# --- 4. experiment as the unit of replication --------------------------------
+# --- 3b. is the field axis also the session axis? ----------------------------
+
+def _suggested_field_cut(sess_by_field: dict):
+  """Highest field below the largest top block that shares no session.
+
+  Walks down from the top of the series and stops at the first field whose
+  sessions also appear lower down. Everything above that point was recorded
+  in sessions that contributed nothing else, so within it a change in
+  response cannot be attributed to the field. Returns None when no such block
+  exists, which is the outcome to want.
+  """
+  fields = sorted(sess_by_field)
+  cut_idx = len(fields)
+  # Every split is tested rather than scanning until the first overlap.
+  # Disjointness is not monotonic in the split point: the top field usually
+  # shares its session with the field just below it, which would stop the
+  # scan before it reached the block boundary that matters.
+  for i in range(1, len(fields)):
+    upper = set().union(*[sess_by_field[f] for f in fields[i:]])
+    lower = set().union(*[sess_by_field[f] for f in fields[:i]])
+    if not (upper & lower):
+      cut_idx = i
+      break
+  return fields[cut_idx - 1] if cut_idx < len(fields) else None
+
+
+def report_session_confound(df: pd.DataFrame, out: Path):
+  """Which sessions supplied which fields, and how much that matters.
+
+  Every other check in this module asks whether the two preparations differ.
+  This one asks whether the x axis means what it says. If a field is supplied
+  by sessions that supply no other field, then its response rate carries the
+  session as well as the field, and the two cannot be told apart by any
+  amount of resampling within it.
+  """
+  sub = _field_cells(df)
+  if sub.empty or sub["session"].isna().all():
+    print("Session check skipped: no session could be parsed from the "
+          "experiment names.")
+    return
+
+  counts = (sub.groupby(["field_kV_cm", "session"]).size()
+            .unstack(fill_value=0).sort_index())
+  counts.to_csv(out / "field_session_counts.csv")
+  print(f"\n{'=' * 70}")
+  print("Vesicles per field and session (is the dose axis also a date axis?)")
+  print("=" * 70)
+  print(counts.to_string())
+
+  rate = (sub.groupby("session")["is_responding"]
+          .agg(n="count", responding="sum"))
+  rate["frac"] = rate["responding"] / rate["n"]
+  print("\nResponding fraction per session, pooled over fields and groups:")
+  print(rate.to_string(float_format=lambda x: f"{x:.3f}"))
+  if len(rate) > 1 and rate["frac"].min() > 0:
+    print(f"  Between-session spread: {rate['frac'].min():.1%} to "
+          f"{rate['frac'].max():.1%}, a factor of "
+          f"{rate['frac'].max() / rate['frac'].min():.1f}. Any field carried "
+          "by one session inherits that spread.")
+
+  sess_by_field = {E: set(g["session"].dropna())
+                   for E, g in sub.groupby("field_kV_cm")}
+  # Within a field, the groups have to come from the same sessions or the
+  # comparison at that field carries the session too. Most fields here are
+  # supplied by one session, which is harmless as long as both groups sit in
+  # it; what is not harmless is the two groups sitting in different ones.
+  for E, g in sub.groupby("field_kV_cm"):
+    per_pop = {p: set(x["session"].dropna())
+               for p, x in g.groupby("population") if len(x) >= MIN_N_PER_FIELD}
+    if len(per_pop) < 2:
+      continue
+    sets = list(per_pop.values())
+    if all(s == sets[0] for s in sets):
+      continue
+    detail = "; ".join(f"{POP_LABEL.get(p, p)} {','.join(sorted(s))}"
+                       for p, s in per_pop.items())
+    disjoint = all(not (x & y) for i, x in enumerate(sets)
+                   for y in sets[i + 1:])
+    print(f"\n{'  WARNING: ' if disjoint else '  Note: '}"
+          f"at {E:.2f} kV/cm the groups do not come from the same sessions "
+          f"({detail})."
+          + (" They share none, so this field cannot separate the groups "
+             "from their sessions." if disjoint else ""))
+
+  cut = _suggested_field_cut(sess_by_field)
+  if cut is None:
+    print("No block of top fields is session-isolated; the whole series is "
+          "readable as a dose response.")
+  else:
+    print(f"\nFields above {cut:.2f} kV/cm share no session with any field "
+          "below them, so across that break the dose axis and the session "
+          "axis cannot be separated.")
+  if INTERPRETED_MAX_FIELD is not None and cut is not None \
+      and abs(cut - INTERPRETED_MAX_FIELD) > 0.05:
+    print(f"  WARNING: INTERPRETED_MAX_FIELD is {INTERPRETED_MAX_FIELD} but "
+          f"the session table implies {cut:.2f}. The figures are drawn "
+          "against the setting, not against the data. Update it or explain "
+          "the difference.")
+  elif INTERPRETED_MAX_FIELD is None and cut is not None:
+    print("  WARNING: INTERPRETED_MAX_FIELD is None, so the figures draw an "
+          "unbroken dose curve across that break.")
+
+  # --- figure ---------------------------------------------------------------
+  pops = [p for p in POP_LABEL if p in set(sub["population"])]
+  sessions = sorted(sub["session"].dropna().unique())
+  marks = ["o", "s", "^", "D", "v", "P"]
+  fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11.5, 4.4),
+                                 gridspec_kw={"width_ratios": [1.6, 1]})
+  for pop in pops:
+    for j, s in enumerate(sessions):
+      cell = sub[(sub["population"] == pop) & (sub["session"] == s)]
+      g = cell.groupby("field_kV_cm")["is_responding"].agg(["count", "sum"])
+      g = g[g["count"] >= 3]
+      if g.empty:
+        continue
+      ax1.scatter(g.index, g["sum"] / g["count"],
+                  s=12 + 2.2 * g["count"], marker=marks[j % len(marks)],
+                  color=_colour(pop), edgecolors="white", linewidth=0.5,
+                  zorder=3)
+  _mark_uninterpreted(ax1, sorted(sess_by_field))
+  ax1.set_xlabel("field strength (kV/cm)")
+  ax1.set_ylabel("fraction responding")
+  ax1.set_ylim(-0.05, 1.05)
+  ax1.set_title("Response against field, split by session", fontsize=10)
+  handles = ([plt.Line2D([], [], marker=marks[j % len(marks)], ls="",
+                         mfc="none", mec=PALETTE["grey"],
+                         color=PALETTE["grey"], ms=5, label=s)
+              for j, s in enumerate(sessions)]
+             + [plt.Line2D([], [], marker="o", ls="", color=_colour(p), ms=5,
+                           label=POP_LABEL[p]) for p in pops])
+  ax1.legend(handles=handles, frameon=False, fontsize=7.5, ncol=2,
+             loc="upper left", handletextpad=0.4, columnspacing=1.0)
+
+  ax2.bar(range(len(rate)), rate["frac"], color=PALETTE["light_blue"],
+          edgecolor=PALETTE["dark_blue"], lw=0.8)
+  for i, (n, f) in enumerate(zip(rate["n"], rate["frac"])):
+    ax2.text(i, f + 0.004, f"n={int(n)}", ha="center", fontsize=7.5,
+             color=PALETTE["grey"])
+  ax2.set_xticks(range(len(rate)))
+  ax2.set_xticklabels(rate.index, rotation=45, ha="right", fontsize=8)
+  ax2.set_ylabel("fraction responding")
+  ax2.set_title("Response per session, pooled", fontsize=10)
+  fig.tight_layout()
+  fig.savefig(out / "field_response_by_session.pdf", dpi=300)
+  plt.close(fig)
+
+
+# --- 3c. endpoint distribution and the block that is not interpreted ---------
+
+try:
+  from process import INTENSITY_DIFF_THRESHOLD as INTACT_BAND
+except Exception:
+  INTACT_BAND = 0.05
+
+# Emit \input-able tables alongside the figures. The alternative is copying
+# counts out of the console into the thesis by hand, which is where the
+# transcription errors come from.
+WRITE_LATEX_TABLES = True
+LATEX_SUBFOLDER = "latex"
+
+
+def endpoint_classes(df: pd.DataFrame) -> pd.DataFrame:
+  """Per population and field: how each vesicle ended, and whether it scored.
+
+  Four mutually exclusive outcomes plus the response call, which is a
+  separate measurement of the same trace and is therefore reported beside
+  them rather than derived from them.
+  """
+  sub = _field_cells(df).copy()
+  sub["intact"] = sub["diff"].abs() <= INTACT_BAND
+  sub["lost"] = sub["diff"] < -INTACT_BAND
+  sub["gained"] = sub["diff"] > INTACT_BAND
+  rows = []
+  for (pop, E), cell in sub.groupby(["population", "field_kV_cm"]):
+    resp = cell["is_responding"].dropna().astype(bool)
+    rows.append({"population": pop, "field_kV_cm": E, "n": len(cell),
+                 "n_intact": int(cell["intact"].sum()),
+                 "n_lost": int(cell["lost"].sum()),
+                 "n_gained": int(cell["gained"].sum()),
+                 "n_responding": int(resp.sum()),
+                 "frac_intact": float(cell["intact"].mean()),
+                 "median_released": float(cell["released"].median()),
+                 "interpreted": interpreted(E)})
+  out = pd.DataFrame(rows)
+  if out.empty:
+    return out
+  out["population"] = pd.Categorical(out["population"],
+                                     [p for p in POP_LABEL], ordered=True)
+  return out.sort_values(["population", "field_kV_cm"]).reset_index(drop=True)
+
+
+def plot_endpoint_distribution(df: pd.DataFrame, out: Path):
+  """Where the endpoint change actually sits, and the intact fraction.
+
+  The trajectory figure draws one line per vesicle, so a mode of two hundred
+  vesicles at zero renders as a solid block while a dozen extreme traces
+  dominate the eye. That reads as two groups whether or not there are two.
+  A count axis settles it.
+  """
+  sub = _field_cells(df)
+  if sub.empty:
+    print("Endpoint distribution skipped: nothing to plot.")
+    return
+  cls = endpoint_classes(df)
+  pops = [p for p in POP_LABEL if p in set(sub["population"])]
+
+  fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11.0, 4.2),
+                                 gridspec_kw={"width_ratios": [1.15, 1]})
+  # Full range, not a percentile: clipping the axis at the 99th percentile
+  # would fold the largest releases into the last bin, and those are the
+  # vesicles the tail is being drawn to characterise.
+  hi = float(np.nanmax(sub["released"]))
+  edges = np.arange(-0.10, max(0.15, hi + 0.05), 0.025)
+  bottom = np.zeros(len(edges) - 1)
+  for pop in pops:
+    v = sub[sub["population"] == pop]["released"].clip(edges[0],
+                                                       edges[-1] - 1e-9)
+    h, _ = np.histogram(v, bins=edges)
+    ax1.bar(edges[:-1], h, width=np.diff(edges), bottom=bottom, align="edge",
+            color=_colour(pop), lw=0.3, edgecolor="white",
+            label=POP_LABEL[pop])
+    bottom += h
+  ax1.axvspan(-INTACT_BAND, INTACT_BAND, color=PALETTE["pale_blue"],
+              alpha=0.55, lw=0, zorder=0)
+  # Symlog, not log: the mode is two orders of magnitude above the tail and a
+  # linear axis hides the tail entirely, but a plain log axis cannot show the
+  # empty bins between the two.
+  ax1.set_yscale("symlog", linthresh=10)
+  ax1.set_xlabel("released fraction at the matched endpoint")
+  ax1.set_ylabel("vesicles")
+  ax1.set_title("Endpoint change, all fields", fontsize=10)
+  ax1.legend(frameon=False, fontsize=8, loc="upper right")
+
+  # Counts are annotated only for the two populations the section compares.
+  # The lumenal-only group has three usable fields and its labels land on top
+  # of the other two where all three sit at 100%.
+  for pop, dy in zip(pops, (9, -14, -14)):
+    m = cls[(cls["population"] == pop) & (cls["n"] >= MIN_N_PER_FIELD)
+            & cls["interpreted"]]
+    if m.empty:
+      continue
+    ax2.plot(m["field_kV_cm"], 100 * m["frac_intact"], "-o",
+             color=_colour(pop), lw=1.8, ms=5, label=POP_LABEL[pop])
+    if pop == LUMEN_GROUP:
+      # Its labels land on top of the other two where all three sit at 100%,
+      # and its three usable fields are already in the table.
+      continue
+    for _, r in m.iterrows():
+      ax2.annotate(f"{int(r['n'])}", (r["field_kV_cm"],
+                                      100 * r["frac_intact"]),
+                   textcoords="offset points", xytext=(0, dy), ha="center",
+                   fontsize=6.5, color=_colour(pop))
+  ax2.set_xlabel("field strength (kV/cm)")
+  ax2.set_ylabel(f"vesicles ending within {INTACT_BAND:.0%} (%)")
+  ax2.set_title("Intact fraction, interpreted range", fontsize=10)
+  ax2.legend(frameon=False, fontsize=8, loc="lower left")
+
+  fig.tight_layout()
+  fig.savefig(out / "endpoint_distribution.pdf", dpi=300)
+  plt.close(fig)
+  cls.to_csv(out / "endpoint_classes.csv", index=False)
+
+  tot = _field_cells(df)
+  n_in = int((tot["diff"].abs() <= INTACT_BAND).sum())
+  n_lo = int((tot["diff"] < -INTACT_BAND).sum())
+  n_hi = int((tot["diff"] > INTACT_BAND).sum())
+  print(f"\nEndpoint outcome, all {len(tot)} vesicles: {n_in} within "
+        f"{INTACT_BAND:.0%}, {n_lo} lost more, {n_hi} gained more.")
+  losses = -tot.loc[tot["diff"] < -INTACT_BAND, "diff"]
+  for lo_e, hi_e in ((INTACT_BAND, 0.10), (0.10, 0.20), (0.20, 0.40),
+                     (0.40, np.inf)):
+    n = int(((losses > lo_e) & (losses <= hi_e)).sum())
+    print(f"    {lo_e:.2f} to {hi_e:.2f}: {n}")
+  print("  A tail that thins away from the band is a graded response; two "
+        "separated humps would be a binary one. Read this before describing "
+        "the trajectory figure.")
+
+
+def report_uninterpreted_block(df: pd.DataFrame, out: Path):
+  """Why the fields above the cut are excluded, tested rather than asserted.
+
+  Three things could make a block of high fields respond less than the
+  fields below it without the field being the cause: too few vesicles to
+  see anything, loss of the vesicles that did respond before they were
+  scored, or traces those vesicles could not be scored on. Each is checkable
+  from the frame already loaded, and each is checked here so the exclusion
+  rests on a measurement rather than on the fact that it looks odd.
+  """
+  if INTERPRETED_MAX_FIELD is None:
+    return
+  sub = _field_cells(df)
+  hi = sub[~sub["field_kV_cm"].apply(interpreted)]
+  if hi.empty:
+    return
+  ref_E = max(E for E in sub["field_kV_cm"].unique() if interpreted(E))
+  ref = sub[sub["field_kV_cm"] == ref_E]
+  k_ref, n_ref = int(ref["is_responding"].sum()), len(ref)
+  k_hi, n_hi = int(hi["is_responding"].sum()), len(hi)
+  p_ref = k_ref / n_ref if n_ref else np.nan
+
+  print(f"\n{'=' * 70}")
+  print(f"Fields above {INTERPRETED_MAX_FIELD} kV/cm: why they are excluded")
+  print("=" * 70)
+  print(f"  responding {k_hi}/{n_hi} against {k_ref}/{n_ref} at {ref_E:.2f} "
+        "kV/cm, the highest interpreted field")
+
+  # 1. sampling
+  try:
+    from scipy.stats import binom
+    p_bin = float(binom.cdf(k_hi, n_hi, p_ref))
+    print(f"  1. not sampling: at the {ref_E:.2f} kV/cm rate "
+          f"({p_ref:.1%}), {n_hi} vesicles would be expected to return "
+          f"{p_ref * n_hi:.0f} responders. P(X <= {k_hi}) = {p_bin:.2g}")
+  except Exception:
+    pass
+
+  # 2. attrition -- vesicles that never reached the response call. df still
+  # holds them; _field_cells is what drops them, so the comparison is
+  # between the two.
+  all_hi = df[~df["field_kV_cm"].apply(interpreted) & df["field_kV_cm"].notna()]
+  all_lo = df[df["field_kV_cm"].apply(interpreted) & df["field_kV_cm"].notna()]
+  rej_hi = len(all_hi) - len(hi)
+  rej_lo = len(all_lo) - len(sub[sub["field_kV_cm"].apply(interpreted)])
+  print(f"  2. not attrition among scored vesicles: {rej_hi} of {len(all_hi)} "
+        f"tracked vesicles above the cut were dropped before the response "
+        f"call ({rej_hi / max(len(all_hi), 1):.1%}) against {rej_lo} of "
+        f"{len(all_lo)} below it ({rej_lo / max(len(all_lo), 1):.1%}); "
+        f"counting every one as a responder gives "
+        f"{k_hi + rej_hi}/{n_hi + rej_hi}.")
+  print("     This counts only vesicles that reached tracking. A vesicle "
+        "that lysed at the pulse and was never tracked is not in either "
+        "denominator; compare the per-chamber yield below.")
+
+  # 3. detectability and geometry, per session
+  cols = [c for c in ("radius_um", "prepulse_lumen_abs") if c in df.columns]
+  if cols and "session" in df.columns:
+    g = df.groupby("session").agg(
+        vesicles=("guv_id", "size"), chambers=("experiment", "nunique"),
+        **{c: (c, "median") for c in cols})
+    g["per_chamber"] = (g["vesicles"] / g["chambers"]).round(1)
+    hi_sess = sorted(all_hi["session"].dropna().unique())
+    print("  3. session properties (the block's sessions: "
+          f"{', '.join(map(str, hi_sess))}):")
+    print(g.to_string(float_format=lambda x: f"{x:.2f}"))
+    print("     Higher pre-pulse contrast or a larger radius in the excluded "
+          "block would make a response EASIER to see and to induce, so they "
+          "cannot explain a lower rate; a lower per-chamber yield would "
+          "point at loss before tracking.")
+
+  pd.DataFrame({"metric": ["k_hi", "n_hi", "k_ref", "n_ref", "rejected_hi",
+                           "rejected_lo"],
+                "value": [k_hi, n_hi, k_ref, n_ref, rej_hi, rej_lo]}).to_csv(
+      out / "uninterpreted_block_checks.csv", index=False)
+
+
+# --- LaTeX tables ------------------------------------------------------------
+
+def _tex_escape(s) -> str:
+  return str(s).replace("_", r"\_").replace("%", r"\%")
+
+
+def write_latex_tables(df: pd.DataFrame, out: Path, noise: pd.DataFrame = None):
+  """Emit the results tables as \\input-able .tex, from the same frame.
+
+  Every number here is also in a CSV beside it. The point of the .tex is that
+  the thesis never contains a figure retyped by hand from a console.
+  """
+  if not WRITE_LATEX_TABLES:
+    return
+  tex = out / LATEX_SUBFOLDER
+  tex.mkdir(parents=True, exist_ok=True)
+  sub = _field_cells(df)
+  cls = endpoint_classes(df)
+  pops = [p for p in POP_LABEL if p in set(sub["population"])]
+  written = []
+
+  # --- responding vesicles at each field -----------------------------------
+  lines = [r"% generated by susceptibility.write_latex_tables -- do not edit",
+           r"\begin{table}[tb]", r"  \centering",
+           r"  \caption[Responding vesicles at each applied field]"
+           r"{\textbf{Responding vesicles at each applied field.} Responding "
+           r"vesicles over vesicles scored, with the percentage and its "
+           r"Wilson \SI{95}{\percent} interval. The session column is what "
+           r"shows whether the dose axis is also a date axis.}",
+           r"  \label{tab: CH2 - Field response}", r"  \small",
+           r"  \begin{tabular}{l"
+           + " r@{\\hspace{5pt}}l" * len(pops) + r" l}",
+           r"    \toprule",
+           r"    \multicolumn{1}{c}{$E$} & "
+           + " & ".join(f"\\multicolumn{{2}}{{c}}{{\\textit{{{POP_LABEL[p]}}}}}"
+                        for p in pops)
+           + r" & \multicolumn{1}{c}{Session} \\",
+           r"    \multicolumn{1}{c}{(\si{\kilo\volt\per\centi\meter})} & "
+           + " & ".join([r"$k/n$ & \% (CI)"] * len(pops)) + r" & \\",
+           r"    \midrule"]
+  for E in sorted(sub["field_kV_cm"].unique()):
+    cells, sess = [], set()
+    for pop in pops:
+      c = sub[(sub["population"] == pop) & (sub["field_kV_cm"] == E)]
+      if c.empty:
+        cells += ["--", ""]
+        continue
+      k, n = int(c["is_responding"].sum()), len(c)
+      lo, hi = wilson(k, n)
+      cells += [f"{k}/{n}", f"{100 * k / n:.1f} ({100 * lo:.0f}--{100 * hi:.0f})"]
+      sess.update(c["session"].dropna().astype(str))
+    lines.append(f"    {E:.2f} & " + " & ".join(cells) + " & "
+                 + ", ".join(sorted(sess)) + r" \\")
+    if INTERPRETED_MAX_FIELD is not None and interpreted(E) and not any(
+        interpreted(x) for x in sub["field_kV_cm"].unique() if x > E):
+      lines.append(r"    \midrule")
+  lines += [r"    \bottomrule", r"  \end{tabular}", r"\end{table}"]
+  (tex / "tab_field_response.tex").write_text("\n".join(lines) + "\n")
+  written.append("tab_field_response.tex")
+
+  # --- endpoint classification ---------------------------------------------
+  lines = [r"% generated by susceptibility.write_latex_tables -- do not edit",
+           r"\begin{table}[tb]", r"  \centering",
+           r"  \caption[Endpoint classification at each applied field]"
+           r"{\textbf{Endpoint classification at each applied field.} "
+           r"Vesicles scored ($n$), those ending within "
+           rf"\SI{{{100 * INTACT_BAND:.0f}}}{{\percent}} of their pre-pulse "
+           r"intensity, those losing more, those gaining more, and those "
+           r"meeting the response criterion, which additionally requires the "
+           r"fall to exceed three times the vesicle's own frame-to-frame "
+           r"noise. The two are separate measurements of the same trace.}",
+           r"  \label{tab: CH2 - Endpoint classes}", r"  \small",
+           r"  \begin{tabular}{l r r r r r}", r"    \toprule",
+           r"    $E$ (\si{\kilo\volt\per\centi\meter}) & $n$ & Within band"
+           r" & Lost & Gained & Responding \\"]
+  for pop in pops:
+    m = cls[(cls["population"] == pop) & cls["interpreted"]]
+    if m.empty:
+      continue
+    lines.append(r"    \midrule")
+    lines.append(f"    \\multicolumn{{6}}{{l}}{{\\textit{{{POP_LABEL[pop]}}}}} \\\\")
+    for _, r in m.iterrows():
+      lines.append(f"    \\quad {r['field_kV_cm']:.2f} & {int(r['n'])} & "
+                   f"{int(r['n_intact'])} & {int(r['n_lost'])} & "
+                   f"{int(r['n_gained'])} & {int(r['n_responding'])} \\\\")
+    lines.append(f"    \\quad all & {int(m['n'].sum())} & "
+                 f"{int(m['n_intact'].sum())} & {int(m['n_lost'].sum())} & "
+                 f"{int(m['n_gained'].sum())} & "
+                 f"{int(m['n_responding'].sum())} \\\\")
+  lines += [r"    \bottomrule", r"  \end{tabular}", r"\end{table}"]
+  (tex / "tab_endpoint_classes.tex").write_text("\n".join(lines) + "\n")
+  written.append("tab_endpoint_classes.tex")
+
+  # --- the responders themselves -------------------------------------------
+  r_df = sub[sub["is_responding"] == True].copy()
+  if not r_df.empty:
+    r_df = r_df.sort_values(["population", "field_kV_cm", "released"],
+                            ascending=[True, True, False])
+    n_cens = int(r_df["response_class"].isin(["GRADUAL", "DELAYED"]).sum()) \
+        if "response_class" in r_df else 0
+    caption = (
+        r"\caption[Responding vesicles]{\textbf{The "
+        rf"${len(r_df)}$ responding vesicles." + "}"
+        r" Released fraction is the fall from the pre-pulse baseline to the "
+        r"matched endpoint. \textsc{gradual} and \textsc{delayed} both mean "
+        r"the vesicle was still losing dye when the record ended, so "
+        rf"${n_cens}$ of ${len(r_df)}$ responses are censored rather than "
+        r"resolved. $\tau/T$ is the fitted time constant over the record "
+        r"duration; $^{\dagger}$ marks the vesicles meeting the "
+        r"identifiability criteria." + "}")
+    lines = [r"% generated by susceptibility.write_latex_tables -- do not edit",
+             r"\begin{table}[tb]", r"  \centering", "  " + caption,
+             r"  \label{tab: CH2 - Responders}", r"  \small",
+             r"  \begin{tabular}{l S[table-format=1.2] S[table-format=2.1] l "
+             r"S[table-format=2.2] l}", r"    \toprule",
+             r"    Population & {$E$ (\si{\kilo\volt\per\centi\meter})}"
+             r" & {Released (\%)} & Class & {$\tau/T$} & Session \\",
+             r"    \midrule"]
+    prev = None
+    for _, r in r_df.iterrows():
+      if prev is not None and r["population"] != prev:
+        lines.append(r"    \addlinespace")
+      prev = r["population"]
+      cls_s = str(r.get("response_class", "")).lower()
+      tor = r.get("tau_over_record", np.nan)
+      lines.append(
+          f"    \\textit{{{POP_LABEL[r['population']]}}} & "
+          f"{r['field_kV_cm']:.2f} & {100 * r['released']:.1f} & "
+          f"\\textsc{{{cls_s}}} & "
+          f"{tor:.2f}" + ("$^{\\dagger}$" if r.get("tau_identifiable") else "")
+          + f" & {r.get('session', '')} \\\\")
+    lines += [r"    \bottomrule", r"  \end{tabular}", r"\end{table}"]
+    (tex / "tab_responders.tex").write_text("\n".join(lines) + "\n")
+    written.append("tab_responders.tex")
+
+  print(f"\nWrote {len(written)} LaTeX table(s) to {tex}:")
+  for w in written:
+    print(f"    {w}")
+
 
 def plot_experiment_level(df: pd.DataFrame, out: Path):
   """One point per EXPERIMENT, not per GUV.
@@ -484,13 +1173,13 @@ def check_detectability(df: pd.DataFrame, outputs_root, out: Path):
   # Stagnate only, matching every other response figure in this module.
   #
   # Two things go wrong without this. The responding RATE printed below is
-  # taken from the same `is_responding` column the dose-response uses, but
+  # taken from the same `is_responding` column the field response uses, but
   # process.py only recomputes that column at the matched endpoint for
   # Stagnate vesicles; Grow, Reduce and Rupture rows keep the whole-record
   # call read straight from _fit_parameters.csv. Pooling the two puts three
   # definitions in one percentage -- matched-endpoint, whole-record, and NaN
   # for the censored -- and the resulting figure disagrees with the
-  # dose-response panels drawn from the same file.
+  # field-response panels drawn from the same file.
   #
   # The noise and contrast distributions move with it deliberately. This
   # function asks whether one population is easier to SCORE as responding, so
@@ -506,7 +1195,7 @@ def check_detectability(df: pd.DataFrame, outputs_root, out: Path):
     print(f"\n  Detectability restricted to {FATE_FOR_RESPONSE} vesicles: "
           f"{n_before - len(merged)} of {n_before} dropped, {len(merged)} "
           "retained. The responding rate below is on the same vesicles as "
-          "the dose-response figures.")
+          "the field-response figures.")
 
   pops = [p for p in POP_LABEL if p in set(merged["population"])]
   cols = [c for c in ("response_noise", "sep0_over_sigma") if c in merged]
@@ -617,133 +1306,125 @@ def check_detectability(df: pd.DataFrame, outputs_root, out: Path):
   plt.close(fig)
 
 
-def check_per_experiment_within_bins(df: pd.DataFrame, out: Path):
-  """Responding fraction per EXPERIMENT, inside each shared dose bin.
+def check_per_experiment_within_fields(df: pd.DataFrame, out: Path):
+  """Responding fraction per EXPERIMENT, at each applied field.
 
-  The pooled dose response treats every vesicle as independent. If the
-  difference between populations is carried by one or two sessions, it is a
-  session effect wearing a population label. Each point here is one
-  experiment; the populations separate only if their experiments do.
+  The pooled curve treats every vesicle as independent. Vesicles in one
+  chamber share a preparation, a field of view and a day, so a difference
+  carried by one chamber is a statement about that chamber. This is the
+  check that the difference is not.
   """
-  sub = df[df["dvm_proxy"].notna() & (df["size_category"] == "Stagnate")]
-  edges = _dose_bins(sub) if not sub.empty else None
-  if edges is None:
-    print("Per-experiment bin check skipped: dose range too narrow.")
+  sub = _field_cells(df)
+  if sub.empty:
+    print("Per-experiment field check skipped: nothing to compare.")
     return
-
-  sub = sub.copy()
-  sub["bin"] = pd.cut(sub["dvm_proxy"], edges, include_lowest=True,
-                      labels=False)
-  per = (sub.groupby(["bin", "population", "experiment"])
+  per = (sub.groupby(["field_kV_cm", "population", "experiment"])
          .agg(n_guv=("is_responding", "count"),
-              frac_responding=("is_responding",
-                               lambda s: s.dropna().mean()))
+              frac_responding=("is_responding", lambda x: x.dropna().mean()))
          .reset_index())
-  # An experiment contributing one or two vesicles to a bin can only report
+  # An experiment contributing one or two vesicles to a field can only report
   # 0, 0.5 or 1 by construction; that is not an estimate of a fraction.
   per = per[per["n_guv"] >= 3]
   if per.empty:
-    print("Per-experiment bin check skipped: no experiment has >=3 GUVs "
-          "in any bin.")
+    print("Per-experiment field check skipped: no experiment has >=3 GUVs "
+          "at any single field.")
     return
-  per.to_csv(out / "per_experiment_within_bin.csv", index=False)
+  per.to_csv(out / "per_experiment_within_field.csv", index=False)
 
-  counts = per.groupby(["bin", "population"]).size().unstack(fill_value=0)
+  counts = per.groupby(["field_kV_cm", "population"]).size().unstack(fill_value=0)
   pops = [p for p in POP_LABEL if p in counts.columns]
-
-  print("\nResponding fraction per EXPERIMENT, within shared dose bins:")
-  print("  (a bin can only separate two groups if BOTH have >=2 experiments "
-        "in it; with three groups a bin may compare some pairs and not "
-        "others)")
-  for b in sorted(per["bin"].unique()):
-    lo, hi = edges[int(b)], edges[int(b) + 1]
-    have = [p for p in pops if counts.loc[b, p] >= 2]
-    ok = len(have) >= 2
+  print("\nResponding fraction per EXPERIMENT, at each field:")
+  print("  (a field separates two groups only if BOTH have >=2 experiments "
+        "there)")
+  for E in sorted(per["field_kV_cm"].unique()):
+    have = [p for p in pops if counts.loc[E, p] >= 2]
     mark = ("" if len(have) == len(pops) else
             f"   (comparable here: {', '.join(POP_LABEL[p] for p in have)})"
-            if ok else "   (too few experiments to compare)")
-    print(f"  bin dV_m {lo:.2f}-{hi:.2f} V{mark}")
-    cell = per[per["bin"] == b]
+            if len(have) >= 2 else "   (too few experiments to compare)")
+    print(f"  {E:.2f} kV/cm{mark}")
+    cell = per[per["field_kV_cm"] == E]
     for pop in pops:
       vals = cell[cell["population"] == pop]
       if vals.empty:
         continue
       fr = ", ".join(f"{v:.2f}(n={int(n)})" for v, n
                      in zip(vals["frac_responding"], vals["n_guv"]))
-      n_exp = len(vals)
-      n_nonzero = int((vals["frac_responding"] > 0).sum())
-      print(f"    {POP_LABEL[pop]:<16} median {vals['frac_responding'].median():.2f}"
-            f"  ({n_nonzero}/{n_exp} experiments with any responder)")
+      print(f"    {POP_LABEL[pop]:<16} median "
+            f"{vals['frac_responding'].median():.2f}  "
+            f"({int((vals['frac_responding'] > 0).sum())}/{len(vals)} "
+            "experiments with any responder)")
       print(f"      {fr}")
 
   fig, ax = plt.subplots(figsize=(9.5, 5))
   rng = np.random.default_rng(0)
+  fields = sorted(per["field_kV_cm"].unique())
+  xpos = {E: i for i, E in enumerate(fields)}
   for k, pop in enumerate(pops):
     m = per[per["population"] == pop]
     off = (k - (len(pops) - 1) / 2) * 0.28
-    xs = m["bin"].to_numpy(float) + off + rng.uniform(-0.05, 0.05, len(m))
+    xs = np.array([xpos[E] for E in m["field_kV_cm"]], float) + off \
+        + rng.uniform(-0.05, 0.05, len(m))
     ax.scatter(xs, m["frac_responding"], s=30 + 3 * m["n_guv"],
                color=_colour(pop), alpha=0.85, edgecolors="white",
-               linewidth=0.6, label=f"{POP_LABEL[pop]} (1 point = 1 experiment)")
-  ax.set_xticks(range(len(edges) - 1))
-  # Two decimals, not zero. These edges were hundreds of V.um before the dose
-  # axis became a potential in volts; at the new scale ".0f" collapses
-  # 0.036, 0.345 and 0.558 to "0", "0" and "1", which is what the axis was
-  # showing.
-  ax.set_xticklabels([f"{edges[i]:.2f}-\n{edges[i+1]:.2f}"
-                      for i in range(len(edges) - 1)], fontsize=8)
-  ax.set_xlabel(r"dose bin  ($\Delta V_m$, V)")
+               linewidth=0.6,
+               label=f"{POP_LABEL[pop]} (1 point = 1 experiment)")
+  ax.set_xticks(range(len(fields)))
+  # Asterisked fields are outside the interpreted range. The x axis here is
+  # categorical, so the shaded band used on the dose figures has nothing to
+  # sit on; the mark is the same statement in the space available.
+  ax.set_xticklabels([f"{E:.2f}" + ("" if interpreted(E) else "*")
+                      for E in fields], fontsize=8)
+  ax.set_xlabel("field strength (kV/cm)")
   ax.set_ylabel("fraction responding")
   ax.set_ylim(-0.05, 1.05)
-  ax.set_title("Responding fraction per experiment, within dose bin\n"
-               "(marker size = GUVs contributed; <3 GUVs per bin dropped)")
+  star = ("" if all(interpreted(E) for E in fields) else
+          "\n* one session only; not read as a dose response")
+  ax.set_title("Responding fraction per experiment, at each field\n"
+               "(marker size = GUVs contributed; <3 GUVs per field dropped)"
+               + star)
   ax.legend(frameon=False, fontsize=9)
   ax.grid(axis="y", alpha=0.35, linestyle="--")
   fig.tight_layout()
-  fig.savefig(out / "per_experiment_within_bin.pdf", dpi=300)
+  fig.savefig(out / "per_experiment_within_field.pdf", dpi=300)
   plt.close(fig)
 
 
-# Radius window over which Bare and Branched cortex vesicles overlap closely
-# enough to be compared without any dose correction, in micrometres.
-#
-# The two preparations differ by 2.09 um in median radius, which is the whole
-# reason the dV_m axis exists. Inside 4.5-5.5 um they do not: 92 Bare and 82
-# cortex vesicles, medians 4.99 and 4.97 um, Mann-Whitney p = 0.27. At matched
-# radius AND matched field the induced potential is matched too, so a
-# comparison here rests on no model at all -- not the Schwan expression, not
-# the 1.5 factor, not the assumption of a sphere in a uniform field.
-#
-# What it costs is power and chambers. See the printed output.
-SIZE_MATCHED_WINDOW = (4.5, 5.5)
+# Radius window the analysis already runs inside, taken from process.py so
+# there is one definition. This module used to carry its own copy, which
+# silently applied a SECOND, narrower restriction on top of the first once the
+# two numbers diverged.
+try:
+  from process import SIZE_WINDOW_UM as _PROC_WINDOW
+except Exception:
+  _PROC_WINDOW = None
+SIZE_MATCHED_WINDOW = _PROC_WINDOW
 
-# Field at or above which any vesicle in this window responds. Below it both
-# groups are at the assay floor and contribute only zeros to both arms, so
-# pooling across the whole series dilutes the comparison with conditions that
-# cannot distinguish anything. Read the per-field table before trusting the
-# pooled row: this cut is chosen from the data, not prespecified.
-SIZE_MATCHED_MIN_FIELD = 1.0
+# Field at or above which any vesicle responds. Below it both groups sit at
+# the assay floor and contribute only zeros, so pooling the whole series
+# dilutes the comparison with conditions that cannot separate anything. Read
+# the per-field table before trusting the pooled row: this cut is chosen from
+# the data, not prespecified.
+SIZE_MATCHED_MIN_FIELD = 1.2
 
 
 def check_size_matched(df: pd.DataFrame, out: Path):
-  """Bare vs cortex at matched radius, without the dose correction.
+  """Bare vs cortex at matched radius, pooled across fields.
 
   The dV_m analysis answers the confound by modelling it. This answers it by
   removing it: restrict to vesicles of the same size and the applied field is
-  the dose. The two should agree, and if they do the result does not depend
+  the treatment. The two should agree, and if they do the result does not depend
   on the Schwan expression being right.
   """
-  lo, hi = SIZE_MATCHED_WINDOW
-  sub = df[(df["size_category"] == FATE_FOR_RESPONSE)
-           & df["released"].notna() & df["radius_um"].notna()]
-  m = sub[(sub["radius_um"] >= lo) & (sub["radius_um"] <= hi)].copy()
+  m = df[(df["size_category"] == FATE_FOR_RESPONSE)
+         & df["released"].notna() & df["radius_um"].notna()].copy()
   if m.empty:
-    print("Size-matched check skipped: no vesicles in the window.")
+    print("Size-matched check skipped: no vesicles with a release value.")
     return
+  win = ("radius %.2f-%.2f um" % SIZE_MATCHED_WINDOW
+         if SIZE_MATCHED_WINDOW else "no size window set")
 
   print(f"\n{'=' * 70}")
-  print(f"Size-matched comparison, radius {lo}-{hi} um "
-        "(no dose correction applied)")
+  print(f"Bare vs cortex pooled across fields ({win})")
   print("=" * 70)
   pops = [p for p in POP_LABEL if p in set(m["population"])]
   for p in pops:
@@ -760,8 +1441,18 @@ def check_size_matched(df: pd.DataFrame, out: Path):
   try:
     from scipy.stats import mannwhitneyu
     p_r = float(mannwhitneyu(a["radius_um"], b["radius_um"]).pvalue)
-    print(f"\n  Residual radius difference inside the window: p = {p_r:.2f} "
-          "(large is what this check needs).")
+    d_r = float(a["radius_um"].median() - b["radius_um"].median())
+    print(f"\n  Residual radius difference: {d_r:+.2f} um "
+          f"(Bare minus cortex), p = {p_r:.3g}.")
+    if p_r < 0.05:
+      print("    Detectable, so these groups are NOT matched -- only closer "
+            "than the unrestricted populations. Report the residual and its "
+            "direction rather than claiming a match.")
+    if d_r > 0:
+      print("    It runs conservatively: Bare vesicles remain the larger, so "
+            "they reach the higher induced potential and should porate more "
+            "readily. An excess measured in the cortex-bearing group is "
+            "obtained against this bias, not because of it.")
   except Exception:
     pass
 
@@ -783,6 +1474,27 @@ def check_size_matched(df: pd.DataFrame, out: Path):
     _report_matched_cell(ah, bh,
                          f"E >= {SIZE_MATCHED_MIN_FIELD} kV/cm")
 
+  # Below the field at which Bare first responds. This is the cell the
+  # threshold claim rests on -- one group at zero and the other not -- and it
+  # was previously computed by hand from the per-field table.
+  al = a[a["field_kV_cm"] < SIZE_MATCHED_MIN_FIELD]
+  bl = b[b["field_kV_cm"] < SIZE_MATCHED_MIN_FIELD]
+  if len(al) >= 5 and len(bl) >= 5:
+    _report_matched_cell(al, bl, f"E < {SIZE_MATCHED_MIN_FIELD} kV/cm")
+    # Same cell inside one session. The Fisher test above treats vesicles as
+    # independent when they are clustered in chambers and days; restricting
+    # to the session that supplies most of this range removes the day as an
+    # explanation entirely, at the cost of the vesicles it discards. If the
+    # difference survives here it does not rest on a between-day change.
+    if "session" in al.columns and al["session"].notna().any():
+      s = pd.concat([al["session"], bl["session"]]).value_counts().idxmax()
+      a_s, b_s = al[al["session"] == s], bl[bl["session"] == s]
+      if len(a_s) >= 5 and len(b_s) >= 5:
+        _report_matched_cell(
+            a_s, b_s,
+            f"E < {SIZE_MATCHED_MIN_FIELD} kV/cm, session {s} only "
+            f"({len(a_s) + len(b_s)} of {len(al) + len(bl)} vesicles)")
+
   m.to_csv(out / "size_matched_window.csv", index=False)
 
 
@@ -793,12 +1505,15 @@ def _report_matched_cell(a: pd.DataFrame, b: pd.DataFrame, label: str):
   print(f"\n  {label}:")
   print(f"    responding   Bare {ka}/{len(a)} ({100 * ka / len(a):.1f}%)"
         f"   cortex {kb}/{len(b)} ({100 * kb / len(b):.1f}%)")
-  try:
-    from scipy.stats import fisher_exact
-    tab = [[ka, len(a) - ka], [kb, len(b) - kb]]
-    print(f"    Fisher exact p = {fisher_exact(tab)[1]:.4f}")
-  except Exception:
-    pass
+  if "efflux" not in a.columns:
+    a = a.assign(efflux=a["is_responding"] == True)
+    b = b.assign(efflux=b["is_responding"] == True)
+  d, lo, hi = cluster_diff(a, b)
+  if np.isfinite(lo):
+    print(f"    difference   {d:+.3f}  95% CI [{lo:+.3f}, {hi:+.3f}]"
+          f"  (bootstrap clustered on experiment)")
+  else:
+    print(f"    difference   {d:+.3f}  -- no interval, too few chambers")
 
   rng = np.random.default_rng(0)
   for name, v in (("Bare", a["released"].dropna().to_numpy(float)),
@@ -833,11 +1548,19 @@ def main(results_dir=None, root=None):
   df = load_summary(base)
   print(f"Loaded {len(df)} GUV rows from {base / 'guv_bulk_summary.csv'}")
   report_size_distributions(df, out)
-  plot_dose_response(df, out)
-  check_per_experiment_within_bins(df, out)
+  # Runs before the dose figures so that a disagreement between
+  # INTERPRETED_MAX_FIELD and the session table is printed above them rather
+  # than after they have already been written.
+  report_session_confound(df, out)
+  report_uninterpreted_block(df, out)
+  plot_field_response(df, out)
+  plot_endpoint_distribution(df, out)
+  check_per_experiment_within_fields(df, out)
   check_detectability(df, tree, out)
   check_size_matched(df, out)
+  report_section3(df, out)
   plot_experiment_level(df, out)
+  write_latex_tables(df, out)
   print(f"\nSaved susceptibility figures to {out}")
   return df
 

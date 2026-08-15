@@ -303,6 +303,93 @@ ENDPOINT_MATCHED_TOLERANCE_S = 5.0
 # Moving that threshold can no longer shift the dye, tau, or susceptibility
 # results -- it is confined to the rupture fraction in 02_size_and_fate/.
 EXCLUDE_FATES = ("LOST_PREPULSE", "OUT_OF_FRAME")
+
+# -----------------------------------------------------------------------------
+# The analysis population.
+#
+# One definition, imported by every stage that reports a vesicle count, so no
+# two sections of the results can be built on different denominators. Before
+# this existed, susceptibility.py ran on the size-windowed, fate-filtered set
+# while tau_identifiability_report.py ran on its own -- 363 vesicles against
+# 358 -- and the two numbers appeared side by side in the same chapter.
+#
+# Four conditions, in the order they are applied:
+#
+#   1. Radius inside SIZE_WINDOW_UM. The induced transmembrane potential is
+#      dV_m = 1.5 E R cos(theta), linear in radius, so vesicles of different
+#      size at one field are not at one treatment. Matching on size is what
+#      makes the field axis the whole of the treatment; it is not optional and
+#      it is not replaceable by a per-vesicle correction.
+#
+#   2. Radius stable across the matched window. A vesicle that changes size
+#      between the pre-pulse frames and ENDPOINT_MATCHED_T_S has changed the
+#      quantity the intensity is normalised by, so its endpoint change is not
+#      purely a dye measurement.
+#
+#   3. An endpoint call exists at ENDPOINT_MATCHED_T_S. Records that stop
+#      before the matched time carry no measurement there, and a missing
+#      endpoint must not fall through into the unchanged class.
+#
+#   4. The endpoint change is a loss or no change. A vesicle whose intensity
+#      RISES by more than INTENSITY_DIFF_THRESHOLD is excluded, leaving two
+#      exhaustive classes: flatline and efflux.
+#
+# On (4): every gainer in the interpreted range shrank -- terminal_norm_radius
+# 0.93 to 0.99, median 0.96, against 1.00 for the rest -- so condition (2)
+# removes most of them on the mechanism rather than on the outcome. The
+# remainder are dropped here because the two-class scheme requires it. Both
+# counts are printed so the exclusion is visible rather than assumed.
+RADIUS_STABLE_TOL = 0.05
+
+
+def analysis_population(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame:
+  """The vesicles every reported number is computed on.
+
+  Expects a frame from guv_bulk_summary.csv, i.e. after the fate filter and
+  the size window have already been applied upstream. The size check is
+  repeated here anyway: this function is the definition, and a caller that
+  reads the CSV directly must get the same population as one that does not.
+  """
+  n0 = len(df)
+  out = df.copy()
+  steps = []
+
+  if SIZE_WINDOW_UM is not None and "radius_um" in out.columns:
+    lo, hi = SIZE_WINDOW_UM
+    keep = out["radius_um"].between(lo, hi)
+    steps.append((f"radius outside {lo}-{hi} um or unmeasured",
+                  int((~keep).sum())))
+    out = out[keep]
+
+  if "terminal_norm_radius" in out.columns:
+    keep = (out["terminal_norm_radius"]
+            .between(1.0 - RADIUS_STABLE_TOL, 1.0 + RADIUS_STABLE_TOL))
+    steps.append((f"radius changed by more than {RADIUS_STABLE_TOL:.0%}",
+                  int((~keep).sum())))
+    out = out[keep]
+
+  if "diff" in out.columns:
+    keep = out["diff"].notna()
+    steps.append((f"no endpoint call at t = {ENDPOINT_MATCHED_T_S} s",
+                  int((~keep).sum())))
+    out = out[keep]
+
+    keep = out["diff"] <= INTENSITY_DIFF_THRESHOLD
+    steps.append((f"gained more than {INTENSITY_DIFF_THRESHOLD:.0%}",
+                  int((~keep).sum())))
+    out = out[keep]
+
+  if verbose:
+    print(f"\nAnalysis population: {len(out)} of {n0} GUV(s) retained.")
+    for label, n in steps:
+      if n:
+        print(f"  -{n:<4} {label}")
+    if "population" in out.columns:
+      for g, n in out["population"].value_counts().items():
+        print(f"    {g:<24} {n}")
+  return out.copy()
+
+
 CORTEX_STATUS_ORDER = ["CORTEX", "AMBIGUOUS", "NO_CORTEX", "UNKNOWN"]
 TAU_REQUIRE_IDENTIFIABLE = True
 TAU_REQUIRE_RESPONDING = True
@@ -402,71 +489,69 @@ def _responding_at(t_c: np.ndarray, y_c: np.ndarray):
 
 # -----------------------------------------------------------------------------
 # --- SIZE WINDOW ---
-# Radius range, in micrometres, that every vesicle must fall inside to enter
-# the bulk table. None disables the filter and restores the whole population.
+# Read from config.py, which is the single place it is set and where the
+# reasoning, the width comparison and the list of exempt stages are recorded.
+# Every other bulk script imports it from here, so this indirection is what
+# makes one edit in config reach the whole pipeline.
 #
-# The two preparations differ by 2.09 um in median radius (6.58 vs 4.49), and
-# the induced transmembrane potential scales with radius, so a comparison at
-# matched applied field is also a comparison at mismatched dose. There are two
-# ways to answer that. Correct for it, by plotting against 1.5*E*R; or remove
-# it, by comparing only vesicles of the same size. This constant does the
-# second.
-#
-# The correction is the more powerful option and the restriction is the more
-# conservative one. Mercadal et al. (2016) report that the inverse
-# radius-field relationship Schwan's equation predicts is often not observed
-# experimentally, or is much shallower than predicted, so dividing a dose axis
-# by radius imports an assumption that may not hold in this regime. Matching
-# on size assumes nothing about how dose scales.
-#
-# Inside 4.5-5.5 um the two preparations are indistinguishable in radius
-# (medians 4.99 and 4.97 um, Mann-Whitney p = 0.27), so applied field is the
-# dose and no model is needed.
-#
-# It is expensive. Roughly four vesicles in five fall outside, and the loss is
-# not spread evenly: conditions where one preparation happens to be large or
-# small lose almost everything. The report printed at aggregation time lists
-# what each condition costs, and it should be read before the results are
-# trusted -- a condition reduced to a handful of vesicles is not a condition.
-SIZE_WINDOW_UM = (4.5, 5.5)
+# The fallback exists so a config without the setting still runs, but a run
+# that falls back is not comparable with one that does not, and it says so.
+# -----------------------------------------------------------------------------
+SIZE_WINDOW_UM = getattr(cfg, "SIZE_WINDOW_UM", "__missing__")
+if SIZE_WINDOW_UM == "__missing__":
+  SIZE_WINDOW_UM = (4.0, 6.0)
+  print("WARNING: config.py defines no SIZE_WINDOW_UM; falling back to "
+        f"{SIZE_WINDOW_UM} um. Set it in config.py so every script agrees.")
 
 
-def _report_size_window(kept: dict, dropped: dict, n_no_radius: int) -> None:
-  """What the size window cost, per phenotype and per condition.
+def apply_size_window(df: pd.DataFrame) -> pd.DataFrame:
+  """Restrict to SIZE_WINDOW_UM and report what it costs.
 
-  Built from tallies rather than from the finished table, because a vesicle
-  outside the window is rejected inside the aggregation loop and never
-  becomes a row. The condition list is the part worth reading: the loss is
-  not spread evenly, and a condition reduced to one or two vesicles has
-  stopped being a condition whatever the group totals say.
+  Applied to the finished table rather than inside the aggregation loop,
+  because the two halves of this chapter need different populations. Any
+  comparison between the preparations has to run inside the window, or it
+  compares cortex presence with vesicle size. Any description of the
+  cortex-bearing population on its own -- how the actin shell breaks down,
+  where on the vesicle it goes -- contains no such comparison, and inside the
+  window it loses three quarters of its vesicles and its 30 V reference for
+  nothing. So the aggregation keeps every vesicle and the caller decides.
+
+  Vesicles with no measured radius are dropped rather than kept: the point is
+  that every vesicle in the returned table is known to be inside the window,
+  and an unmeasured radius cannot be known to be.
   """
+  if SIZE_WINDOW_UM is None or df.empty or "radius_um" not in df.columns:
+    return df
   lo, hi = SIZE_WINDOW_UM
-  n_keep, n_drop = sum(kept.values()), sum(dropped.values())
-  total = n_keep + n_drop
-  if total == 0:
-    return
-  print(f"\nSIZE WINDOW {lo}-{hi} um, applied before any endpoint is read.")
-  print(f"  {n_keep} of {total} vesicle(s) retained ({100 * n_keep / total:.0f}%); "
-        f"{n_no_radius} of the {n_drop} rejected had no measured radius.")
+  keep = df["radius_um"].between(lo, hi)
+  n_nan = int(df["radius_um"].isna().sum())
 
-  groups = sorted({g for g, _ in kept} | {g for g, _ in dropped})
+  print(f"\nSIZE WINDOW {lo}-{hi} um.")
+  print(f"  {int(keep.sum())} of {len(df)} vesicle(s) retained "
+        f"({100 * keep.mean():.0f}%); {n_nan} had no measured radius and are "
+        "dropped with the rest.")
+  grp = df.assign(_g=df.apply(assign_cortex_group, axis=1))
+  before = grp["_g"].value_counts()
+  after = grp[keep]["_g"].value_counts()
   print("  per group:")
-  for g in groups:
-    k = sum(v for (gg, _), v in kept.items() if gg == g)
-    dd = sum(v for (gg, _), v in dropped.items() if gg == g)
-    print(f"    {g:<24} {k + dd:4d} -> {k:4d}")
+  for g in before.index:
+    print(f"    {g:<24} {before[g]:4d} -> {int(after.get(g, 0)):4d}")
 
-  thin = [(g, v, sum(x for (gg, vv), x in kept.items()
-                     if (gg, vv) == (g, v)),
-           sum(x for (gg, vv), x in dropped.items() if (gg, vv) == (g, v)))
-          for g, v in sorted({*kept, *dropped})]
-  thin = [t for t in thin if t[2] < 3]
-  if thin:
-    print(f"  {len(thin)} condition(s) left with fewer than 3 vesicles; these "
+  # Per condition, because the loss is not uniform and a condition left with
+  # two vesicles is gone whatever the group totals say.
+  cells = (grp.assign(inside=keep)
+           .groupby(["_g", "voltage"], sort=False)
+           .agg(before=("inside", "size"), after=("inside", "sum"))
+           .reset_index())
+  gone = cells[cells["after"] < 3]
+  if not gone.empty:
+    print(f"  {len(gone)} condition(s) left with fewer than 3 vesicles; these "
           "should not be read as conditions:")
-    for g, v, k, dd in sorted(thin, key=lambda t: -(t[2] + t[3])):
-      print(f"    {g:<24} {v:>5}  {k + dd:3d} -> {k:d}")
+    for _, r in gone.sort_values("before", ascending=False).iterrows():
+      print(f"    {r['_g']:<24} {r['voltage']:>5}  "
+            f"{int(r['before']):3d} -> {int(r['after']):d}")
   print("  Set SIZE_WINDOW_UM = None to restore the whole population.")
+  return df[keep].copy()
 
 
 def aggregate_pipeline_results(outputs_root: str) -> pd.DataFrame:
@@ -489,10 +574,6 @@ def aggregate_pipeline_results(outputs_root: str) -> pd.DataFrame:
   # deliberately truncated field whose vesicles are still present in the fate
   # and rupture analyses. Keyed (population, voltage, experiment).
   endpoint_censored_by = {}
-  # Size-window tallies, accumulated in the loop because the rejected
-  # vesicles never become rows and so cannot be counted from the table.
-  size_kept, size_dropped = {}, {}
-  n_size_no_radius = 0
 
   all_fate = [f for f in root.glob("**/*_guv_fate_classification.csv")
               if RESULTS_SUBFOLDER not in f.parts]
@@ -621,30 +702,6 @@ def aggregate_pipeline_results(outputs_root: str) -> pd.DataFrame:
           cortex_status = str(guv_cx.iloc[0].get("cortex_status", "UNKNOWN"))
           cortex_contrast = guv_cx.iloc[0].get("cortex_contrast", np.nan)
           prepulse_lumen_abs = guv_cx.iloc[0].get("prepulse_lumen_abs", np.nan)
-
-      # SIZE WINDOW, applied here rather than to the finished table.
-      # Everything below this point -- the endpoint read, the truncated-trace
-      # response call, the per-frame column lookups -- is work done per
-      # vesicle, and four vesicles in five are about to be discarded. Placing
-      # the test after the cortex status lookup, which is a cheap row match,
-      # lets the tally below break the loss down by phenotype rather than by
-      # raw preparation.
-      if SIZE_WINDOW_UM is not None:
-        _lo, _hi = SIZE_WINDOW_UM
-        if not (np.isfinite(radius_um) and _lo <= radius_um <= _hi):
-          _g = assign_cortex_group({"population": population,
-                                    "cortex_status": cortex_status,
-                                    "cortex_contrast": cortex_contrast})
-          _k = (_g, voltage)
-          size_dropped[_k] = size_dropped.get(_k, 0) + 1
-          if not np.isfinite(radius_um):
-            n_size_no_radius += 1
-          continue
-        _g = assign_cortex_group({"population": population,
-                                  "cortex_status": cortex_status,
-                                  "cortex_contrast": cortex_contrast})
-        _k = (_g, voltage)
-        size_kept[_k] = size_kept.get(_k, 0) + 1
 
       radius_bin = assign_size_bin(radius_um)
       intensity_cat = None
@@ -776,9 +833,6 @@ def aggregate_pipeline_results(outputs_root: str) -> pd.DataFrame:
     print("  worst-affected experiments:")
     for exp_name, n_dropped in worst:
       print(f"    {n_dropped:>3}  {exp_name}")
-
-  if SIZE_WINDOW_UM is not None:
-    _report_size_window(size_kept, size_dropped, n_size_no_radius)
 
   out = pd.DataFrame(records)
 
@@ -1089,9 +1143,22 @@ def report_endpoint_times(df: pd.DataFrame):
   print()
 
 def _filter_stagnate(df: pd.DataFrame) -> pd.DataFrame:
+  """Stagnate vesicles with a usable pre-pulse baseline.
+
+  The intensity_category is deliberately NOT filtered on here. It is derived
+  from the endpoint change, which is the outcome every figure downstream
+  measures, so excluding "Increase Intensity" would drop vesicles on the
+  basis of their result: it truncates the released-fraction distribution at
+  the left, raises the apparent intact fraction, and does so unequally
+  between preparations, since gainers are not evenly distributed. It also
+  made this gate disagree with susceptibility.py's, which keeps them, so the
+  same field carried two different denominators in one results section.
+
+  The pre-pulse tolerance stays. That one is a check on the normalisation,
+  decided before the pulse and independent of what the vesicle then did.
+  """
   return df[
       (df["size_category"] == "Stagnate")
-      & (df["intensity_category"].isin(["Lose Intensity", "Flatline"]))
       & ((df["i_pre"] - 1.0).abs() <= PRE_PULSE_TOLERANCE)
   ].copy()
 
@@ -1198,6 +1265,59 @@ def report_tau_yield(df: pd.DataFrame):
           "response call at the matched time. They are out of the numerator "
           "AND the denominator of n_responding.")
   print()
+
+def report_response_agreement(df: pd.DataFrame) -> pd.DataFrame:
+  """Do the response call and the endpoint category agree, and where not?
+
+  Two quantities in this pipeline are compared against the same number,
+  0.05, and they are not the same quantity:
+
+    is_responding      run_analysis._observed_response takes the median of
+                       the first few POST-pulse frames as its baseline and
+                       requires the fall to clear max(0.05, 3 * noise).
+    intensity_category i_final - i_pre, referenced to the PRE-pulse mean,
+                       and compared against INTENSITY_DIFF_THRESHOLD.
+
+  A vesicle whose trace sits above its pre-pulse mean in the first frames
+  after the pulse can therefore clear the response gate on a total change
+  below 0.05, and one whose decline is shallow but steady can do the
+  opposite. Both are legitimate readings of the same trace; what is not
+  legitimate is quoting a count from one next to a count from the other
+  without saying they were made differently. This prints the cross-tab so
+  the overlap is a number in the log rather than an assumption.
+  """
+  need = {"is_responding", "intensity_category"}
+  if not need.issubset(df.columns):
+    return pd.DataFrame()
+  sub = df[df["is_responding"].notna()].copy()
+  if sub.empty:
+    return pd.DataFrame()
+  sub["is_responding"] = sub["is_responding"].astype(bool)
+  tab = pd.crosstab(sub["is_responding"], sub["intensity_category"])
+  print("\nResponse call against endpoint category:")
+  print(tab.to_string())
+
+  lost = sub["intensity_category"] == "Lose Intensity"
+  odd_hi = sub[sub["is_responding"] & ~lost]      # responding, change < 5%
+  odd_lo = sub[~sub["is_responding"] & lost]      # >5% change, gate not met
+  print(f"  responding but endpoint change within "
+        f"{INTENSITY_DIFF_THRESHOLD:.0%}: {len(odd_hi)}")
+  print(f"  endpoint change beyond {INTENSITY_DIFF_THRESHOLD:.0%} but not "
+        f"scored responding: {len(odd_lo)}")
+  if len(odd_lo):
+    d = (-odd_lo["diff"]).abs()
+    print(f"    their released fractions run {d.min():.3f}-{d.max():.3f}, so "
+          "the gate is discarding the shallowest losses rather than a random "
+          "selection: the responding fraction is a floor, not an estimate.")
+  for label, cell in (("responding, endpoint inside the band", odd_hi),):
+    if cell.empty:
+      continue
+    print(f"  {label} -- do not build a claim on these:")
+    for _, r in cell.iterrows():
+      print(f"    {r['experiment']} GUV {r['guv_id']}  "
+            f"released {-r['diff']:+.4f}  {r.get('response_class', '')}")
+  return tab
+
 
 def plot_drop_by_cortex_status(df: pd.DataFrame, output_dir: str):
   out_path = sub_dir(output_dir, "cortex_class")
@@ -1517,11 +1637,42 @@ def _peak_time_grid(t_max: float) -> np.ndarray:
       np.arange(10.0, t_max + 5.0, 5.0),
   ]))
 
-def collect_cortex_peak_traces(df: pd.DataFrame, outputs_root: str):
-  root = Path(outputs_root)
+def cortex_stage_population(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame:
+  """Cortex-bearing, Stagnate, and holding their size across the record.
+
+  The cortex stages measure a shell whose brightness is read around the
+  vesicle outline. A vesicle that lost projected area between the pre-pulse
+  frames and the end of the window changed that outline, so its peak height
+  and its pole/equator index are partly a geometry change rather than a cortex
+  change. Excluding them is the same criterion Section 3 applies to the dye
+  measurement, on the same tolerance, for the same reason.
+
+  Note what this does NOT apply: the size window. These stages run on the
+  pre-window population, because the pole/equator index is normalised within
+  each vesicle and so does not compare across sizes. The cortex peak dose
+  series does compare across sizes and inherits the caveat; it is stated
+  rather than filtered, since matching would cost roughly half the traces on
+  a measurement whose result is a bound.
+  """
   keep = df.assign(group=df.apply(assign_cortex_group, axis=1))
   keep = keep[(keep["group"] == "Branched, cortex")
               & (keep["size_category"] == "Stagnate")]
+  n0 = len(keep)
+  if "terminal_norm_radius" in keep.columns:
+    stable = keep["terminal_norm_radius"].between(
+        1.0 - RADIUS_STABLE_TOL, 1.0 + RADIUS_STABLE_TOL)
+    n_drop = int((~stable).sum())
+    keep = keep[stable]
+    if verbose and n_drop:
+      print(f"  Cortex stages: {n_drop} of {n0} cortex-bearing stagnate "
+            f"GUV(s) dropped for changing size by more than "
+            f"{RADIUS_STABLE_TOL:.0%}; {len(keep)} retained.")
+  return keep
+
+
+def collect_cortex_peak_traces(df: pd.DataFrame, outputs_root: str):
+  root = Path(outputs_root)
+  keep = cortex_stage_population(df)
   if keep.empty:
     return None, None, None
   wanted = {(r["experiment"], str(r["guv_id"])): r["voltage"]
@@ -1559,7 +1710,17 @@ def collect_cortex_peak_traces(df: pd.DataFrame, outputs_root: str):
   if not raw:
     return None, None, None
 
-  grid = _peak_time_grid(t_max)
+  # The grid stops at ENDPOINT_MATCHED_T_S rather than at the longest record.
+  #
+  # Two reasons, and they point the same way. The bleach reference only covers
+  # ~441 s, so past that the divisor is all-NaN and every corrected trace is
+  # blanked -- visible as "All-NaN slice encountered" and, in the figure, as
+  # the long records simply stopping. And a median across voltages taken past
+  # 431 s is computed on whichever sessions happened to record longer, which
+  # is the record-length confound the matched endpoint exists to remove.
+  t_grid_max = t_max if ENDPOINT_MATCHED_T_S is None else min(
+      t_max, float(ENDPOINT_MATCHED_T_S))
+  grid = _peak_time_grid(t_grid_max)
   by_voltage = {}
   for volt, t, y in raw:
     interp = np.interp(grid, t, y)
@@ -1860,9 +2021,7 @@ def collect_pole_equator_traces(df: pd.DataFrame, outputs_root: str):
   Returns (None, None, None) if nothing usable was found.
   """
   root = Path(outputs_root)
-  keep = df.assign(group=df.apply(assign_cortex_group, axis=1))
-  keep = keep[(keep["group"] == "Branched, cortex")
-              & (keep["size_category"] == "Stagnate")]
+  keep = cortex_stage_population(df, verbose=False)
   if keep.empty:
     print("Pole/equator pooling skipped: no cortex-bearing stagnate GUVs.")
     return None, None, None
@@ -2085,10 +2244,18 @@ def _boot_median_ci(v, clusters=None, n_boot: int = None, seed: int = 0):
 def report_pole_equator(per_guv: pd.DataFrame, out_path: Path) -> pd.DataFrame:
   """Per-window, per-stratum, per-voltage summary of the polarization index.
 
-  The test is a Wilcoxon signed-rank of each GUV's window value against zero,
-  not a comparison of two group means: every vesicle carries its own
-  pre-pulse normalisation, so zero is a fixed reference rather than an
-  estimated one, and the paired form is what matches that design.
+  The test is a one-sample clustered percentile bootstrap of each GUV's window
+  value against zero, not a comparison of two group means: every vesicle
+  carries its own pre-pulse normalisation, so zero is a fixed reference rather
+  than an estimated one, and the one-sample form is what matches that design.
+
+  Resampling is over whole EXPERIMENTS, not vesicles. Vesicles in one chamber
+  share a preparation, a field and a day, so the chamber is the unit of
+  replication. This is why the test is a bootstrap and not the Wilcoxon
+  signed-rank that used to sit here: Wilcoxon has no notion of clustering and
+  returned intervals narrower than the design supports. The confidence
+  interval and the p-value both come out of this one procedure, so they cannot
+  disagree with each other.
   """
   if per_guv is None or per_guv.empty:
     return pd.DataFrame()
@@ -2665,9 +2832,7 @@ def plot_cortex_peak_breakdown(df: pd.DataFrame, output_dir: str):
     print("Cortex peak breakdown skipped: no peak metrics.")
     return
 
-  sub = df.assign(group=df.apply(assign_cortex_group, axis=1))
-  sub = sub[sub["group"] == "Branched, cortex"]
-  sub = sub[sub["size_category"] == "Stagnate"]
+  sub = cortex_stage_population(df, verbose=False)
   if sub.empty:
     print("Cortex peak breakdown skipped: no cortex-bearing stagnate GUVs.")
     return
@@ -2937,7 +3102,10 @@ def generate_separate_pdf_plots(df: pd.DataFrame, output_dir: str):
 
   size_categories = ["Grow", "Stagnate", "Reduce", "Rupture/Collapse"]
   size_colors = {c: SIZE_CATEGORY_COLORS[c] for c in size_categories}
-  intensity_categories = ["Lose Intensity", "Flatline"]
+  # All three, not two. The gainers are few but they are vesicles that were
+  # scored, and a bar chart whose bars do not sum to the condition's n is a
+  # chart the reader cannot check against any other figure.
+  intensity_categories = ["Lose Intensity", "Flatline", "Increase Intensity"]
 
   fig1, ax1 = plt.subplots(figsize=fig_size("size_category_distribution", max(8, 1.1 * len(voltages) + 3), 5.5))
   x = np.arange(len(voltages))
@@ -2999,7 +3167,7 @@ def generate_separate_pdf_plots(df: pd.DataFrame, output_dir: str):
   fig2, ax2 = plt.subplots(figsize=fig_size("stagnate_intensity_counts", max(8, 1.1 * len(voltages) + 3), 5.5))
   n_series = len(pops) * len(intensity_categories)
   bar_w = 0.8 / max(n_series, 1)
-  hatches = {"Lose Intensity": "", "Flatline": "///"}
+  hatches = {"Lose Intensity": "", "Flatline": "///", "Increase Intensity": "..."}
 
   s_idx = 0
   for pop in pops:
@@ -3096,6 +3264,13 @@ def generate_separate_pdf_plots(df: pd.DataFrame, output_dir: str):
             color=ANNOTATION_TEXT,
         )
 
+    # The band the figure is read against. Every statement made from this
+    # panel is about how many vesicles ended inside or outside
+    # INTENSITY_DIFF_THRESHOLD of their baseline, and without the band drawn
+    # the reader has to take that boundary on trust and place it by eye.
+    ax3.axhspan(1 - INTENSITY_DIFF_THRESHOLD, 1 + INTENSITY_DIFF_THRESHOLD,
+                color=PALETTE["pale_blue"], alpha=0.5, lw=0, zorder=0)
+
     ax3.set_xticks(np.arange(len(voltages)))
     ax3.set_xticklabels(field_labels(voltages), fontsize=9, rotation=45)
     ax3.set_xlabel(FIELD_AXIS_LABEL)
@@ -3109,7 +3284,8 @@ def generate_separate_pdf_plots(df: pd.DataFrame, output_dir: str):
 
   fig3.suptitle(
       "Intensity Drop Trajectories per Field Strength"
-      f"\n(Pre-Pulse → Final {ENDPOINT_N_FRAMES}-Frame Average)"
+      f"\n(Pre-Pulse → Final {ENDPOINT_N_FRAMES}-Frame Average;"
+      f" shaded band is ±{INTENSITY_DIFF_THRESHOLD:.0%} of baseline)"
   )
   style_figure("intensity_drop_trajectories")
   plt.tight_layout()
@@ -3193,7 +3369,8 @@ if __name__ == "__main__":
   results_dir = Path(outputs_root) / RESULTS_SUBFOLDER
   results_dir.mkdir(parents=True, exist_ok=True)
 
-  df_summary = aggregate_pipeline_results(outputs_root)
+  df_all = aggregate_pipeline_results(outputs_root)
+  df_summary = apply_size_window(df_all)
   df_summary.to_csv(results_dir / "guv_bulk_summary.csv", index=False)
   write_layout_readme(results_dir)
   plot_lumen_abs_histogram(df_summary, str(results_dir))
