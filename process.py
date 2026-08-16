@@ -183,6 +183,11 @@ README = """Bulk_Analysis_Results
 =====================
 
 guv_bulk_summary.csv      one row per GUV, every experiment. Start here.
+excluded_intensity_gainers.csv
+                          vesicles removed before any figure or statistic
+                          because their endpoint intensity rose above the
+                          pre-pulse baseline. Written on every run, empty
+                          when there were none.
 
 01_dye_release/           what the dye did: released fraction per vesicle
                           against voltage, drop trajectories, and the
@@ -334,59 +339,130 @@ EXCLUDE_FATES = ("LOST_PREPULSE", "OUT_OF_FRAME")
 #      RISES by more than INTENSITY_DIFF_THRESHOLD is excluded, leaving two
 #      exhaustive classes: flatline and efflux.
 #
-# On (4): every gainer in the interpreted range shrank -- terminal_norm_radius
-# 0.93 to 0.99, median 0.96, against 1.00 for the rest -- so condition (2)
-# removes most of them on the mechanism rather than on the outcome. The
-# remainder are dropped here because the two-class scheme requires it. Both
-# counts are printed so the exclusion is visible rather than assumed.
+# On (4): this is now done at the source by drop_intensity_gainers, so that
+# the figure functions -- which never call this one -- exclude them too. The
+# check is kept here as a guard for any caller that reads a table predating
+# that change; on a current run it reports zero. Every gainer in the
+# interpreted range shrank (terminal_norm_radius 0.93 to 0.99, median 0.96,
+# against 1.00 for the rest), so condition (2) would remove most of them on
+# the mechanism rather than on the outcome in any case.
 RADIUS_STABLE_TOL = 0.05
 
 
-def analysis_population(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame:
+# Written into the susceptibility output folder. Every vesicle removed by
+# analysis_population, one row each, with the condition that removed it.
+POPULATION_ATTRITION_CSV = "excluded_analysis_population.csv"
+
+
+def analysis_population(df: pd.DataFrame, verbose: bool = True,
+                        attrition_dir=None) -> pd.DataFrame:
   """The vesicles every reported number is computed on.
 
-  Expects a frame from guv_bulk_summary.csv, i.e. after the fate filter and
-  the size window have already been applied upstream. The size check is
-  repeated here anyway: this function is the definition, and a caller that
-  reads the CSV directly must get the same population as one that does not.
+  Expects a frame from guv_bulk_summary.csv, i.e. after the fate filter, the
+  gainer filter and the size window have already been applied upstream. Those
+  checks that CAN be repeated here are repeated: this function is the
+  definition, and a caller that reads the CSV directly must get the same
+  population as one that does not.
+
+  Six conditions are applied here, in order:
+
+    1. Radius inside SIZE_WINDOW_UM. dV_m = 1.5 E R cos(theta) is linear in
+       radius, so vesicles of different size at one field are not at one
+       treatment.
+    2. Radius stable to within RADIUS_STABLE_TOL across the matched window. A
+       vesicle that changed size changed the quantity its intensity is
+       normalised by.
+    3. An endpoint call exists at ENDPOINT_MATCHED_T_S.
+    4. The endpoint change is a loss or no change (guard; gainers are removed
+       at aggregation by drop_intensity_gainers, so this reports zero).
+    5. Not Rupture/Collapse. Grow and Reduce are already excluded by (2),
+       which is the tighter test -- both need a 15% terminal radius change
+       against this function's 5% -- but a rupture is called from tracking
+       loss rather than from terminal radius, so a vesicle that held its size
+       until it burst after the matched time passes (2) and has to be named
+       here. Retained fates are printed so any survivor of (2) that is not
+       Stagnate is visible rather than assumed absent.
+    6. Pre-pulse baseline within PRE_PULSE_TOLERANCE of 1.0. Intensities are
+       normalised to each vesicle's own pre-pulse mean, so a baseline that
+       has already drifted before the pulse makes the endpoint change a
+       measurement of that drift as much as of the dye. This is the same
+       gate _filter_stagnate applies to the figures; before it was added here
+       the figures and the Section 3 table applied different pre-pulse
+       standards to the same vesicles.
+
+  A seventh exclusion is upstream and cannot be rechecked here: vesicles that
+  left the field of view (OUT_OF_FRAME) and vesicles the tracker lost before
+  the pulse was delivered (LOST_PREPULSE) are dropped in
+  aggregate_pipeline_results via EXCLUDE_FATES and carry no row in the bulk
+  table at all, so there is no raw fate column left to test. Their counts are
+  printed by that stage.
   """
   n0 = len(df)
   out = df.copy()
   steps = []
+  removed = []
+
+  def cut(keep, label):
+    nonlocal out
+    n = int((~keep).sum())
+    steps.append((label, n))
+    if n and attrition_dir is not None:
+      removed.append(out[~keep].assign(reason=label))
+    out = out[keep]
 
   if SIZE_WINDOW_UM is not None and "radius_um" in out.columns:
     lo, hi = SIZE_WINDOW_UM
-    keep = out["radius_um"].between(lo, hi)
-    steps.append((f"radius outside {lo}-{hi} um or unmeasured",
-                  int((~keep).sum())))
-    out = out[keep]
+    cut(out["radius_um"].between(lo, hi),
+        f"radius outside {lo}-{hi} um or unmeasured")
 
   if "terminal_norm_radius" in out.columns:
-    keep = (out["terminal_norm_radius"]
-            .between(1.0 - RADIUS_STABLE_TOL, 1.0 + RADIUS_STABLE_TOL))
-    steps.append((f"radius changed by more than {RADIUS_STABLE_TOL:.0%}",
-                  int((~keep).sum())))
-    out = out[keep]
+    cut(out["terminal_norm_radius"].between(1.0 - RADIUS_STABLE_TOL,
+                                            1.0 + RADIUS_STABLE_TOL),
+        f"radius changed by more than {RADIUS_STABLE_TOL:.0%}")
 
   if "diff" in out.columns:
-    keep = out["diff"].notna()
-    steps.append((f"no endpoint call at t = {ENDPOINT_MATCHED_T_S} s",
-                  int((~keep).sum())))
-    out = out[keep]
+    cut(out["diff"].notna(),
+        f"no endpoint call at t = {ENDPOINT_MATCHED_T_S} s")
+    cut(out["diff"] <= INTENSITY_DIFF_THRESHOLD,
+        f"gained more than {INTENSITY_DIFF_THRESHOLD:.0%} "
+        "(should be 0; already dropped upstream)")
 
-    keep = out["diff"] <= INTENSITY_DIFF_THRESHOLD
-    steps.append((f"gained more than {INTENSITY_DIFF_THRESHOLD:.0%}",
-                  int((~keep).sum())))
-    out = out[keep]
+  if "size_category" in out.columns:
+    cut(out["size_category"] != "Rupture/Collapse", "ruptured or collapsed")
+
+  if "i_pre" in out.columns:
+    cut((out["i_pre"] - 1.0).abs() <= PRE_PULSE_TOLERANCE,
+        f"pre-pulse baseline more than {PRE_PULSE_TOLERANCE:.0%} from 1.0")
 
   if verbose:
     print(f"\nAnalysis population: {len(out)} of {n0} GUV(s) retained.")
     for label, n in steps:
       if n:
         print(f"  -{n:<4} {label}")
+    if "size_category" in out.columns:
+      fates = out["size_category"].value_counts()
+      print("  fates retained: "
+            + ", ".join(f"{k} {v}" for k, v in fates.items()))
+      stray = fates.drop("Stagnate", errors="ignore")
+      if stray.sum():
+        print(f"    {int(stray.sum())} retained vesicle(s) are not Stagnate. "
+              "They held their radius to within "
+              f"{RADIUS_STABLE_TOL:.0%} but were called otherwise; check "
+              "before describing this population as stagnate.")
     if "population" in out.columns:
       for g, n in out["population"].value_counts().items():
         print(f"    {g:<24} {n}")
+
+  if attrition_dir is not None:
+    path = Path(attrition_dir) / POPULATION_ATTRITION_CSV
+    path.parent.mkdir(parents=True, exist_ok=True)
+    gone = (pd.concat(removed, ignore_index=True) if removed
+            else pd.DataFrame(columns=list(df.columns) + ["reason"]))
+    cols = ["reason"] + [c for c in _GAINER_ATTRITION_COLS
+                         if c != "reason" and c in gone.columns]
+    gone.reindex(columns=cols).to_csv(path, index=False)
+    if verbose:
+      print(f"  {len(gone)} excluded row(s) written to {path}")
   return out.copy()
 
 
@@ -552,6 +628,73 @@ def apply_size_window(df: pd.DataFrame) -> pd.DataFrame:
             f"{int(r['before']):3d} -> {int(r['after']):d}")
   print("  Set SIZE_WINDOW_UM = None to restore the whole population.")
   return df[keep].copy()
+
+
+# Written next to guv_bulk_summary.csv. Rows dropped by drop_intensity_gainers,
+# with the columns needed to find each vesicle again and to see how far over
+# the threshold it was.
+GAINER_ATTRITION_CSV = "excluded_intensity_gainers.csv"
+
+_GAINER_ATTRITION_COLS = [
+    "reason", "experiment", "guv_id", "population", "voltage",
+    "size_category", "radius_um", "terminal_norm_radius",
+    "i_pre", "i_final", "diff", "intensity_category",
+    "t_endpoint_used", "is_responding",
+]
+
+
+def drop_intensity_gainers(df: pd.DataFrame, results_dir=None,
+                           verbose: bool = True) -> pd.DataFrame:
+  """Remove vesicles whose endpoint intensity ROSE, at the source table.
+
+  Applied once, immediately after aggregation, so that every figure, every
+  summary and every statistic downstream runs on the same population. The
+  earlier arrangement had the exclusion only inside analysis_population, which
+  susceptibility.py calls and the figure functions do not, so the Section 3
+  counts and the intensity-breakdown figure carried different denominators
+  for the same conditions.
+
+  Efflux lowers lumen intensity. A vesicle that ends more than
+  INTENSITY_DIFF_THRESHOLD above its own pre-pulse baseline has not released
+  dye, so it belongs to neither of the two classes the dye analysis reports,
+  and there is no field at which its behaviour is the measurement. Most of
+  them shrank -- terminal_norm_radius 0.93 to 0.99 against 1.00 for the rest
+  -- which is why the ROI came to enclose brighter surroundings.
+
+  Records with no endpoint call (diff is NaN) are NOT touched here. A missing
+  measurement is not a gain, and it is handled by the endpoint gate in
+  analysis_population.
+
+  The dropped rows are written to GAINER_ATTRITION_CSV when results_dir is
+  given, including when there are none, so "checked, nothing to exclude" is
+  distinguishable from "this never ran".
+  """
+  if df.empty or "diff" not in df.columns:
+    return df
+  gain = df["diff"] > INTENSITY_DIFF_THRESHOLD
+  dropped = df[gain].copy()
+  kept = df[~gain].copy()
+
+  if verbose:
+    print(f"\nINTENSITY GAINERS excluded: {int(gain.sum())} of {len(df)} "
+          f"vesicle(s) ended more than {INTENSITY_DIFF_THRESHOLD:.0%} above "
+          "their pre-pulse baseline.")
+    if not dropped.empty:
+      grp = dropped.assign(_g=dropped.apply(assign_cortex_group, axis=1))
+      for (g, v), n in grp.groupby(["_g", "voltage"]).size().items():
+        print(f"    {g:<24} {v:>6}  {n:3d}")
+
+  if results_dir is not None:
+    out = dropped.copy()
+    out.insert(0, "reason", "endpoint intensity gain > "
+               f"{INTENSITY_DIFF_THRESHOLD:.0%} of pre-pulse baseline")
+    cols = [c for c in _GAINER_ATTRITION_COLS if c in out.columns]
+    path = Path(results_dir) / GAINER_ATTRITION_CSV
+    path.parent.mkdir(parents=True, exist_ok=True)
+    out.reindex(columns=cols).to_csv(path, index=False)
+    if verbose:
+      print(f"  Excluded rows written to {path}")
+  return kept
 
 
 def aggregate_pipeline_results(outputs_root: str) -> pd.DataFrame:
@@ -1145,14 +1288,12 @@ def report_endpoint_times(df: pd.DataFrame):
 def _filter_stagnate(df: pd.DataFrame) -> pd.DataFrame:
   """Stagnate vesicles with a usable pre-pulse baseline.
 
-  The intensity_category is deliberately NOT filtered on here. It is derived
-  from the endpoint change, which is the outcome every figure downstream
-  measures, so excluding "Increase Intensity" would drop vesicles on the
-  basis of their result: it truncates the released-fraction distribution at
-  the left, raises the apparent intact fraction, and does so unequally
-  between preparations, since gainers are not evenly distributed. It also
-  made this gate disagree with susceptibility.py's, which keeps them, so the
-  same field carried two different denominators in one results section.
+  The intensity_category is not filtered on here, because it no longer needs
+  to be: drop_intensity_gainers removes "Increase Intensity" vesicles from the
+  aggregated table before any consumer sees it, so the frame arriving here
+  holds only flatlines and losers. Filtering again at this point would be a
+  second definition of the same exclusion, which is how this gate and
+  susceptibility.py's came to disagree in the first place.
 
   The pre-pulse tolerance stays. That one is a check on the normalisation,
   decided before the pulse and independent of what the vesicle then did.
@@ -3102,10 +3243,12 @@ def generate_separate_pdf_plots(df: pd.DataFrame, output_dir: str):
 
   size_categories = ["Grow", "Stagnate", "Reduce", "Rupture/Collapse"]
   size_colors = {c: SIZE_CATEGORY_COLORS[c] for c in size_categories}
-  # All three, not two. The gainers are few but they are vesicles that were
-  # scored, and a bar chart whose bars do not sum to the condition's n is a
-  # chart the reader cannot check against any other figure.
-  intensity_categories = ["Lose Intensity", "Flatline", "Increase Intensity"]
+  # Two, not three. Gainers are gone from the frame by the time it gets here
+  # (drop_intensity_gainers, at aggregation), so these two classes are
+  # exhaustive and the bars sum to the condition's n -- which is the same n
+  # Section 3 reports. The excluded vesicles are listed in
+  # GAINER_ATTRITION_CSV rather than drawn as a third bar.
+  intensity_categories = ["Lose Intensity", "Flatline"]
 
   fig1, ax1 = plt.subplots(figsize=fig_size("size_category_distribution", max(8, 1.1 * len(voltages) + 3), 5.5))
   x = np.arange(len(voltages))
@@ -3167,7 +3310,7 @@ def generate_separate_pdf_plots(df: pd.DataFrame, output_dir: str):
   fig2, ax2 = plt.subplots(figsize=fig_size("stagnate_intensity_counts", max(8, 1.1 * len(voltages) + 3), 5.5))
   n_series = len(pops) * len(intensity_categories)
   bar_w = 0.8 / max(n_series, 1)
-  hatches = {"Lose Intensity": "", "Flatline": "///", "Increase Intensity": "..."}
+  hatches = {"Lose Intensity": "", "Flatline": "///"}
 
   s_idx = 0
   for pop in pops:
@@ -3370,6 +3513,7 @@ if __name__ == "__main__":
   results_dir.mkdir(parents=True, exist_ok=True)
 
   df_all = aggregate_pipeline_results(outputs_root)
+  df_all = drop_intensity_gainers(df_all, results_dir)
   df_summary = apply_size_window(df_all)
   df_summary.to_csv(results_dir / "guv_bulk_summary.csv", index=False)
   write_layout_readme(results_dir)

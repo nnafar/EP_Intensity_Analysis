@@ -120,7 +120,7 @@ def _colour(pop: str):
 ELECTRODE_GAP_CM = 0.3
 
 
-def load_summary(results_dir: Path) -> pd.DataFrame:
+def load_summary(results_dir: Path, attrition_dir=None) -> pd.DataFrame:
   path = results_dir / "guv_bulk_summary.csv"
   if not path.exists():
     raise SystemExit(f"{path} not found -- run the intensity stage first.")
@@ -141,7 +141,7 @@ def load_summary(results_dir: Path) -> pd.DataFrame:
   # The analysis population, defined once in process.py and applied here so
   # that this module cannot report a denominator the kinetics stage does not
   # share. See process.analysis_population for what it removes and why.
-  df = process.analysis_population(df)
+  df = process.analysis_population(df, attrition_dir=attrition_dir)
 
   df["voltage_V"] = df["voltage"].astype(str).str.extract(r"(\d+)").astype(float)
   # Applied field strength. This is the treatment, and inside the size window
@@ -1545,7 +1545,7 @@ def main(results_dir=None, root=None):
   # The per-experiment CSVs live one level up from the results folder.
   tree = Path(root) if root else base.parent
 
-  df = load_summary(base)
+  df = load_summary(base, attrition_dir=out)
   print(f"Loaded {len(df)} GUV rows from {base / 'guv_bulk_summary.csv'}")
   report_size_distributions(df, out)
   # Runs before the dose figures so that a disagreement between

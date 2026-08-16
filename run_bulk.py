@@ -83,6 +83,11 @@ def run_intensity(root: Path):
   # vesicle including the ones the window discards. Filtering earlier would
   # save that work but would leave the cortex stages with nothing to run on.
   df_all = process.aggregate_pipeline_results(str(root))
+  # Before anything else touches the table. Both branches below start from
+  # df_all -- the dye stages through apply_size_window, the cortex stages
+  # through cortex_stage_population -- so excluding here is what makes the
+  # two sets of figures agree on which vesicles exist.
+  df_all = process.drop_intensity_gainers(df_all, results)
   df = process.apply_size_window(df_all)
   if df.empty:
     print("No GUV records found -- has batch_run.py been run?")
@@ -93,8 +98,12 @@ def run_intensity(root: Path):
   print(f"Saved {summary_csv}  ({len(df)} GUV rows, "
         f"{df['experiment'].nunique()} experiments)")
   print(f"  This file is the SIZE-MATCHED population and is what "
-        f"susceptibility.py reads. The cortex-breakdown stages below run on "
-        f"all {len(df_all)} vesicles instead; see the note in run_intensity.")
+        f"susceptibility.py reads, which then applies "
+        f"process.analysis_population to it. The cortex-breakdown stages "
+        f"below start from all {len(df_all)} vesicles instead and apply "
+        f"process.cortex_stage_population: cortex-bearing, Stagnate and "
+        f"radius-stable, but NOT size-windowed. Their counts will not "
+        f"reconcile with the dye sections and are not meant to.")
   process.write_layout_readme(results)
 
   # Aggregated once and passed to each consumer, rather than letting
