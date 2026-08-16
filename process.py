@@ -355,7 +355,8 @@ POPULATION_ATTRITION_CSV = "excluded_analysis_population.csv"
 
 
 def analysis_population(df: pd.DataFrame, verbose: bool = True,
-                        attrition_dir=None) -> pd.DataFrame:
+                        attrition_dir=None, size_window="config"
+                        ) -> pd.DataFrame:
   """The vesicles every reported number is computed on.
 
   Expects a frame from guv_bulk_summary.csv, i.e. after the fate filter, the
@@ -410,8 +411,13 @@ def analysis_population(df: pd.DataFrame, verbose: bool = True,
       removed.append(out[~keep].assign(reason=label))
     out = out[keep]
 
-  if SIZE_WINDOW_UM is not None and "radius_um" in out.columns:
-    lo, hi = SIZE_WINDOW_UM
+  # size_window is the configured window unless a caller passes another one.
+  # Only the radius sensitivity does that, and it does it so the sweep runs
+  # through this function rather than reimplementing the other five cuts
+  # beside it, where they could drift.
+  window = SIZE_WINDOW_UM if size_window == "config" else size_window
+  if window is not None and "radius_um" in out.columns:
+    lo, hi = window
     cut(out["radius_um"].between(lo, hi),
         f"radius outside {lo}-{hi} um or unmeasured")
 
@@ -531,16 +537,21 @@ def load_cortex_status(exp_dir: Path) -> pd.DataFrame:
 _RESPONDING_IMPORT_FAILED = []
 
 
-def _responding_at(t_c: np.ndarray, y_c: np.ndarray):
-  """run_analysis's own response call, applied to a truncated trace.
+def _trace_noise_at(t_c: np.ndarray, y_c: np.ndarray):
+  """High-frequency noise scale of a truncated trace, in normalised units.
 
-  _observed_response and the two thresholds are imported rather than
-  reimplemented. A second copy of this rule in this file is precisely the
-  drift that would make the matched-time and whole-record numbers
-  incomparable for a reason that had nothing to do with the data.
+  The noise half of run_analysis._observed_response is imported rather than
+  reimplemented: the release threshold below scales with this number, so a
+  second copy of the estimator here is exactly the drift that would make the
+  threshold mean different things in different files.
 
-  Returns True/False, or None if the rule could not be applied (in which case
-  the caller leaves the original whole-record call in place).
+  Only the NOISE is taken. The change half of that function measures the fall
+  from the first post-pulse samples, and poration onset falls inside the first
+  imaging frame, so that baseline has already absorbed part of the release.
+  The release magnitude is measured against i_pre instead, upstream of the
+  pulse, where nothing has happened yet.
+
+  Returns the noise, or None if it could not be estimated.
   """
   try:
     from run_analysis import _observed_response
@@ -548,19 +559,63 @@ def _responding_at(t_c: np.ndarray, y_c: np.ndarray):
     if not _RESPONDING_IMPORT_FAILED:
       _RESPONDING_IMPORT_FAILED.append(e)
       print(f"  WARNING: cannot import run_analysis._observed_response ({e}). "
-            "is_responding is left as computed over the whole record, so it "
-            "does not match the truncated i_final. Do not read the responding "
-            "fraction from this run.")
+            "The release threshold falls back to the flat "
+            f"{INTENSITY_DIFF_THRESHOLD:.0%} floor with no per-vesicle noise "
+            "term. Runs with and without this warning are not comparable.")
     return None
 
-  efflux = str(getattr(cfg, "MODEL_TO_USE", "EFFLUX")).startswith("EFFLUX")
-  drop, noise = _observed_response(np.asarray(t_c, float),
-                                   np.asarray(y_c, float), efflux=efflux)
-  k = float(getattr(cfg, "FIT_RESPONSE_AMPLITUDE_SIGMA", 3.0))
-  min_amp = float(getattr(cfg, "FIT_MIN_RESPONSE_AMPLITUDE", 0.05))
-  if not (np.isfinite(drop) and np.isfinite(noise)):
-    return None
-  return bool(drop > max(min_amp, k * noise))
+  _, noise = _observed_response(np.asarray(t_c, float),
+                                np.asarray(y_c, float), efflux=True)
+  return float(noise) if np.isfinite(noise) else None
+
+
+# Multiplier on each vesicle's own noise in the release test. Config may
+# override; the fit stage used the same name for the same purpose.
+EFFLUX_NOISE_SIGMA = float(getattr(cfg, "FIT_RESPONSE_AMPLITUDE_SIGMA", 3.0))
+
+# Mirrors of the two fit-quality gates, needed here only for the back-compat
+# path below.
+TAU_SE_RATIO_MAX = float(getattr(cfg, "TAU_SE_RATIO_MAX", 0.5))
+TAU_MAX_FRACTION_OF_RECORD = float(getattr(cfg, "TAU_MAX_FRACTION_OF_RECORD", 1/3))
+
+
+def _tau_fit_ok_from_row(fr) -> bool:
+  """Did the FIT constrain tau? Read the column, or rebuild it if absent.
+
+  run_analysis writes tau_fit_ok directly. Fit tables written before that
+  column existed carry tau_identifiable instead, which is NOT the same thing:
+  it has the old post-pulse response gate ANDed into it, and that gate is the
+  thing being removed. Rebuilding from tau_se_ratio and tau_over_record --
+  both of which those older tables do carry -- gives the fit-quality half on
+  its own, which is what this stage needs. That is what makes the change
+  re-aggregatable without refitting every experiment.
+  """
+  v = fr.get("tau_fit_ok", None)
+  if v is not None and not (isinstance(v, float) and np.isnan(v)):
+    return bool(v)
+  se = pd.to_numeric(fr.get("tau_se_ratio", np.nan), errors="coerce")
+  tor = pd.to_numeric(fr.get("tau_over_record", np.nan), errors="coerce")
+  return bool(np.isfinite(se) and se <= TAU_SE_RATIO_MAX
+              and np.isfinite(tor) and tor <= TAU_MAX_FRACTION_OF_RECORD)
+
+
+def efflux_threshold_for(noise) -> float:
+  """The drop a vesicle must show, against its pre-pulse mean, to count.
+
+      max(INTENSITY_DIFF_THRESHOLD, EFFLUX_NOISE_SIGMA * noise)
+
+  Two guards doing different jobs. The flat floor is an effect-size floor: it
+  keeps changes too small to matter out, and it sits in an empty interval of
+  the observed loss distribution rather than through a cluster. The noise term
+  is a per-vesicle detectability floor: a jittery trace has to fall further
+  before its fall is believable. For most vesicles here the noise term is the
+  smaller of the two and the floor binds, which is the intended behaviour --
+  the noise term exists so that the criterion scales if the data get worse,
+  not to do the work on this dataset.
+  """
+  if noise is None or not np.isfinite(noise):
+    return float(INTENSITY_DIFF_THRESHOLD)
+  return float(max(INTENSITY_DIFF_THRESHOLD, EFFLUX_NOISE_SIGMA * noise))
 
 
 # -----------------------------------------------------------------------------
@@ -639,7 +694,8 @@ _GAINER_ATTRITION_COLS = [
     "reason", "experiment", "guv_id", "population", "voltage",
     "size_category", "radius_um", "terminal_norm_radius",
     "i_pre", "i_final", "diff", "intensity_category",
-    "t_endpoint_used", "is_responding",
+    "t_endpoint_used", "efflux", "efflux_noise",
+    "efflux_threshold", "tau_fit_ok",
 ]
 
 
@@ -709,7 +765,7 @@ def aggregate_pipeline_results(outputs_root: str) -> pd.DataFrame:
   # rather than per row, so the cost of the setting is one visible number.
   endpoint_short = {}
   endpoint_no_time = set()
-  n_response_flipped = 0
+  n_efflux_noise_bound = 0
   n_endpoint_censored = 0
   # Which conditions the censoring falls on, not just how many vesicles it
   # takes. A total is not enough to write an n from: the loss is not spread
@@ -818,9 +874,11 @@ def aggregate_pipeline_results(outputs_root: str) -> pd.DataFrame:
       radius_um = np.nan
       tau = np.nan
       tau_se = np.nan
+      tau_fit_ok = False
       tau_identifiable = False
-      is_responding = False
-      response_class = None
+      efflux = False
+      efflux_noise = np.nan
+      efflux_thresh = np.nan
       tau_over_record = np.nan
       
       if df_fit is not None:
@@ -830,9 +888,7 @@ def aggregate_pipeline_results(outputs_root: str) -> pd.DataFrame:
           radius_um = fr.get("radius_um", np.nan)
           tau = fr.get("tau", np.nan)
           tau_se = fr.get("tau_SE", np.nan)
-          tau_identifiable = bool(fr.get("tau_identifiable", False))
-          is_responding = bool(fr.get("is_responding", False))
-          response_class = fr.get("response_class", None)
+          tau_fit_ok = _tau_fit_ok_from_row(fr)
           tau_over_record = fr.get("tau_over_record", np.nan)
 
       cortex_status = "UNKNOWN"
@@ -881,29 +937,36 @@ def aggregate_pipeline_results(outputs_root: str) -> pd.DataFrame:
             else:
               intensity_cat = "Lose Intensity"
 
-            # is_responding came off the FULL record, so leaving it alone
-            # would give a matched-time release magnitude next to a
-            # whole-record response call, and the dose-response figure plots
-            # both. Recomputed here on the truncated trace using
-            # run_analysis's own _observed_response and the same two config
-            # thresholds -- imported, not restated, so there is one
-            # definition of "responding" in the codebase and not two.
+            # THE release call, and the only one in the pipeline. A vesicle
+            # released dye if it fell, against its own PRE-pulse mean, by more
+            # than max(flat floor, 3 x its own noise). Everything downstream
+            # -- Section 3, the dose-response figure, the tau gate -- reads
+            # this one boolean, so there is no second criterion to reconcile
+            # it against.
+            #
+            # Measured against i_pre rather than against the first post-pulse
+            # samples because onset falls inside the first imaging frame: a
+            # post-pulse baseline has already absorbed part of the release.
+            # The noise scale is estimated on the post-pulse samples, where
+            # the frame-to-frame scatter is what the threshold needs to clear;
+            # it is a scale, not a baseline, so the contamination does not
+            # reach it.
             if post_t is not None and len(post_t) >= 6:
-              new_resp = _responding_at(post_t, post_vals)
-              if new_resp is not None:
-                if bool(new_resp) != bool(is_responding):
-                  n_response_flipped += 1
-                is_responding = bool(new_resp)
+              _n = _trace_noise_at(post_t, post_vals)
+              if _n is not None:
+                efflux_noise = _n
+            efflux_thresh = efflux_threshold_for(efflux_noise)
+            efflux = bool(-diff >= efflux_thresh)
+            if efflux and abs(diff) <= INTENSITY_DIFF_THRESHOLD:
+              n_efflux_noise_bound += 1
       elif size_cat == "Stagnate" and endpoint_censored:
-        # The release value is unobtainable at the matched time, so the
-        # response call taken over the whole record has to go with it. Left
-        # in place it would put a whole-record verdict in the same column as
-        # matched-time verdicts, and the responding fraction would then be a
-        # mixture of two definitions.
+        # No endpoint at the matched time means no release call: the vesicle
+        # is out of the numerator AND the denominator, rather than being
+        # scored as not having released.
         n_endpoint_censored += 1
         _key = (population, voltage, exp_dir.name)
         endpoint_censored_by[_key] = endpoint_censored_by.get(_key, 0) + 1
-        is_responding = np.nan
+        efflux = np.nan
 
       records.append({
           "population": population,
@@ -919,9 +982,15 @@ def aggregate_pipeline_results(outputs_root: str) -> pd.DataFrame:
           "prepulse_lumen_abs": prepulse_lumen_abs,
           "tau": tau,
           "tau_SE": tau_se,
-          "tau_identifiable": tau_identifiable,
-          "is_responding": is_responding,
-          "response_class": response_class,
+          "tau_fit_ok": tau_fit_ok,
+          # tau is only a measurement where the fit constrained it AND the
+          # vesicle actually released dye. Without the second term a flat
+          # trace passes, because a fit has nothing to be uncertain about
+          # when there is nothing there.
+          "tau_identifiable": bool(tau_fit_ok) and efflux is True,
+          "efflux": efflux,
+          "efflux_noise": efflux_noise,
+          "efflux_threshold": efflux_thresh,
           "tau_over_record": tau_over_record,
           "i_pre": i_pre,
           "i_final": i_final,
@@ -962,8 +1031,15 @@ def aggregate_pipeline_results(outputs_root: str) -> pd.DataFrame:
           if (p, v) == (pop, volt):
             print(f"    {POPULATION_LABELS.get(pop, pop):<12} {volt:<12} "
                   f"{exp:<48} {n:>3}")
-    print(f"  {n_response_flipped} response call(s) changed against the "
-          "whole-record version.")
+    print(f"  Release call: drop against the PRE-pulse mean exceeding "
+          f"max({INTENSITY_DIFF_THRESHOLD:.0%}, "
+          f"{EFFLUX_NOISE_SIGMA:g} x the vesicle's own noise).")
+    if n_efflux_noise_bound:
+      print(f"  {n_efflux_noise_bound} vesicle(s) cleared the noise term "
+            "but not the flat floor. That cannot happen while the floor is "
+            "the larger of the two, so a non-zero count here means the noise "
+            "term has started to bind and the threshold is no longer a "
+            "constant across vesicles.")
 
   if dropped_fates:
     total = sum(dropped_fates.values())
@@ -985,8 +1061,8 @@ def aggregate_pipeline_results(outputs_root: str) -> pd.DataFrame:
   # list of column labels, which is how a censoring change surfaced three
   # functions away as KeyError: 'radius_bin'. The nullable dtype is the only
   # one where NA both masks as False and stays out of a .sum().
-  if "is_responding" in out.columns:
-    out["is_responding"] = out["is_responding"].astype("boolean")
+  if "efflux" in out.columns:
+    out["efflux"] = out["efflux"].astype("boolean")
   return out
 
 
@@ -1369,9 +1445,12 @@ def _filter_tau(df: pd.DataFrame) -> pd.DataFrame:
       & (df["tau"] > 0)
   ].copy()
   if TAU_REQUIRE_IDENTIFIABLE:
-    sub = sub[sub["tau_identifiable"]]
-  if TAU_REQUIRE_RESPONDING:
-    sub = sub[sub["is_responding"]]
+    # tau_identifiable is already (fit constrained AND released), so a
+    # separate release filter here would be redundant. TAU_REQUIRE_RESPONDING
+    # is kept as a switch for the case where identifiability is turned off.
+    sub = sub[sub["tau_identifiable"].fillna(False)]
+  elif TAU_REQUIRE_RESPONDING:
+    sub = sub[sub["efflux"].fillna(False)]
   return sub[sub["radius_bin"].isin(BIN_ORDER)]
 
 def report_tau_yield(df: pd.DataFrame):
@@ -1385,15 +1464,15 @@ def report_tau_yield(df: pd.DataFrame):
     # not quietly scored as a non-responder. n_no_call carries them instead,
     # because "we could not tell" and "it did not respond" are different
     # denominators and only one of them belongs in a response rate.
-    n_call = int(sub["is_responding"].notna().sum())
+    n_call = int(sub["efflux"].notna().sum())
     rows.append({
         "population": pop,
         "voltage": v,
         "n_guv": len(sub),
         "n_fitted": int(fitted),
         "n_no_call": int(len(sub) - n_call),
-        "n_responding": int(sub["is_responding"].sum()),
-        "n_tau_identifiable": int(sub["tau_identifiable"].sum()),
+        "n_efflux": int(sub["efflux"].sum()),
+        "n_tau_identifiable": int(sub["tau_identifiable"].fillna(False).sum()),
         "n_plotted": len(_filter_tau(sub)),
     })
   tbl = pd.DataFrame(rows).sort_values(["population", "voltage"])
@@ -1404,61 +1483,45 @@ def report_tau_yield(df: pd.DataFrame):
     print(f"  n_no_call: {n_missing} vesicle(s) whose record ends before "
           f"ENDPOINT_MATCHED_T_S = {ENDPOINT_MATCHED_T_S}, so they have no "
           "response call at the matched time. They are out of the numerator "
-          "AND the denominator of n_responding.")
+          "AND the denominator of n_efflux.")
   print()
 
-def report_response_agreement(df: pd.DataFrame) -> pd.DataFrame:
-  """Do the response call and the endpoint category agree, and where not?
+def report_efflux_calls(df: pd.DataFrame) -> pd.DataFrame:
+  """Where the release call sits relative to the flat threshold.
 
-  Two quantities in this pipeline are compared against the same number,
-  0.05, and they are not the same quantity:
+  This function used to cross-tabulate two response criteria against each
+  other, because the pipeline had two: an endpoint difference against the
+  pre-pulse mean, and a response flag built on a post-pulse baseline. They
+  disagreed about individual vesicles and produced different counts for the
+  same comparison. The post-pulse version has been removed -- onset falls
+  inside the first imaging frame, so its baseline had already absorbed part
+  of the release -- and there is now one call.
 
-    is_responding      run_analysis._observed_response takes the median of
-                       the first few POST-pulse frames as its baseline and
-                       requires the fall to clear max(0.05, 3 * noise).
-    intensity_category i_final - i_pre, referenced to the PRE-pulse mean,
-                       and compared against INTENSITY_DIFF_THRESHOLD.
-
-  A vesicle whose trace sits above its pre-pulse mean in the first frames
-  after the pulse can therefore clear the response gate on a total change
-  below 0.05, and one whose decline is shallow but steady can do the
-  opposite. Both are legitimate readings of the same trace; what is not
-  legitimate is quoting a count from one next to a count from the other
-  without saying they were made differently. This prints the cross-tab so
-  the overlap is a number in the log rather than an assumption.
+  What is still worth printing is how close the calls sit to the threshold,
+  since that is what a reader will ask when the threshold is quoted.
   """
-  need = {"is_responding", "intensity_category"}
-  if not need.issubset(df.columns):
+  if "efflux" not in df.columns or "diff" not in df.columns:
     return pd.DataFrame()
-  sub = df[df["is_responding"].notna()].copy()
+  sub = df[df["efflux"].notna()].copy()
   if sub.empty:
-    return pd.DataFrame()
-  sub["is_responding"] = sub["is_responding"].astype(bool)
-  tab = pd.crosstab(sub["is_responding"], sub["intensity_category"])
-  print("\nResponse call against endpoint category:")
-  print(tab.to_string())
-
-  lost = sub["intensity_category"] == "Lose Intensity"
-  odd_hi = sub[sub["is_responding"] & ~lost]      # responding, change < 5%
-  odd_lo = sub[~sub["is_responding"] & lost]      # >5% change, gate not met
-  print(f"  responding but endpoint change within "
-        f"{INTENSITY_DIFF_THRESHOLD:.0%}: {len(odd_hi)}")
-  print(f"  endpoint change beyond {INTENSITY_DIFF_THRESHOLD:.0%} but not "
-        f"scored responding: {len(odd_lo)}")
-  if len(odd_lo):
-    d = (-odd_lo["diff"]).abs()
-    print(f"    their released fractions run {d.min():.3f}-{d.max():.3f}, so "
-          "the gate is discarding the shallowest losses rather than a random "
-          "selection: the responding fraction is a floor, not an estimate.")
-  for label, cell in (("responding, endpoint inside the band", odd_hi),):
-    if cell.empty:
-      continue
-    print(f"  {label} -- do not build a claim on these:")
-    for _, r in cell.iterrows():
-      print(f"    {r['experiment']} GUV {r['guv_id']}  "
-            f"released {-r['diff']:+.4f}  {r.get('response_class', '')}")
-  return tab
-
+    return sub
+  sub["efflux"] = sub["efflux"].astype(bool)
+  loss = -sub["diff"]
+  n_rel = int(sub["efflux"].sum())
+  print(f"\nRelease calls: {n_rel} of {len(sub)} vesicle(s) released dye.")
+  if n_rel:
+    r = loss[sub["efflux"]]
+    print(f"  losses among them: min {r.min():.3f}  median {r.median():.3f}  "
+          f"max {r.max():.3f}")
+  near = sub[(~sub["efflux"]) & (loss > 0.8 * INTENSITY_DIFF_THRESHOLD)]
+  if len(near):
+    print(f"  {len(near)} vesicle(s) fell between 80% of the threshold and it, "
+          "so they would change side under a small change to it:")
+    for _, r in near.sort_values("diff").head(10).iterrows():
+      print(f"    {r['experiment']} GUV {r['guv_id']}  lost "
+            f"{-r['diff']:.4f}  threshold {r.get('efflux_threshold', float('nan')):.4f}")
+  print()
+  return sub
 
 def plot_drop_by_cortex_status(df: pd.DataFrame, output_dir: str):
   out_path = sub_dir(output_dir, "cortex_class")
@@ -1690,6 +1753,12 @@ def apply_cortex_split(df: pd.DataFrame) -> pd.DataFrame:
 
 PEAK_N_FRAMES = ENDPOINT_N_FRAMES
 MIN_CONTROL_N = 5
+# How far from the requested matched time a condition's nearest sampled frame
+# may sit before that condition is left blank instead of read. Records here end
+# between about 430 and 436 s, so a matched time of 431 s sits at the edge of
+# coverage and argmin would otherwise silently return whatever frame was
+# closest, however far away.
+MATCHED_T_TOLERANCE_S = 20.0
 CONTROL_VOLTAGE = "30V"
 BLEACH_REFERENCE_PATTERN = rf"-{CONTROL_VOLTAGE}-"
 EXCLUDE_EXPERIMENTS = [r"-0V-", r"260331.*400V"]
@@ -1939,8 +2008,9 @@ def plot_cortex_peak_timecourse(df: pd.DataFrame, outputs_root: str,
   axes[1].legend(frameon=False, fontsize=7, ncol=2, loc="lower left")
 
   fig.suptitle("Radial cortex peak height over time, cortex-bearing GUVs\n"
-               + (f"(median and IQR; divided by the {CONTROL_VOLTAGE} "
-                  "bleach reference)" if corrected else
+               + (f"(median and IQR; pulsed curves divided by the "
+                  f"{CONTROL_VOLTAGE} bleach reference, which is itself "
+                  "drawn uncorrected)" if corrected else
                   f"(median and IQR; dashed red = {CONTROL_VOLTAGE} "
                   "bleach reference, uncorrected)"),
                fontsize=11)
@@ -1957,17 +2027,37 @@ def plot_cortex_peak_timecourse(df: pd.DataFrame, outputs_root: str,
     tbl = pd.DataFrame(rows).sort_values("voltage", key=lambda c:
                                          c.map(_voltage_key))
 
-    t_ref = 320.0
-    matched = []
+    # Read at the same elapsed time the dye endpoint uses, so the actin and
+    # dye sections of the chapter describe one instant rather than two. This
+    # was 320 s, chosen only because every record reaches it; the cost was that
+    # no sentence could put a cortex number and a release number side by side.
+    t_ref = ENDPOINT_MATCHED_T_S
+    matched, short = [], []
     for volt, (t, med) in curves.items():
         i = int(np.argmin(np.abs(t - t_ref)))
-        matched.append({"voltage": volt, "peak_at_matched_t": float(med[i])})
+        gap = float(abs(float(t[i]) - t_ref))
+        if gap > MATCHED_T_TOLERANCE_S:
+            short.append((volt, float(t[i]), gap))
+            matched.append({"voltage": volt, "peak_at_matched_t": np.nan})
+        else:
+            matched.append({"voltage": volt, "peak_at_matched_t": float(med[i])})
     tbl = tbl.merge(pd.DataFrame(matched), on="voltage", how="left")
     ctrl_row = tbl[tbl["voltage"] == CONTROL_VOLTAGE]
     n_ctrl = int(ctrl_row["n_guv"].iloc[0]) if not ctrl_row.empty else 0
     ctrl_at_t = float(ctrl_row["peak_at_matched_t"].iloc[0]) if n_ctrl else np.nan
 
-    if n_ctrl >= MIN_CONTROL_N:
+    if corrected:
+        # Each pulsed curve was already divided by the CONTROL_VOLTAGE median
+        # above, so the level a condition is measured against is 1.0 by
+        # construction. Subtracting the control's own value here as well
+        # removed it twice and put a floor of -(1 - ctrl_at_t) under the
+        # column: a condition behaving exactly like the control came out as
+        # having lost LESS peak than the control, which nothing can do. It is
+        # what produced the flat -0.02 to -0.04 band across 90-360V.
+        tbl["excess_loss_vs_control"] = 1.0 - tbl["peak_at_matched_t"]
+        tbl.loc[tbl["voltage"] == CONTROL_VOLTAGE,
+                "excess_loss_vs_control"] = np.nan
+    elif n_ctrl >= MIN_CONTROL_N:
         tbl["excess_loss_vs_control"] = ctrl_at_t - tbl["peak_at_matched_t"]
     elif n_ctrl:
         print(f"\n  {CONTROL_VOLTAGE} reference has only {n_ctrl} GUV(s) at t = {t_ref:.0f} s "
@@ -1987,6 +2077,20 @@ def plot_cortex_peak_timecourse(df: pd.DataFrame, outputs_root: str,
       if "excess_loss_vs_control" in tbl:
         print("excess_loss_vs_control > 0 means more peak lost than the "
               f"{CONTROL_VOLTAGE} reference at the same elapsed time.")
+      if corrected:
+        print(f"  Curves are already divided by the {CONTROL_VOLTAGE} "
+              "reference, so that level is 1.000 by construction and the "
+              "column is 1 - peak_at_matched_t. The reference row is left "
+              "blank in it: the peak shown against "
+              f"{CONTROL_VOLTAGE} is UNCORRECTED, i.e. the drift that was "
+              "divided out of every other row, and is not on their scale.")
+      if short:
+        print(f"  No sample within {MATCHED_T_TOLERANCE_S:.0f} s of "
+              f"{t_ref:.0f} s, so read as blank rather than from the nearest "
+              "frame:")
+        for volt, t_near, gap in short:
+          print(f"    {volt:>5}  nearest support at {t_near:.0f} s "
+                f"({gap:.0f} s away)")
     print(tbl.to_string(index=False))
     print()
 

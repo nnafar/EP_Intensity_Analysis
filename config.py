@@ -312,11 +312,19 @@ MODEL_FREE_REPORT_TIMES_S = [10, 30, 60, 120, 300, 600]
 # can come out deceptively small, sneaking a meaningless tau past the
 # identifiability gate. Such GUVs are valid data points — locating the voltage
 # threshold is the point of the experiment — they simply do not carry a tau.
-# A fit counts as responding when its total exponential amplitude exceeds both
-# an absolute floor and a multiple of its own residual scatter, so the test
-# adapts to each trace's noise instead of using one fixed cutoff.
-FIT_RESPONSE_AMPLITUDE_SIGMA = 3.0
-FIT_MIN_RESPONSE_AMPLITUDE   = 0.05
+# A vesicle counts as having RELEASED dye when its drop, measured against its
+# own PRE-pulse mean at the matched endpoint, exceeds both an absolute floor
+# and a multiple of its own frame-to-frame noise, so the test adapts to each
+# trace instead of using one fixed cutoff.
+#
+# The call is made in process.aggregate_pipeline_results, not at fit time.
+# It used to be made in run_analysis against a baseline taken from the first
+# few POST-pulse frames, which is wrong here: poration onset falls inside the
+# first imaging frame, so that baseline had already absorbed part of the
+# release and the test saw only the remainder. The two thresholds below are
+# unchanged; what changed is the baseline they are applied to.
+FIT_RESPONSE_AMPLITUDE_SIGMA = 3.0   # read by process.RELEASE_NOISE_SIGMA
+FIT_MIN_RESPONSE_AMPLITUDE   = 0.05  # see process.INTENSITY_DIFF_THRESHOLD
 
 # --- Stepwise traces --------------------------------------------------------
 # The efflux formula assumes ONE permeabilisation event followed by a
@@ -708,6 +716,9 @@ BOXPLOT_PARAMS = ['Iinf', 'A', 'tau']
 # between. Any threshold in 2.0-5.0 gives the identical split, so 3.0 sits in
 # the middle of the gap rather than on the edge of it. Re-check that gap on a
 # new imaging condition before trusting the number.
+# NOTE: this no longer drives a response_class label -- that column has
+# been removed. It survives as the input to exp_vs_linear /
+# onset_lag_frac in the fit table, which are descriptive only.
 RESPONSE_SHAPE_MIN_RSS_RATIO = 3.0
 
 # DELAYED threshold: onset_lag_frac = t10 / t90, where t10 and t90 are the
@@ -722,6 +733,9 @@ RESPONSE_SHAPE_MIN_RSS_RATIO = 3.0
 # frame-to-frame drop; a delayed onset can be a perfectly smooth decline that
 # simply begins late. On this dataset the two flag almost disjoint sets of
 # GUVs, so both are worth keeping.
+# NOTE: this no longer drives a response_class label -- that column has
+# been removed. It survives as the input to exp_vs_linear /
+# onset_lag_frac in the fit table, which are descriptive only.
 RESPONSE_ONSET_LAG_FRAC = 0.07
 
 # Tracking outputs

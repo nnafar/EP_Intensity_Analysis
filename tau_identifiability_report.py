@@ -53,7 +53,29 @@ def _match_analysis_population(out):
   keep = pd.Series(keep, index=out.index)
   print(f"Analysis population: {int(keep.sum())} of {len(out)} GUV(s) "
         f"retained (matched to guv_bulk_summary.csv).")
-  return out[keep].copy()
+  out = out[keep].copy()
+
+  # Take the CALLS from the bulk table too, not just the membership. This
+  # report is built from the per-experiment fit files, which carry their own
+  # copy of every flag. Filtering rows to the analysis population while
+  # leaving those copies in place is how this file came to print a responder
+  # count that disagreed with the one in the results table: same vesicles,
+  # two columns, two answers. The bulk table is the authority because that is
+  # where the matched endpoint is applied.
+  cols = [c for c in ('efflux', 'tau_identifiable', 'diff', 'released')
+          if c in bulk.columns]
+  if cols:
+    key_out = list(zip(out['experiment'].astype(str),
+                       out['guv_id'].astype('Int64')))
+    idx = bulk.set_index([bulk['experiment'].astype(str),
+                          bulk['guv_id'].astype('Int64')])
+    for c in cols:
+      out[c] = [idx[c].get(k, pd.NA) for k in key_out]
+  else:
+    print("WARNING: guv_bulk_summary.csv carries no efflux column, so this "
+          "report is using the fit-file flags. Those are computed on the "
+          "whole record and will not agree with the results tables.")
+  return out
 
 
 SE_RATIO_MAX = float(getattr(cfg, 'TAU_SE_RATIO_MAX', 0.5))
@@ -164,14 +186,16 @@ def load() -> pd.DataFrame:
 def summarise(df: pd.DataFrame) -> None:
   n = len(df)
   ident = df['tau_identifiable'].fillna(False).astype(bool)
-  resp = df['is_responding'].fillna(False).astype(bool)
+  # One release call, taken from the bulk table (fall from the PRE-pulse mean
+  # at the matched endpoint, against the vesicle's own noise).
+  resp = df['efflux'].fillna(False).astype(bool)
   slow = df['tau_over_record'] > TAU_OVER_RECORD_MAX
   loose = df['tau_se_ratio'] > SE_RATIO_MAX
   step = df.get('has_step', pd.Series(False, index=df.index)).fillna(False).astype(bool)
 
   print(f"\nPooled over {df['experiment'].nunique()} experiment(s), {n} GUV(s)\n")
   print(f"  tau identifiable                     {ident.sum():5d}  ({ident.mean():.1%})")
-  print(f"  responding (model-free)              {resp.sum():5d}  ({resp.mean():.1%})")
+  print(f"  released dye                         {resp.sum():5d}  ({resp.mean():.1%})")
   print()
   print("  Of the GUVs that failed the gate:")
   failed = ~ident
@@ -182,7 +206,7 @@ def summarise(df: pd.DataFrame) -> None:
           f"{(failed & loose).sum():5d}  ({(failed & loose).sum() / failed.sum():.1%})")
     print(f"    single-frame step (too fast)      "
           f"{(failed & step).sum():5d}  ({(failed & step).sum() / failed.sum():.1%})")
-    print(f"    not responding at all             "
+    print(f"    no dye released at all            "
           f"{(failed & ~resp).sum():5d}  ({(failed & ~resp).sum() / failed.sum():.1%})")
 
   with np.errstate(divide='ignore', invalid='ignore'):
@@ -199,16 +223,16 @@ def summarise(df: pd.DataFrame) -> None:
           f"median tau {sub['tau'].median():9.1f} s   "
           f"tau/record {sub['tau_over_record'].median():6.2f}")
 
-  print("\n  Response class:")
-  for cls, cnt in df['response_class'].value_counts().items():
-    print(f"    {cls:<16} {cnt:5d}  ({cnt / n:.1%})")
-
-  print("\n  Model-free response amplitude (response_drop), responding GUVs:")
+  # Magnitude taken from the endpoint difference, not from response_drop.
+  # response_drop measures the fall from the first few POST-pulse frames, and
+  # onset falls inside the first frame, so it understates the release by
+  # whatever left before its baseline was taken.
+  print("\n  Release magnitude (fall from pre-pulse mean), releasing GUVs:")
   grp = 'cortex_group' if 'cortex_group' in df.columns else 'population'
   for pop, sub in df[resp].groupby(grp):
-    print(f"    {pop:<24} median {sub['response_drop'].median():.3f}  "
-          f"IQR {sub['response_drop'].quantile(.25):.3f}-"
-          f"{sub['response_drop'].quantile(.75):.3f}  (n={len(sub)})")
+    mag = -pd.to_numeric(sub['diff'], errors='coerce')
+    print(f"    {pop:<24} median {mag.median():.3f}  "
+          f"IQR {mag.quantile(.25):.3f}-{mag.quantile(.75):.3f}  (n={len(sub)})")
 
 def figure(df: pd.DataFrame, out_path: Path) -> None:
   colours = POPULATION_COLORS

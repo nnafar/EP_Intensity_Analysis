@@ -120,6 +120,51 @@ def _colour(pop: str):
 ELECTRODE_GAP_CM = 0.3
 
 
+def efflux_bool(s: pd.Series) -> pd.Series:
+  """The efflux column as a real bool, with missing read as no efflux.
+
+  fillna() on an object column is what raises the downcasting FutureWarning,
+  and infer_objects() does not silence it because the warning fires inside
+  fillna itself. Mapping element by element avoids the question: a missing
+  call is not efflux, a string survives a round trip through CSV, and the
+  result is bool either way.
+  """
+  if pd.api.types.is_bool_dtype(s):
+    return s
+
+  def one(v):
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+      return False
+    if isinstance(v, str):
+      return v.strip().lower() in ("true", "1", "yes")
+    return bool(v)
+
+  return s.map(one).astype(bool)
+
+
+def derive_columns(df: pd.DataFrame) -> pd.DataFrame:
+  """Columns every stage in this module expects, added once.
+
+  Kept out of load_summary so the radius sensitivity, which reads a different
+  file, derives its field axis and its release values the same way rather
+  than from a second copy of these three lines.
+  """
+  df = df.copy()
+  df["voltage_V"] = (df["voltage"].astype(str).str.extract(r"(\d+)")
+                     .astype(float))
+  # Applied field strength. This is the treatment, and inside the size window
+  # it is also the whole of it -- no correction for radius is applied or
+  # needed. See the module docstring.
+  df["field_kV_cm"] = df["voltage_V"] / ELECTRODE_GAP_CM / 1000.0
+  df["released"] = -df["diff"]
+  # Acquisition session, from the yymmdd prefix the output folders carry.
+  # Chambers recorded on one day share a lipid film, a protein prep and a
+  # microscope alignment, so this is the coarsest unit that can confound the
+  # field axis, and the one that does.
+  df["session"] = df["experiment"].astype(str).str.extract(r"^(\d{6})")[0]
+  return df
+
+
 def load_summary(results_dir: Path, attrition_dir=None) -> pd.DataFrame:
   path = results_dir / "guv_bulk_summary.csv"
   if not path.exists():
@@ -143,17 +188,7 @@ def load_summary(results_dir: Path, attrition_dir=None) -> pd.DataFrame:
   # share. See process.analysis_population for what it removes and why.
   df = process.analysis_population(df, attrition_dir=attrition_dir)
 
-  df["voltage_V"] = df["voltage"].astype(str).str.extract(r"(\d+)").astype(float)
-  # Applied field strength. This is the treatment, and inside the size window
-  # it is also the whole of it -- no correction for radius is applied or
-  # needed. See the module docstring.
-  df["field_kV_cm"] = df["voltage_V"] / ELECTRODE_GAP_CM / 1000.0
-  df["released"] = -df["diff"]
-  # Acquisition session, from the yymmdd prefix the output folders carry.
-  # Chambers recorded on one day share a lipid film, a protein prep and a
-  # microscope alignment, so this is the coarsest unit that can confound the
-  # field axis, and the one that does.
-  df["session"] = df["experiment"].astype(str).str.extract(r"^(\d{6})")[0]
+  df = derive_columns(df)
 
   present = [p for p in POP_LABEL if p in set(df["population"])]
   missing = [p for p in POP_LABEL if p not in present]
@@ -176,7 +211,7 @@ MIN_CLUSTERS_FOR_CI = 3
 
 def cluster_diff(a: pd.DataFrame, b: pd.DataFrame, col: str = "efflux",
                  n_boot: int = 5000, seed: int = 0):
-  """Difference in the fraction responding, b minus a, with a percentile
+  """Difference in the fraction with efflux, b minus a, with a percentile
   interval from resampling whole EXPERIMENTS.
 
   Vesicles in one chamber share a preparation, a field and a day. Resampling
@@ -207,6 +242,104 @@ def cluster_diff(a: pd.DataFrame, b: pd.DataFrame, col: str = "efflux",
 
 # --- Section 3: flatline vs efflux -------------------------------------------
 
+def split_field(d: pd.DataFrame) -> float:
+  """Lowest interpreted field at which any Bare vesicle shows efflux.
+
+  One definition, used by Section 3 and by the size-matched block. The two
+  used to derive it separately -- Section 3 from the data, the size-matched
+  block from a hard-coded 1.2 -- and agreed only because the data happened to
+  put the first Bare responder there. A change of threshold or of population
+  would have moved one and not the other, silently.
+  """
+  if "efflux" not in d.columns:
+    return np.inf
+  bare = d[(d["population"] == "Bare") & d["field_kV_cm"].map(interpreted)]
+  first = bare.loc[bare["efflux"] == True, "field_kV_cm"]
+  return float(first.min()) if len(first) else np.inf
+
+
+def report_split_support(d: pd.DataFrame, cut: float, out: Path):
+  """What the split field itself is built on.
+
+  The two-regime description is defined by the field where Bare first
+  responds, so the framing inherits the support of that one cell. Printing the
+  chambers behind it, and the vesicles the matched endpoint censored there,
+  keeps the concession in the chapter attached to numbers rather than left for
+  a reader to reconstruct from the attrition file.
+  """
+  if not np.isfinite(cut):
+    return
+  cell = d[np.isclose(d["field_kV_cm"], cut)]
+  if cell.empty:
+    return
+  print(f"\n  What the {cut:.2f} kV/cm split field rests on:")
+  for pop in POP_LABEL:
+    v = cell[cell["population"] == pop]
+    if v.empty:
+      continue
+    per = ", ".join(f"{int((x['efflux'] == True).sum())}/{len(x)}"
+                    for _, x in v.groupby("experiment"))
+    print(f"    {POP_LABEL[pop]:<22} "
+          f"{int((v['efflux'] == True).sum())}/{len(v)} in "
+          f"{v['experiment'].nunique()} chamber(s): {per}")
+
+  n_ch = cell[cell["population"] == "Bare"]["experiment"].nunique()
+  if n_ch < 2:
+    print("    The Bare side of this field is ONE chamber, so the field at "
+          "which Bare first responds -- and the two-regime split built on it "
+          "-- cannot be separated from that chamber. Describe the split as "
+          "chosen from the data, not as an estimated threshold.")
+
+  path = Path(out) / process.POPULATION_ATTRITION_CSV
+  try:
+    gone = pd.read_csv(path)
+  except Exception:
+    return
+  volt = f"{int(round(cut * ELECTRODE_GAP_CM * 1000))}V"
+  lost = gone[(gone.get("voltage", pd.Series(dtype=object)).astype(str) == volt)
+              & gone.get("reason", pd.Series(dtype=object)).astype(str)
+              .str.contains("no endpoint call", na=False)]
+  if len(lost):
+    print(f"    Censored at this field: {len(lost)} vesicle(s) with no call "
+          f"at t = {process.ENDPOINT_MATCHED_T_S:.0f} s, from "
+          f"{lost['experiment'].nunique()} chamber(s):")
+    for exp, g in lost.groupby("experiment"):
+      print(f"      {len(g):>3}  {exp}")
+    print("    A chamber that lost all of its vesicles here is missing from "
+          "the counts above, not scored as non-responding.")
+
+
+def report_cut_sensitivity(ok: pd.DataFrame, cut: float):
+  """The below-cut comparison against every field the cut could sit at.
+
+  The cut is chosen from the data, so the below-cut cell is chosen too. If the
+  separation only appears at one placement it is a property of that placement.
+  """
+  fields = sorted(ok["field_kV_cm"].unique())
+  rows = []
+  for c in fields[1:]:
+    lo = ok[ok["field_kV_cm"] < c]
+    a = lo[lo["population"] == "Bare"]
+    b = lo[lo["population"] == "Branched, cortex"]
+    if len(a) < 5 or len(b) < 5:
+      continue
+    ka = int((a["efflux"] == True).sum())
+    kb = int((b["efflux"] == True).sum())
+    diff, l, h = cluster_diff(a, b)
+    ci = f"[{l:+.3f}, {h:+.3f}]" if np.isfinite(l) else "no interval"
+    rows.append((c, ka, len(a), kb, len(b), diff, ci,
+                 "  <- the cut used" if abs(c - cut) < 1e-9 else ""))
+  if not rows:
+    return
+  print("\n  Below-cut comparison against where the cut is placed:")
+  print(f"    {'cut':>6} {'Bare':>9} {'cortex':>9}  cortex minus Bare")
+  for c, ka, na, kb, nb, diff, ci, mark in rows:
+    print(f"    {c:6.2f} {ka:>3}/{na:<5} {kb:>3}/{nb:<5} "
+          f"{diff:+.3f} {ci}{mark}")
+  print("    Read the threshold claim from this column, not from the one row "
+        "the chosen cut selects.")
+
+
 def report_section3(df: pd.DataFrame, out: Path) -> pd.DataFrame:
   """Flatline against efflux, per field, for the three cortex groups.
 
@@ -221,7 +354,19 @@ def report_section3(df: pd.DataFrame, out: Path) -> pd.DataFrame:
   every field regardless of how much dye the responders lost.
   """
   d = df.copy()
-  d["efflux"] = d["released"] > process.INTENSITY_DIFF_THRESHOLD
+  # The call is made once, in process.aggregate_pipeline_results, against each
+  # vesicle's own pre-pulse mean and its own noise. Recomputing it here from a
+  # flat threshold would drop the noise term and put a second definition in
+  # the file that reports the headline numbers. The fallback covers an old
+  # summary CSV written before the column existed, and says so.
+  if "efflux" in d.columns:
+    d["efflux"] = efflux_bool(d["efflux"])
+  else:
+    print("  WARNING: no 'efflux' column in this summary -- falling back to a "
+          f"flat {process.INTENSITY_DIFF_THRESHOLD:.0%} cut with no noise "
+          "term. Re-run the bulk stage; these counts are not the reported "
+          "ones.")
+    d["efflux"] = d["released"] > process.INTENSITY_DIFF_THRESHOLD
 
   rows = []
   for (pop, E), cell in d.groupby(["population", "field_kV_cm"]):
@@ -255,11 +400,10 @@ def report_section3(df: pd.DataFrame, out: Path) -> pd.DataFrame:
   # other is not, which is the threshold claim, and pooling the two halves
   # averages that separation away against the wider high-field cells.
   ok = d[d["field_kV_cm"].map(interpreted)]
-  bare = ok[ok["population"] == "Bare"]
-  first = bare.loc[bare["efflux"], "field_kV_cm"]
-  cut = float(first.min()) if len(first) else np.inf
+  cut = split_field(d)
   print(f"\n  Bare first shows efflux at {cut:.2f} kV/cm; the series is split "
         f"there.")
+  report_split_support(ok, cut, out)
 
   for label, part in (("all interpreted fields", ok),
                       (f"E < {cut:.2f} kV/cm", ok[ok["field_kV_cm"] < cut]),
@@ -289,7 +433,132 @@ def report_section3(df: pd.DataFrame, out: Path) -> pd.DataFrame:
       verdict = "resolved" if (lo > 0 or hi < 0) else "not resolved"
       print(f"    {POP_LABEL[pop]} minus Bare: {diff:+.3f} "
             f"95% CI [{lo:+.3f}, {hi:+.3f}] -- {verdict}")
+  report_cut_sensitivity(ok, cut)
   return tbl
+
+
+# Written by run_bulk.py before the size window is applied.
+ALL_RADII_CSV = "guv_bulk_all_radii.csv"
+
+# Windows the headline cells are recomputed under. None is no restriction at
+# all; the configured window sits in the middle of the sweep so its row can be
+# read against both looser and tighter ones.
+RADIUS_SENSITIVITY_WINDOWS = [None, (3.0, 7.0), (3.5, 6.5), (4.0, 6.0),
+                              (4.5, 5.5)]
+
+
+def _win_label(win) -> str:
+  return "none" if win is None else f"{win[0]:.1f}-{win[1]:.1f}"
+
+
+def _cell_line(part: pd.DataFrame):
+  """Bare and cortex counts and the clustered difference for one cell."""
+  a = part[part["population"] == "Bare"]
+  b = part[part["population"] == "Branched, cortex"]
+  ka, kb = int(a["efflux"].sum()), int(b["efflux"].sum())
+  diff, lo, hi = cluster_diff(a, b)
+  ci = f"[{lo:+.3f}, {hi:+.3f}]" if np.isfinite(lo) else "no interval"
+  r = (a["radius_um"].median() - b["radius_um"].median()
+       if len(a) and len(b) else np.nan)
+  return (f"{ka:>3}/{len(a):<5} {kb:>3}/{len(b):<5} {diff:+.3f} {ci:<20} "
+          f"{r:+.2f}")
+
+
+def report_radius_sensitivity(base: Path, out: Path):
+  """Does the Bare-vs-cortex result depend on the 4-6 um window?
+
+  The window discards most of the tracked population and does not discard it
+  evenly: at 1.33 kV/cm it removes more Bare vesicles than cortex ones, and
+  some of the Bare vesicles it removes had released dye. That is the direction
+  that would manufacture the reported difference rather than guard against it,
+  so it is checked here instead of argued about.
+
+  Each row re-runs process.analysis_population under a different window, so
+  the other five conditions of the population are applied identically and
+  only the radius restriction moves. The split field is held at the value the
+  configured window gives, so the cells being compared stay the same cells.
+  """
+  path = Path(base) / ALL_RADII_CSV
+  print("\n" + "=" * 70)
+  print("Radius window sensitivity")
+  print("=" * 70)
+  if not path.exists():
+    print(f"  Skipped: {path} not found. run_bulk.py writes it beside "
+          "guv_bulk_summary.csv; re-run the intensity stage to produce it.")
+    return
+  raw = process.apply_cortex_split(pd.read_csv(path))
+  raw = raw[raw["radius_um"].notna()]
+  print(f"  {len(raw)} vesicle(s) with a measured radius, before any window.")
+
+  ref = derive_columns(process.analysis_population(
+      raw, verbose=False, size_window=process.SIZE_WINDOW_UM))
+  ref["efflux"] = efflux_bool(ref["efflux"])
+  cut = split_field(ref)
+  if not np.isfinite(cut):
+    print("  No Bare responder inside the configured window, so there is no "
+          "split field to hold fixed. Sweep not run.")
+    return
+
+  # --- what the window removes, field by field ------------------------------
+  full = derive_columns(process.analysis_population(
+      raw, verbose=False, size_window=None))
+  full["efflux"] = efflux_bool(full["efflux"])
+  lo, hi = process.SIZE_WINDOW_UM
+  full["in_window"] = full["radius_um"].between(lo, hi)
+  ok = full[full["field_kV_cm"].map(interpreted)]
+
+  print(f"\n  What the {lo}-{hi} um window removes, per interpreted field:")
+  print(f"    {'kV/cm':>6} {'population':<22} "
+        f"{'kept efflux/n':>14} {'removed efflux/n':>17}")
+  for E in sorted(ok["field_kV_cm"].unique()):
+    for pop in ("Bare", "Branched, cortex"):
+      cell = ok[(ok["field_kV_cm"] == E) & (ok["population"] == pop)]
+      if cell.empty:
+        continue
+      kept = cell[cell["in_window"]]
+      gone = cell[~cell["in_window"]]
+      print(f"    {E:6.2f} {POP_LABEL[pop]:<22} "
+            f"{int(kept['efflux'].sum()):>7}/{len(kept):<6} "
+            f"{int(gone['efflux'].sum()):>9}/{len(gone):<6}")
+
+  # --- the responders the window discards, named ----------------------------
+  lost = ok[(~ok["in_window"]) & ok["efflux"]]
+  if len(lost):
+    print(f"\n  Responding vesicles the window discards ({len(lost)}):")
+    for _, v in lost.sort_values(["field_kV_cm", "population"]).iterrows():
+      print(f"    {v['field_kV_cm']:.2f} kV/cm  "
+            f"{POP_LABEL.get(v['population'], v['population']):<22} "
+            f"r = {v['radius_um']:.2f} um  released {v['released']:+.3f}  "
+            f"{v['experiment']}")
+    print("    A responder discarded from one group and not the other moves "
+          "the difference. Read the sweep below with these in mind.")
+
+  # --- the headline cells, window by window ---------------------------------
+  parts = [("all interpreted", lambda d: d),
+           (f"E < {cut:.2f} kV/cm", lambda d: d[d["field_kV_cm"] < cut]),
+           (f"E >= {cut:.2f} kV/cm", lambda d: d[d["field_kV_cm"] >= cut])]
+  runs = []
+  for win in RADIUS_SENSITIVITY_WINDOWS:
+    d = derive_columns(process.analysis_population(
+        raw, verbose=False, size_window=win))
+    d["efflux"] = efflux_bool(d["efflux"])
+    runs.append((win, d[d["field_kV_cm"].map(interpreted)],
+                 split_field(d)))
+
+  for label, sel in parts:
+    print(f"\n  {label}:")
+    print(f"    {'window':>9} {'Bare':>9} {'cortex':>9} "
+          f"{'cortex minus Bare':<28} {'median r, Bare-cortex':>10}")
+    for win, d, _ in runs:
+      mark = "  <- configured" if win == process.SIZE_WINDOW_UM else ""
+      print(f"    {_win_label(win):>9} {_cell_line(sel(d))}{mark}")
+
+  print("\n  Where Bare first responds, under each window:")
+  for win, _, c in runs:
+    print(f"    {_win_label(win):>9}  "
+          + (f"{c:.2f} kV/cm" if np.isfinite(c) else "never"))
+  print("    A window that moves this has changed which fields the split "
+        "describes, not just how many vesicles are in them.")
 
 
 def wilson(k: int, n: int, z: float = 1.96):
@@ -456,7 +725,7 @@ def plot_field_response(df: pd.DataFrame, out: Path):
         thin.append((POP_LABEL[pop], E, len(v)))
         continue
       boot = np.mean(v[rng.integers(0, len(v), (4000, len(v)))], axis=1)
-      resp = cell["is_responding"].dropna().astype(bool)
+      resp = cell["efflux"].dropna().astype(bool)
       k, n = int(resp.sum()), int(len(resp))
       wl, wh = wilson(k, n) if n else (np.nan, np.nan)
       xs.append(E)
@@ -471,8 +740,8 @@ def plot_field_response(df: pd.DataFrame, out: Path):
                    "mean_released": float(v.mean()),
                    "mean_ci_lo": float(np.percentile(boot, 2.5)),
                    "mean_ci_hi": float(np.percentile(boot, 97.5)),
-                   "n_with_call": n, "n_responding": k,
-                   "frac_responding": (k / n if n else np.nan),
+                   "n_with_call": n, "n_efflux": k,
+                   "frac_efflux": (k / n if n else np.nan),
                    "frac_ci_lo": wl, "frac_ci_hi": wh,
                    "interpreted": interpreted(E),
                    "sessions": ",".join(sorted(cell["session"].dropna()
@@ -510,7 +779,7 @@ def plot_field_response(df: pd.DataFrame, out: Path):
   ax1.axhline(0, color=PALETTE["grey"], lw=0.8, ls="--")
   ax1.set_ylabel("released fraction of lumenal signal")
   ax1.set_title("Release magnitude (mean, bootstrap 95% CI)", fontsize=10)
-  ax2.set_ylabel("fraction responding")
+  ax2.set_ylabel("fraction with efflux")
   ax2.set_ylim(-0.02, 1.02)
   ax2.set_title("Responding fraction (Wilson 95% CI)", fontsize=10)
   all_fields = sorted(stag["field_kV_cm"].dropna().unique())
@@ -589,7 +858,7 @@ def report_session_confound(df: pd.DataFrame, out: Path):
   print("=" * 70)
   print(counts.to_string())
 
-  rate = (sub.groupby("session")["is_responding"]
+  rate = (sub.groupby("session")["efflux"]
           .agg(n="count", responding="sum"))
   rate["frac"] = rate["responding"] / rate["n"]
   print("\nResponding fraction per session, pooled over fields and groups:")
@@ -651,7 +920,7 @@ def report_session_confound(df: pd.DataFrame, out: Path):
   for pop in pops:
     for j, s in enumerate(sessions):
       cell = sub[(sub["population"] == pop) & (sub["session"] == s)]
-      g = cell.groupby("field_kV_cm")["is_responding"].agg(["count", "sum"])
+      g = cell.groupby("field_kV_cm")["efflux"].agg(["count", "sum"])
       g = g[g["count"] >= 3]
       if g.empty:
         continue
@@ -661,7 +930,7 @@ def report_session_confound(df: pd.DataFrame, out: Path):
                   zorder=3)
   _mark_uninterpreted(ax1, sorted(sess_by_field))
   ax1.set_xlabel("field strength (kV/cm)")
-  ax1.set_ylabel("fraction responding")
+  ax1.set_ylabel("fraction with efflux")
   ax1.set_ylim(-0.05, 1.05)
   ax1.set_title("Response against field, split by session", fontsize=10)
   handles = ([plt.Line2D([], [], marker=marks[j % len(marks)], ls="",
@@ -680,7 +949,7 @@ def report_session_confound(df: pd.DataFrame, out: Path):
              color=PALETTE["grey"])
   ax2.set_xticks(range(len(rate)))
   ax2.set_xticklabels(rate.index, rotation=45, ha="right", fontsize=8)
-  ax2.set_ylabel("fraction responding")
+  ax2.set_ylabel("fraction with efflux")
   ax2.set_title("Response per session, pooled", fontsize=10)
   fig.tight_layout()
   fig.savefig(out / "field_response_by_session.pdf", dpi=300)
@@ -714,12 +983,12 @@ def endpoint_classes(df: pd.DataFrame) -> pd.DataFrame:
   sub["gained"] = sub["diff"] > INTACT_BAND
   rows = []
   for (pop, E), cell in sub.groupby(["population", "field_kV_cm"]):
-    resp = cell["is_responding"].dropna().astype(bool)
+    resp = cell["efflux"].dropna().astype(bool)
     rows.append({"population": pop, "field_kV_cm": E, "n": len(cell),
                  "n_intact": int(cell["intact"].sum()),
                  "n_lost": int(cell["lost"].sum()),
                  "n_gained": int(cell["gained"].sum()),
-                 "n_responding": int(resp.sum()),
+                 "n_efflux": int(resp.sum()),
                  "frac_intact": float(cell["intact"].mean()),
                  "median_released": float(cell["released"].median()),
                  "interpreted": interpreted(E)})
@@ -836,8 +1105,8 @@ def report_uninterpreted_block(df: pd.DataFrame, out: Path):
     return
   ref_E = max(E for E in sub["field_kV_cm"].unique() if interpreted(E))
   ref = sub[sub["field_kV_cm"] == ref_E]
-  k_ref, n_ref = int(ref["is_responding"].sum()), len(ref)
-  k_hi, n_hi = int(hi["is_responding"].sum()), len(hi)
+  k_ref, n_ref = int(ref["efflux"].sum()), len(ref)
+  k_hi, n_hi = int(hi["efflux"].sum()), len(hi)
   p_ref = k_ref / n_ref if n_ref else np.nan
 
   print(f"\n{'=' * 70}")
@@ -942,7 +1211,7 @@ def write_latex_tables(df: pd.DataFrame, out: Path, noise: pd.DataFrame = None):
       if c.empty:
         cells += ["--", ""]
         continue
-      k, n = int(c["is_responding"].sum()), len(c)
+      k, n = int(c["efflux"].sum()), len(c)
       lo, hi = wilson(k, n)
       cells += [f"{k}/{n}", f"{100 * k / n:.1f} ({100 * lo:.0f}--{100 * hi:.0f})"]
       sess.update(c["session"].dropna().astype(str))
@@ -979,51 +1248,55 @@ def write_latex_tables(df: pd.DataFrame, out: Path, noise: pd.DataFrame = None):
     for _, r in m.iterrows():
       lines.append(f"    \\quad {r['field_kV_cm']:.2f} & {int(r['n'])} & "
                    f"{int(r['n_intact'])} & {int(r['n_lost'])} & "
-                   f"{int(r['n_gained'])} & {int(r['n_responding'])} \\\\")
+                   f"{int(r['n_gained'])} & {int(r['n_efflux'])} \\\\")
     lines.append(f"    \\quad all & {int(m['n'].sum())} & "
                  f"{int(m['n_intact'].sum())} & {int(m['n_lost'].sum())} & "
                  f"{int(m['n_gained'].sum())} & "
-                 f"{int(m['n_responding'].sum())} \\\\")
+                 f"{int(m['n_efflux'].sum())} \\\\")
   lines += [r"    \bottomrule", r"  \end{tabular}", r"\end{table}"]
   (tex / "tab_endpoint_classes.tex").write_text("\n".join(lines) + "\n")
   written.append("tab_endpoint_classes.tex")
 
   # --- the responders themselves -------------------------------------------
-  r_df = sub[sub["is_responding"] == True].copy()
+  r_df = sub[sub["efflux"] == True].copy()
   if not r_df.empty:
     r_df = r_df.sort_values(["population", "field_kV_cm", "released"],
                             ascending=[True, True, False])
-    n_cens = int(r_df["response_class"].isin(["GRADUAL", "DELAYED"]).sum()) \
-        if "response_class" in r_df else 0
+    # Was counted from response_class in ("GRADUAL", "DELAYED"). That column
+    # is gone; the same thing is read straight off the fit instead, and more
+    # directly: a vesicle whose tau the record did not constrain was still
+    # losing dye when the record ended.
+    n_cens = int((~r_df.get("tau_identifiable",
+                            pd.Series(False, index=r_df.index))
+                  .fillna(False).astype(bool)).sum())
     caption = (
         r"\caption[Responding vesicles]{\textbf{The "
         rf"${len(r_df)}$ responding vesicles." + "}"
         r" Released fraction is the fall from the pre-pulse baseline to the "
-        r"matched endpoint. \textsc{gradual} and \textsc{delayed} both mean "
-        r"the vesicle was still losing dye when the record ended, so "
-        rf"${n_cens}$ of ${len(r_df)}$ responses are censored rather than "
-        r"resolved. $\tau/T$ is the fitted time constant over the record "
-        r"duration; $^{\dagger}$ marks the vesicles meeting the "
-        r"identifiability criteria." + "}")
+        r"matched endpoint, and a vesicle counts as releasing when that fall "
+        r"exceeds the larger of \SI{5}{\percent} and three times its own "
+        rf"frame-to-frame noise. ${n_cens}$ of ${len(r_df)}$ were still "
+        r"losing dye when the record ended, so their $\tau$ is an "
+        r"extrapolation rather than a measurement. $\tau/T$ is the fitted "
+        r"time constant over the record duration; $^{\dagger}$ marks the "
+        r"vesicles meeting the identifiability criteria." + "}")
     lines = [r"% generated by susceptibility.write_latex_tables -- do not edit",
              r"\begin{table}[tb]", r"  \centering", "  " + caption,
              r"  \label{tab: CH2 - Responders}", r"  \small",
-             r"  \begin{tabular}{l S[table-format=1.2] S[table-format=2.1] l "
+             r"  \begin{tabular}{l S[table-format=1.2] S[table-format=2.1] "
              r"S[table-format=2.2] l}", r"    \toprule",
              r"    Population & {$E$ (\si{\kilo\volt\per\centi\meter})}"
-             r" & {Released (\%)} & Class & {$\tau/T$} & Session \\",
+             r" & {Released (\%)} & {$\tau/T$} & Session \\",
              r"    \midrule"]
     prev = None
     for _, r in r_df.iterrows():
       if prev is not None and r["population"] != prev:
         lines.append(r"    \addlinespace")
       prev = r["population"]
-      cls_s = str(r.get("response_class", "")).lower()
       tor = r.get("tau_over_record", np.nan)
       lines.append(
           f"    \\textit{{{POP_LABEL[r['population']]}}} & "
           f"{r['field_kV_cm']:.2f} & {100 * r['released']:.1f} & "
-          f"\\textsc{{{cls_s}}} & "
           f"{tor:.2f}" + ("$^{\\dagger}$" if r.get("tau_identifiable") else "")
           + f" & {r.get('session', '')} \\\\")
     lines += [r"    \bottomrule", r"  \end{tabular}", r"\end{table}"]
@@ -1049,7 +1322,7 @@ def plot_experiment_level(df: pd.DataFrame, out: Path):
 
   per_exp = (stag.groupby(["population", "voltage", "voltage_V", "experiment"])
              .agg(median_released=("released", "median"),
-                  frac_responding=("is_responding",
+                  frac_efflux=("efflux",
                                    lambda s: s.dropna().mean()),
                   n_guv=("released", "size"),
                   median_radius=("radius_um", "median"))
@@ -1144,7 +1417,7 @@ def load_guv_qc(outputs_root) -> pd.DataFrame:
 
 
 # Fate whose vesicles carry a matched-endpoint response call. process.py
-# recomputes is_responding at ENDPOINT_MATCHED_T_S for this fate only, so it
+# the efflux call is made at ENDPOINT_MATCHED_T_S for this fate only, so it
 # is the only one whose responding rate is on a single clock.
 FATE_FOR_RESPONSE = "Stagnate"
 
@@ -1152,7 +1425,7 @@ FATE_FOR_RESPONSE = "Stagnate"
 def check_detectability(df: pd.DataFrame, outputs_root, out: Path):
   """Is one population simply easier to score as responding?
 
-  `is_responding` fires when a vesicle's observed decline clears a noise
+  `efflux` fires when a vesicle's fall from its PRE-pulse mean clears a noise
   floor derived from its own trace. A population with quieter traces, or with
   better pre-pulse dye contrast, clears that floor on a smaller real change --
   which would produce a susceptibility difference with no difference in
@@ -1173,7 +1446,7 @@ def check_detectability(df: pd.DataFrame, outputs_root, out: Path):
   # Stagnate only, matching every other response figure in this module.
   #
   # Two things go wrong without this. The responding RATE printed below is
-  # taken from the same `is_responding` column the field response uses, but
+  # taken from the same `efflux` column the field response uses, but
   # process.py only recomputes that column at the matched endpoint for
   # Stagnate vesicles; Grow, Reduce and Rupture rows keep the whole-record
   # call read straight from _fit_parameters.csv. Pooling the two puts three
@@ -1229,7 +1502,7 @@ def check_detectability(df: pd.DataFrame, outputs_root, out: Path):
   # the easiest group to score against the hardest. A ratio taken over a
   # middle group would understate how far apart the ends are.
   resp_rate = {POP_LABEL[p]:
-               merged[merged["population"] == p]["is_responding"]
+               merged[merged["population"] == p]["efflux"]
                .dropna().mean() for p in pops}
   more_responsive = max(resp_rate, key=resp_rate.get)
   print(f"  responding overall: "
@@ -1319,8 +1592,8 @@ def check_per_experiment_within_fields(df: pd.DataFrame, out: Path):
     print("Per-experiment field check skipped: nothing to compare.")
     return
   per = (sub.groupby(["field_kV_cm", "population", "experiment"])
-         .agg(n_guv=("is_responding", "count"),
-              frac_responding=("is_responding", lambda x: x.dropna().mean()))
+         .agg(n_guv=("efflux", "count"),
+              frac_efflux=("efflux", lambda x: x.dropna().mean()))
          .reset_index())
   # An experiment contributing one or two vesicles to a field can only report
   # 0, 0.5 or 1 by construction; that is not an estimate of a fraction.
@@ -1348,10 +1621,10 @@ def check_per_experiment_within_fields(df: pd.DataFrame, out: Path):
       if vals.empty:
         continue
       fr = ", ".join(f"{v:.2f}(n={int(n)})" for v, n
-                     in zip(vals["frac_responding"], vals["n_guv"]))
+                     in zip(vals["frac_efflux"], vals["n_guv"]))
       print(f"    {POP_LABEL[pop]:<16} median "
-            f"{vals['frac_responding'].median():.2f}  "
-            f"({int((vals['frac_responding'] > 0).sum())}/{len(vals)} "
+            f"{vals['frac_efflux'].median():.2f}  "
+            f"({int((vals['frac_efflux'] > 0).sum())}/{len(vals)} "
             "experiments with any responder)")
       print(f"      {fr}")
 
@@ -1364,7 +1637,7 @@ def check_per_experiment_within_fields(df: pd.DataFrame, out: Path):
     off = (k - (len(pops) - 1) / 2) * 0.28
     xs = np.array([xpos[E] for E in m["field_kV_cm"]], float) + off \
         + rng.uniform(-0.05, 0.05, len(m))
-    ax.scatter(xs, m["frac_responding"], s=30 + 3 * m["n_guv"],
+    ax.scatter(xs, m["frac_efflux"], s=30 + 3 * m["n_guv"],
                color=_colour(pop), alpha=0.85, edgecolors="white",
                linewidth=0.6,
                label=f"{POP_LABEL[pop]} (1 point = 1 experiment)")
@@ -1375,7 +1648,7 @@ def check_per_experiment_within_fields(df: pd.DataFrame, out: Path):
   ax.set_xticklabels([f"{E:.2f}" + ("" if interpreted(E) else "*")
                       for E in fields], fontsize=8)
   ax.set_xlabel("field strength (kV/cm)")
-  ax.set_ylabel("fraction responding")
+  ax.set_ylabel("fraction with efflux")
   ax.set_ylim(-0.05, 1.05)
   star = ("" if all(interpreted(E) for E in fields) else
           "\n* one session only; not read as a dose response")
@@ -1404,6 +1677,10 @@ SIZE_MATCHED_WINDOW = _PROC_WINDOW
 # dilutes the comparison with conditions that cannot separate anything. Read
 # the per-field table before trusting the pooled row: this cut is chosen from
 # the data, not prespecified.
+# Used only if no Bare vesicle responds anywhere in the interpreted range, in
+# which case split_field() has nothing to return. Normally the cut comes from
+# the data through split_field(), so this file and Section 3 cannot disagree
+# about where the series divides.
 SIZE_MATCHED_MIN_FIELD = 1.2
 
 
@@ -1426,15 +1703,23 @@ def check_size_matched(df: pd.DataFrame, out: Path):
   print(f"\n{'=' * 70}")
   print(f"Bare vs cortex pooled across fields ({win})")
   print("=" * 70)
-  pops = [p for p in POP_LABEL if p in set(m["population"])]
+  # Uninterpreted fields are dropped here as they are in Section 3. Without
+  # this the two blocks described the same vesicles over different field
+  # ranges and disagreed above the cut -- Bare 8/58 in this block against 7/35
+  # in Section 3 -- while agreeing below it, which is the worst arrangement to
+  # read a chapter from.
+  m_int = m[m["field_kV_cm"].map(interpreted)]
+  print(f"  Interpreted fields only (<= {INTERPRETED_MAX_FIELD} kV/cm): "
+        f"{len(m_int)} of {len(m)} vesicles; the CSV holds all of them.")
+  pops = [p for p in POP_LABEL if p in set(m_int["population"])]
   for p in pops:
-    v = m[m["population"] == p]
-    k = int((v["is_responding"] == True).sum())
-    print(f"  {POP_LABEL[p]:<24} n={len(v):3d}  median r={v['radius_um'].median():.2f} um"
-          f"  responding {k}  chambers {v['experiment'].nunique()}")
+    v = m_int[m_int["population"] == p]
+    print(f"  {POP_LABEL[p]:<24} n={len(v):3d}  "
+          f"median r={v['radius_um'].median():.2f} um"
+          f"  chambers {v['experiment'].nunique()}")
 
-  a = m[m["population"] == "Bare"]
-  b = m[m["population"] == "Branched, cortex"]
+  a = m_int[m_int["population"] == "Bare"]
+  b = m_int[m_int["population"] == "Branched, cortex"]
   if len(a) < 5 or len(b) < 5:
     print("  Too few vesicles of both kinds in the window to compare.")
     return
@@ -1456,32 +1741,35 @@ def check_size_matched(df: pd.DataFrame, out: Path):
   except Exception:
     pass
 
-  print(f"\n  Per field strength (cells with >=5 of both):")
-  print(f"    {'kV/cm':>6} {'Bare':>12} {'cortex':>12}   median radius")
-  for E, cell in m.groupby(m["field_kV_cm"].round(2)):
+  # Radius per field, not efflux per field: the response counts are in the
+  # Section 3 table, and printing them twice from two frames is what let the
+  # two copies drift apart in the first place.
+  print(f"\n  Per field strength, radius (cells with >=5 of both):")
+  print(f"    {'kV/cm':>6} {'n Bare':>7} {'n cortex':>9}   median radius")
+  for E, cell in m_int.groupby(m_int["field_kV_cm"].round(2)):
     va = cell[cell["population"] == "Bare"]
     vb = cell[cell["population"] == "Branched, cortex"]
     if len(va) < 5 or len(vb) < 5:
       continue
-    print(f"    {E:6.2f} {int((va['is_responding'] == True).sum()):5d}/{len(va):<6d}"
-          f" {int((vb['is_responding'] == True).sum()):5d}/{len(vb):<6d}"
-          f"   {va['radius_um'].median():.2f} vs {vb['radius_um'].median():.2f} um")
+    print(f"    {E:6.2f} {len(va):7d} {len(vb):9d}   "
+          f"{va['radius_um'].median():.2f} vs "
+          f"{vb['radius_um'].median():.2f} um")
 
-  _report_matched_cell(a, b, "whole window")
-  ah = a[a["field_kV_cm"] >= SIZE_MATCHED_MIN_FIELD]
-  bh = b[b["field_kV_cm"] >= SIZE_MATCHED_MIN_FIELD]
-  if len(ah) >= 5 and len(bh) >= 5:
-    _report_matched_cell(ah, bh,
-                         f"E >= {SIZE_MATCHED_MIN_FIELD} kV/cm")
+  # The responding fractions for this window are reported ONCE, by Section 3
+  # below: same vesicles, same interpreted fields, same clustered interval.
+  # This block used to print them again from an unfiltered frame, so a reader
+  # met two sets of numbers for one comparison and had no way to tell which
+  # the chapter quoted. What is left here is what only this block does -- the
+  # residual size check above, and the single-session sensitivity below.
+  print("\n  Responding fractions for this window: see Section 3 below.")
 
-  # Below the field at which Bare first responds. This is the cell the
-  # threshold claim rests on -- one group at zero and the other not -- and it
-  # was previously computed by hand from the per-field table.
-  al = a[a["field_kV_cm"] < SIZE_MATCHED_MIN_FIELD]
-  bl = b[b["field_kV_cm"] < SIZE_MATCHED_MIN_FIELD]
+  cut = split_field(m_int)
+  if not np.isfinite(cut):
+    cut = SIZE_MATCHED_MIN_FIELD
+  al = a[a["field_kV_cm"] < cut]
+  bl = b[b["field_kV_cm"] < cut]
   if len(al) >= 5 and len(bl) >= 5:
-    _report_matched_cell(al, bl, f"E < {SIZE_MATCHED_MIN_FIELD} kV/cm")
-    # Same cell inside one session. The Fisher test above treats vesicles as
+    # Same cell inside one session. The pooled interval treats vesicles as
     # independent when they are clustered in chambers and days; restricting
     # to the session that supplies most of this range removes the day as an
     # explanation entirely, at the cost of the vesicles it discards. If the
@@ -1492,7 +1780,7 @@ def check_size_matched(df: pd.DataFrame, out: Path):
       if len(a_s) >= 5 and len(b_s) >= 5:
         _report_matched_cell(
             a_s, b_s,
-            f"E < {SIZE_MATCHED_MIN_FIELD} kV/cm, session {s} only "
+            f"E < {cut:.2f} kV/cm, session {s} only "
             f"({len(a_s) + len(b_s)} of {len(al) + len(bl)} vesicles)")
 
   m.to_csv(out / "size_matched_window.csv", index=False)
@@ -1500,14 +1788,14 @@ def check_size_matched(df: pd.DataFrame, out: Path):
 
 def _report_matched_cell(a: pd.DataFrame, b: pd.DataFrame, label: str):
   """Responding fraction, mean release and chamber counts for one cell."""
-  ka = int((a["is_responding"] == True).sum())
-  kb = int((b["is_responding"] == True).sum())
+  ka = int((a["efflux"] == True).sum())
+  kb = int((b["efflux"] == True).sum())
   print(f"\n  {label}:")
   print(f"    responding   Bare {ka}/{len(a)} ({100 * ka / len(a):.1f}%)"
         f"   cortex {kb}/{len(b)} ({100 * kb / len(b):.1f}%)")
   if "efflux" not in a.columns:
-    a = a.assign(efflux=a["is_responding"] == True)
-    b = b.assign(efflux=b["is_responding"] == True)
+    a = a.assign(efflux=a["efflux"] == True)
+    b = b.assign(efflux=b["efflux"] == True)
   d, lo, hi = cluster_diff(a, b)
   if np.isfinite(lo):
     print(f"    difference   {d:+.3f}  95% CI [{lo:+.3f}, {hi:+.3f}]"
@@ -1528,7 +1816,7 @@ def _report_matched_cell(a: pd.DataFrame, b: pd.DataFrame, label: str):
   # is least able to supply. A vesicle-level p built on a handful of chambers
   # is a statement about those chambers.
   for name, v in (("Bare", a), ("cortex", b)):
-    per = [(x["is_responding"] == True).mean()
+    per = [(x["efflux"] == True).mean()
            for _, x in v.groupby("experiment") if len(x) >= 3]
     if not per:
       print(f"    {name:<7} no chamber contributes 3+ vesicles here")
@@ -1559,6 +1847,7 @@ def main(results_dir=None, root=None):
   check_detectability(df, tree, out)
   check_size_matched(df, out)
   report_section3(df, out)
+  report_radius_sensitivity(base, out)
   plot_experiment_level(df, out)
   write_latex_tables(df, out)
   print(f"\nSaved susceptibility figures to {out}")

@@ -95,6 +95,14 @@ def run_intensity(root: Path):
 
   summary_csv = results / "guv_bulk_summary.csv"
   df.to_csv(summary_csv, index=False)
+  # The same table one step earlier, before the window. Nothing downstream
+  # reads it as a population; it exists so susceptibility.py can ask what the
+  # window costs, which cannot be answered from a file the window has already
+  # been applied to. Without it the sensitivity has to be run by editing
+  # SIZE_WINDOW_UM and re-running, and the comparison lives in a notebook
+  # instead of in the pipeline.
+  all_radii_csv = results / "guv_bulk_all_radii.csv"
+  df_all.to_csv(all_radii_csv, index=False)
   print(f"Saved {summary_csv}  ({len(df)} GUV rows, "
         f"{df['experiment'].nunique()} experiments)")
   print(f"  This file is the SIZE-MATCHED population and is what "
@@ -104,6 +112,8 @@ def run_intensity(root: Path):
         f"process.cortex_stage_population: cortex-bearing, Stagnate and "
         f"radius-stable, but NOT size-windowed. Their counts will not "
         f"reconcile with the dye sections and are not meant to.")
+  print(f"Saved {all_radii_csv}  ({len(df_all)} GUV rows) -- the same table "
+        "before the size window, read only by the radius sensitivity.")
   process.write_layout_readme(results)
 
   # Aggregated once and passed to each consumer, rather than letting
@@ -153,7 +163,7 @@ def run_intensity(root: Path):
   df_split = process.apply_cortex_split(df)
   # Printed before the figures that use both metrics, so the overlap between
   # the response call and the endpoint category is in the log above them.
-  process.report_response_agreement(df_split)
+  process.report_efflux_calls(df_split)
   process.generate_separate_pdf_plots(df_split, str(results))
   process.plot_released_fraction_by_voltage(df_split, str(results))
   process.plot_drop_by_cortex_status(df, str(results))

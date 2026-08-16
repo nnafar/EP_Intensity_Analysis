@@ -958,12 +958,17 @@ def _fit_kinetic_model(model_name: str, t_c: np.ndarray, y_c: np.ndarray,
     # last few samples sets the endpoints (so one bad frame cannot create or
     # destroy a response), and the noise scale comes from the MAD of
     # successive differences, which is insensitive to the slow trend itself.
+    # The DROP and the NOISE are still measured here, because both are
+    # properties of the trace and this is where the trace is in hand. What is
+    # NOT decided here is whether the vesicle released dye. That call needs the
+    # pre-pulse baseline and the matched endpoint, neither of which exists at
+    # fit time, and the post-pulse baseline available here is contaminated:
+    # poration onset falls inside the first imaging frame, so a baseline taken
+    # from the first post-pulse samples has already absorbed part of the
+    # release and measures only what leaks out afterwards. The call is made in
+    # process.aggregate_pipeline_results against i_pre.
     resp_drop, resp_noise = _observed_response(
         t_c, y_c, efflux=model_name.startswith('EFFLUX'))
-    k_resp = float(getattr(cfg, 'FIT_RESPONSE_AMPLITUDE_SIGMA', 3.0))
-    min_amp = float(getattr(cfg, 'FIT_MIN_RESPONSE_AMPLITUDE', 0.05))
-    responding = bool(np.isfinite(resp_drop) and np.isfinite(resp_noise)
-                      and resp_drop > max(min_amp, k_resp * resp_noise))
 
     # Retained purely as a diagnostic, no longer a gate: a LARGE amp_total
     # next to a SMALL resp_drop is the signature of the tau-at-bound
@@ -973,11 +978,13 @@ def _fit_kinetic_model(model_name: str, t_c: np.ndarray, y_c: np.ndarray,
     amp_total = float(np.sum(np.abs(params[amp_idx]))) if amp_idx else np.nan
     resid_std = float(np.std(y_c - y_fit)) if len(y_c) > 2 else np.nan
 
-    # tau is only meaningful for a GUV that actually responded AND whose decay
-    # resolved inside the record.
-    identifiable = bool(responding
-                        and np.isfinite(se_ratio) and se_ratio <= se_ratio_max
-                        and not tau_too_long)
+    # Whether the FIT pinned tau down: the standard error is a small fraction
+    # of tau and the decay resolved inside the record. This is necessary for a
+    # usable tau but not sufficient -- a flat trace can satisfy both, because
+    # there is nothing for the fit to be uncertain about. The release
+    # requirement is ANDed onto this downstream, where the endpoint is known.
+    tau_fit_ok = bool(np.isfinite(se_ratio) and se_ratio <= se_ratio_max
+                      and not tau_too_long)
 
     return {
         'model_name': model_name, 'fn': fn, 'params': params, 'names': names,
@@ -985,8 +992,7 @@ def _fit_kinetic_model(model_name: str, t_c: np.ndarray, y_c: np.ndarray,
         'aic': aic, 'aicc': aicc, 'bic': bic,
         'tau_se_ratio': float(se_ratio) if np.isfinite(se_ratio) else np.nan,
         'tau_over_record': float(tau_val / t_span) if t_span > 0 else np.nan,
-        'tau_identifiable': identifiable,
-        'is_responding': responding,
+        'tau_fit_ok': tau_fit_ok,
         'response_drop': resp_drop,
         'response_noise': resp_noise,
         'rss_linear': rss_linear,
@@ -1307,53 +1313,26 @@ def fit_individual_curves(aligned: dict, guv_results: dict, t: np.ndarray, logge
         res.update(dict(zip(names, params)))
         res.update({f'{n}_SE': e for n, e in zip(names, perr)})
 
-        # Quality flags. tau_identifiable == False means the record ended
-        # before the decay resolved, so tau and Iinf are extrapolations and
-        # must be excluded from population statistics — use the model-free
-        # columns for those GUVs instead.
-        res['tau_identifiable'] = primary['tau_identifiable']
-        res['is_responding']    = primary['is_responding']
+        # Quality flags. tau_fit_ok == False means the record ended before the
+        # decay resolved, or the standard error swamped tau, so tau and Iinf
+        # are extrapolations and must be excluded from population statistics —
+        # use the model-free columns for those GUVs instead. tau_fit_ok is NOT
+        # the identifiability flag on its own: process.py ANDs it with the
+        # release call to produce tau_identifiable.
+        res['tau_fit_ok']       = primary['tau_fit_ok']
         res['response_drop']    = primary['response_drop']
         res['response_noise']   = primary['response_noise']
         res['exp_vs_linear']    = primary['exp_vs_linear']
         res['rss_linear']       = primary['rss_linear']
 
-        # --- response phenotype ------------------------------------------
-        # Four mutually exclusive classes, assigned in this order:
-        #
-        #   NON_RESPONDING - no decline resolvable above the trace's own
-        #                    noise. Retained as a data point: locating the
-        #                    voltage threshold is the point of the experiment.
-        #   EXPONENTIAL    - curvature resolved INSIDE the record, i.e. the
-        #                    exponential beats a straight line on the same
-        #                    window by RESPONSE_SHAPE_MIN_RSS_RATIO. Only
-        #                    these carry a tau that means anything.
-        #   DELAYED        - the decline begins measurably AFTER the pulse
-        #                    (onset_lag_frac >= RESPONSE_ONSET_LAG_FRAC),
-        #                    rather than at it.
-        #   GRADUAL        - declines from the pulse onward, but too slowly
-        #                    for the record to distinguish from a straight
-        #                    line. A tau is still fitted and reported; it is
-        #                    an extrapolation and tau_identifiable will
-        #                    almost always be False.
-        #
-        # EXPONENTIAL is tested before DELAYED deliberately. The exponential
-        # is fitted from the pulse, so a trace that sits flat and only then
-        # decays fits it poorly and falls through to DELAYED on its own —
-        # the ordering does not hide late-onset exponentials, it routes them
-        # to the class that describes the more salient feature.
-        _shape_min = float(getattr(cfg, 'RESPONSE_SHAPE_MIN_RSS_RATIO', 3.0))
-        _lag_min   = float(getattr(cfg, 'RESPONSE_ONSET_LAG_FRAC', 0.07))
-        _evl = primary['exp_vs_linear']
-        _lag = metrics_free.get('onset_lag_frac', np.nan)
-        if not primary['is_responding']:
-            res['response_class'] = 'NON_RESPONDING'
-        elif np.isfinite(_evl) and _evl >= _shape_min:
-            res['response_class'] = 'EXPONENTIAL'
-        elif np.isfinite(_lag) and _lag >= _lag_min:
-            res['response_class'] = 'DELAYED'
-        else:
-            res['response_class'] = 'GRADUAL'
+        # A response_class column (NON_RESPONDING / EXPONENTIAL / DELAYED /
+        # GRADUAL) used to be assigned here. It was keyed off the post-pulse
+        # response flag, so it carried the same contaminated baseline, and it
+        # became a third answer to "did this vesicle release dye" sitting
+        # beside the endpoint difference and the response flag. Removed. The
+        # two quantities it was derived from, exp_vs_linear and
+        # onset_lag_frac, are still written to this table, so trace shape can
+        # be recovered without a label that doubles as a response count.
         res['amplitude_total']  = primary['amplitude_total']
         res['residual_std']     = primary['residual_std']
         # Fourth agreed flag. Sourced from the fate classification rather
@@ -1381,8 +1360,8 @@ def fit_individual_curves(aligned: dict, guv_results: dict, t: np.ndarray, logge
             param_str = f"τ₁={params[2]:.1f} s,  τ₂={params[4]:.1f} s"
         else:
             param_str = f"τ = {params[2]:.1f} s"
-        if not primary['tau_identifiable']:
-            param_str = f"({param_str})  τ NOT IDENTIFIABLE"
+        if not primary['tau_fit_ok']:
+            param_str = f"({param_str})  τ NOT CONSTRAINED"
 
         fit_plot_data.append({
             'guv_id':    guv_id,
@@ -1473,15 +1452,17 @@ def fit_individual_curves(aligned: dict, guv_results: dict, t: np.ndarray, logge
                 f"continuous radius instead of binning."
             )
 
-        if 'tau_identifiable' in df_fits.columns:
-            n_id = int(df_fits['tau_identifiable'].sum())
+        if 'tau_fit_ok' in df_fits.columns:
+            n_id = int(df_fits['tau_fit_ok'].sum())
             logger.info(
-                f"tau identifiability: {n_id}/{len(df_fits)} GUV(s) passed "
+                f"tau fit quality: {n_id}/{len(df_fits)} GUV(s) passed "
                 f"(tau_SE/tau <= {getattr(cfg, 'TAU_SE_RATIO_MAX', 0.5)} and "
                 f"tau <= {getattr(cfg, 'TAU_MAX_FRACTION_OF_RECORD', 1/3):.2f} x record). "
                 f"The remaining {len(df_fits) - n_id} have tau/Iinf reported for "
                 f"completeness only — use the model-free columns (t50_s, "
-                f"frac_remaining_*, initial_rate_per_s) for those."
+                f"frac_remaining_*, initial_rate_per_s) for those. This count "
+                f"is NOT the identifiable count: it does not yet require the "
+                f"vesicle to have released dye, which process.py adds."
             )
 
     # Primary data export. This used to happen as a side effect inside
@@ -1491,27 +1472,6 @@ def fit_individual_curves(aligned: dict, guv_results: dict, t: np.ndarray, logge
         fits_path = os.path.join(
             cfg.FOLDER_DYE_FITTING, f"{cfg.EXPERIMENT_BASE_NAME}_fit_parameters.csv")
         df_fits.to_csv(fits_path, index=False)
-        if 'response_class' in df_fits.columns:
-            vc = df_fits['response_class'].value_counts()
-            logger.info(
-                "Response classes: "
-                + ", ".join(f"{k}={int(v)}" for k, v in vc.items())
-                + f"  (EXPONENTIAL requires exp_vs_linear >= "
-                  f"{getattr(cfg, 'RESPONSE_SHAPE_MIN_RSS_RATIO', 3.0)}, "
-                  f"DELAYED requires onset_lag_frac >= "
-                  f"{getattr(cfg, 'RESPONSE_ONSET_LAG_FRAC', 0.07)})"
-            )
-            n_exp = int((df_fits['response_class'] == 'EXPONENTIAL').sum())
-            n_tid = int(df_fits['tau_identifiable'].fillna(False).sum())
-            if n_exp != n_tid:
-                logger.info(
-                    f"  Note: {n_exp} GUV(s) classed EXPONENTIAL vs "
-                    f"{n_tid} with identifiable tau. The two gates ask "
-                    f"different questions — shape resolved within the record "
-                    f"vs tau constrained by it — so a mismatch is expected, "
-                    f"not an error."
-                )
-
         logger.info(f"Saved fit parameters → {fits_path}")
 
     return df_fits
@@ -1527,9 +1487,9 @@ def generate_parameter_boxplots(df_fits: pd.DataFrame, logger: logging.Logger):
 
     # Boxplot only the identifiable fits. Boxplotting a tau that the record
     # cannot constrain produces a distribution of optimiser artefacts.
-    if 'tau_identifiable' in df_fits.columns:
+    if 'tau_fit_ok' in df_fits.columns:
         n_before = len(df_fits)
-        df_fits = df_fits[df_fits['tau_identifiable'].fillna(False)]
+        df_fits = df_fits[df_fits['tau_fit_ok'].fillna(False)]
         if df_fits.empty:
             logger.warning(
                 f"Parameter boxplots skipped: none of {n_before} fit(s) passed "
