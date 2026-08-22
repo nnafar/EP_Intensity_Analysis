@@ -718,9 +718,11 @@ def plot_representative_radial_profiles(df_all: pd.DataFrame, outputs_root,
 
   Answers what the classifier in guv_analysis_utils.classify_cortex_presence
   actually saw: CORTEX, NO_CORTEX and AMBIGUOUS vesicles, each represented by
-  one pre-pulse radial profile, on a common radius axis (fraction of each
-  profile's own extent, so the membrane sits at 1 / PROFILE_EXTENT_RADII =
-  0.625 regardless of vesicle size -- see the module docstring above).
+  one pre-pulse radial profile, on a common radius axis in VESICLE RADII
+  (matching collect_evolution_peaks' grid_x, not the raw 0-1 fraction
+  _profile_peak uses internally for PEAK_SEARCH_FRAC) -- so the membrane
+  sits at x = 1.0 regardless of vesicle size, the same convention
+  plot_mean_actin_evolution's reference line uses.
 
   Deliberately NOT built from collect_evolution_peaks / cortex_stage_
   population: those restrict to cortex-bearing GUVs only, and this figure
@@ -846,9 +848,8 @@ def plot_representative_radial_profiles(df_all: pd.DataFrame, outputs_root,
     ax.plot(grid_x, mean_curve / baseline, color=colours[status], lw=2.2,
             label=labels[status], zorder=3, solid_capstyle="round")
 
-  ax.axvline(1.0 / PROFILE_EXTENT_RADII, color=PALETTE["grey"], lw=0.8,
-             ls=":", zorder=1)
-  ax.text(1.0 / PROFILE_EXTENT_RADII, 0.97, "membrane", fontsize=7.5,
+  ax.axvline(1.0, color=PALETTE["grey"], lw=0.8, ls=":", zorder=1)
+  ax.text(1.0, 0.97, "membrane", fontsize=7.5,
           color=PALETTE["grey"], ha="center", va="top",
           transform=ax.get_xaxis_transform())
   # Not forced to 0: this is intensity normalised to each vesicle's own
@@ -858,7 +859,7 @@ def plot_representative_radial_profiles(df_all: pd.DataFrame, outputs_root,
   # instead.
   ax.margins(y=0.10)
   ax.set_xlim(0, PROFILE_EXTENT_RADII)
-  ax.set_xlabel("radial position (fraction of profile extent)", fontsize=10)
+  ax.set_xlabel("radius / vesicle radius", fontsize=10)
   ax.set_ylabel("actin intensity, normalized to centre-most sample",
                 fontsize=10)
   ax.spines["top"].set_visible(False)
