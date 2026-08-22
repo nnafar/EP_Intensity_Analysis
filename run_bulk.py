@@ -6,7 +6,14 @@ otherwise independent and either can be switched off below.
 
     INTENSITY  process.py  -> per-GUV bulk summary, size/intensity figures,
                               released fraction vs voltage, cortex split,
-                              cortex-breakdown and area-loss onset fields
+                              cortex classification histograms
+    CORTEX     cortex_montage.py
+                           -> what happened to the cortex: peak height lost,
+                              its time course from both the traces and the
+                              radial profiles, the bleach reference, the onset
+                              fields and the pole/equator test. Reads the table
+                              the intensity stage aggregated, so it runs after
+                              it and is skipped if it failed.
     TAU        tau_identifiability_report.py
                            -> why tau is not reportable, pooled over all
                               experiments, with the per-constraint breakdown
@@ -15,7 +22,8 @@ otherwise independent and either can be switched off below.
                               cortex. The only stage that reopens the raw ND2s,
                               so it needs DATA_ROOT and the nd2 package, takes
                               minutes rather than seconds, and is the one most
-                              likely to fail on its own -- hence its own toggle.
+                              likely to fail on its own -- hence its own toggle,
+                              separate from the cortex figures in the same file.
 
 They are deliberately NOT merged into one figure script. The intensity
 analysis aggregates one row per GUV from three different CSVs and gates on
@@ -33,6 +41,7 @@ from pathlib import Path
 # -----------------------------------------------------------------------------
 
 RUN_INTENSITY = True    # process.py: bulk summary + intensity figures
+RUN_CORTEX    = True    # cortex peak, time course, onset fields, pole/equator
 RUN_TAU       = True    # tau identifiability diagnostic
 RUN_MONTAGE   = True    # actin montages; needs the raw ND2s, slowest stage
 RUN_SUSCEPT   = True    # size-matched Bare vs Branched comparison
@@ -60,7 +69,7 @@ def results_dir_for(root: Path) -> Path:
   return out
 
 
-def run_intensity(root: Path):
+def run_intensity(root: Path, state: dict):
   import process
 
   print(f"\n{'=' * 70}\nBulk intensity analysis\n{'=' * 70}")
@@ -83,11 +92,19 @@ def run_intensity(root: Path):
   # vesicle including the ones the window discards. Filtering earlier would
   # save that work but would leave the cortex stages with nothing to run on.
   df_all = process.aggregate_pipeline_results(str(root))
+  # Before drop_intensity_gainers below: the representative-trace figure
+  # needs one gainer example, which that call removes from the table.
+  process.plot_representative_intensity_traces(df_all, str(root),
+                                                str(results))
   # Before anything else touches the table. Both branches below start from
   # df_all -- the dye stages through apply_size_window, the cortex stages
   # through cortex_stage_population -- so excluding here is what makes the
   # two sets of figures agree on which vesicles exist.
   df_all = process.drop_intensity_gainers(df_all, results)
+  # Handed to the cortex stage here, before the size window, because that is
+  # the population cortex_stage_population filters from -- and because a
+  # failure in the dye half below should not take the cortex figures with it.
+  state["df_all"] = df_all
   df = process.apply_size_window(df_all)
   if df.empty:
     print("No GUV records found -- has batch_run.py been run?")
@@ -108,7 +125,8 @@ def run_intensity(root: Path):
   print(f"  This file is the SIZE-MATCHED population and is what "
         f"susceptibility.py reads, which then applies "
         f"process.analysis_population to it. The cortex-breakdown stages "
-        f"below start from all {len(df_all)} vesicles instead and apply "
+        f"in cortex_montage.py start from all {len(df_all)} vesicles "
+        f"instead and apply "
         f"process.cortex_stage_population: cortex-bearing, Stagnate and "
         f"radius-stable, but NOT size-windowed. Their counts will not "
         f"reconcile with the dye sections and are not meant to.")
@@ -121,43 +139,11 @@ def run_intensity(root: Path):
   # Calibration figures for the thresholds the split depends on. Produced
   # from the unsplit frame, since they are what the split is read from.
   process.plot_lumen_abs_histogram(df_all, str(results))
-  # Actin-side metric: how much radial cortex peak height was lost.
-  df_peak = process.add_cortex_peak_metrics(df_all, str(root))
-  process.plot_cortex_peak_breakdown(df_peak, str(results))
-  # Onset fields: the sigmoid midpoint in volts for cortex breakdown and for
-  # area loss, each with a bootstrap CI. Fitted on df merged with
-  # peak_drop_final rather than on df_peak itself, because df_peak is an inner
-  # merge and so contains only vesicles with an actin trace -- Bare GUVs have
-  # none, and dropping them would leave the area-loss onset with one
-  # population to fit instead of two. The merge is left, so bare vesicles
-  # carry NaN for the cortex measure and are simply absent from that fit.
-  #
-  # One thing this does NOT yet do, an open decision rather than an
-  # oversight: the two measures do not have to rest on the same vesicles.
-  # Area loss is available for every GUV with a terminal radius, the cortex
-  # drop only for those whose actin trace reached ENDPOINT_MATCHED_T_S. Check
-  # n_guv per measure in onset_fields.csv before reading the two midpoints as
-  # an ordering. The cortex split is applied inside report_onset_fields, so
-  # the frame passed here is deliberately the unsplit one.
-  process.report_onset_fields(
-      df_all.merge(df_peak[["experiment", "guv_id", "peak_drop_final"]],
-                   on=["experiment", "guv_id"], how="left")
-      if not df_peak.empty else df_all,
-      str(results))
-  process.report_bleach_comparability(str(root))
-  process.plot_cortex_peak_timecourse(df_all, str(root), str(results))
-  # Directionality of that loss, pooled across vesicles. Reads the
-  # per-experiment *_pole_vs_equator_traces.csv files, so it needs
-  # EXPORT_ACTIN_KYMOGRAPH = True on the run that produced them.
-  #
-  # Given df_peak, not df: the conditioned test ("of the cortices that broke
-  # down, did they break down directionally?") needs peak_drop_final, which
-  # only exists after the actin merge. Falls back to df so the pooled test
-  # still runs when no actin traces were found.
-  process.plot_pole_equator_pooled(
-      df_peak if not df_peak.empty else df_all, str(root), str(results))
   process.plot_cortex_contrast_histogram(df_all, str(results))
   process.report_cortex_status(df_all)
+  # Everything downstream of the cortex CLASSIFICATION -- peak height lost, its
+  # time course, the onset fields, the pole/equator test -- is the cortex
+  # stage, in cortex_montage.py.
 
   # --- primary figure set: BranchedCortex split by phenotype ---------------
   df_split = process.apply_cortex_split(df)
@@ -184,14 +170,26 @@ def run_intensity(root: Path):
   return df
 
 
-def run_tau(root: Path):
+def run_cortex(root: Path, state: dict):
+  import cortex_montage
+
+  print(f"\n{'=' * 70}\nCortex breakdown\n{'=' * 70}")
+  df_all = state.get("df_all")
+  if df_all is None:
+    print("Skipped: the intensity stage did not produce a table to run on. "
+          "Set RUN_INTENSITY = True, or run cortex_montage.py on its own.")
+    return None
+  return cortex_montage.cortex_analysis(df_all, root, results_dir_for(root))
+
+
+def run_tau(root: Path, state: dict):
   import tau_identifiability_report as tau
 
   print(f"\n{'=' * 70}\nTau identifiability\n{'=' * 70}")
   return tau.main(root, results_dir_for(root))
 
 
-def run_susceptibility(root: Path):
+def run_susceptibility(root: Path, state: dict):
   import susceptibility
 
   print(f"\n{'=' * 70}\nSusceptibility: bare, cortex and lumenal-only "
@@ -200,7 +198,7 @@ def run_susceptibility(root: Path):
   return susceptibility.main(results_dir_for(root), root)
 
 
-def run_montage(root: Path):
+def run_montage(root: Path, state: dict):
   import cortex_montage
 
   print(f"\n{'=' * 70}\nActin montages\n{'=' * 70}")
@@ -215,7 +213,11 @@ def main():
 
   # Each half is wrapped so a failure in one still leaves the other's figures
   # on disk -- a long batch should not be re-run because a plot raised.
+  # Stage order is a dependency order, not a preference: cortex reads the table
+  # intensity builds, and susceptibility reads the CSV intensity writes.
+  state = {}
   for enabled, name, fn in ((RUN_INTENSITY, "intensity", run_intensity),
+                            (RUN_CORTEX, "cortex", run_cortex),
                             (RUN_TAU, "tau", run_tau),
                             (RUN_SUSCEPT, "susceptibility",
                              run_susceptibility),
@@ -224,7 +226,7 @@ def main():
       print(f"\nSkipping {name} (disabled in the settings block).")
       continue
     try:
-      fn(root)
+      fn(root, state)
     except (Exception, SystemExit) as e:
       # SystemExit is caught deliberately: the stages raise it for missing
       # paths, and it is not an Exception, so it would otherwise skip this
@@ -239,3 +241,5 @@ def main():
 
 if __name__ == "__main__":
   main()
+  
+  

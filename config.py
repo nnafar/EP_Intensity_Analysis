@@ -469,6 +469,20 @@ EXPORT_DEBUG_PLOTS       = True
 # -----------------------------------------------------------------------------
 SIZE_WINDOW_UM = (4.0, 6.0)
 
+# Highest field the dose series can be read across: 0.1 kV/cm (30 V) to
+# 1.33 kV/cm (400 V). Fields above this are still measured and can be
+# tabulated, but they come from sessions that supply no other field, so the
+# field axis and the session axis cannot be told apart above this line (see
+# susceptibility.report_session_confound). All main-text figures restrict to
+# this range; anything above it is drawn only in the supplementary,
+# high-field-only figures, never mixed into the main dose-response plots.
+# Set to None to interpret the whole series (not recommended -- see above).
+#
+# Centralised here rather than left local to susceptibility.py so that
+# process.py's raw-trace figure can also gate on it without importing
+# susceptibility (which itself imports process, and would create a cycle).
+INTERPRETED_MAX_FIELD = 1.34
+
 MICRONS_PER_PIXEL        = 0.11 # Plan Apo λ 60x Oil
 SCALE_BAR_LENGTH_MICRONS = 10
 

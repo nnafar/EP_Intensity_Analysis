@@ -56,6 +56,18 @@ from palette import (
 #   title            per-axes title.
 #   suptitle         the figure-wide title, where one is set.
 #   annotation       text drawn inside the axes (n = counts, percentages).
+#   scale            multiplies EVERY text element above that is not
+#                    individually overridden by whatever size the plotting
+#                    code already gave it, so the axis label, tick label,
+#                    legend, title and every annotation all grow or shrink
+#                    together and keep their relative proportions. This is
+#                    the one knob to reach for first -- "make this figure's
+#                    text 25% bigger" is scale=1.25, not six separate
+#                    absolute numbers. An explicit field above still wins
+#                    over scale for that one element, so scale can be
+#                    combined with a targeted override (e.g. scale=1.2 with
+#                    legend=6 pinned) when one element needs to buck the
+#                    trend.
 #
 # Example -- a single-column figure for the thesis:
 #
@@ -64,13 +76,17 @@ from palette import (
 #       axis_label=8, tick_label=7, legend=7, annotation=6,
 #   ),
 #
-# The keys below are the eleven figures this script writes, named after their
-# PDF. Panel counts scale with the number of populations present unless noted.
+# Example -- same figure, just larger text, proportions untouched:
+#
+#   "lumen_abs_histogram": dict(scale=1.3),
+#
+# The keys below are named after the PDF each one controls. Panel counts
+# scale with the number of populations present unless noted.
 # -----------------------------------------------------------------------------
 
 _FIG_FIELDS = ("width", "width_per_panel", "height", "axis_label",
                "tick_label", "legend", "legend_title", "title",
-               "suptitle", "annotation")
+               "suptitle", "annotation", "scale")
 
 
 def _fig(**kwargs):
@@ -97,10 +113,39 @@ FIGURE_STYLE = {
     # 04_cortex_breakdown
     "onset_fields":                  _fig(),   # one panel per population
     "cortex_peak_breakdown":         _fig(),   # single panel
-    "cortex_peak_timecourse":        _fig(),   # fixed at 2 panels
+    "cortex_size_dependence":        _fig(),   # one panel per field
+    "actin_evolution_mean":          _fig(),   # one panel per field
+    "actin_evolution_peak":          _fig(),   # single panel
     "pole_equator_pooled":           _fig(),   # fixed at 2 panels
     # 05_kinetics
     "tau_by_size_voltage":           _fig(),   # one panel per population
+    "tau_identifiability":           _fig(),   # fixed at 2 panels
+
+    # 06_representative_traces (new as of the 2026-08 update)
+    "guv_representative_intensity_traces": _fig(),   # single panel
+    "guv_representative_radial_profiles":  _fig(),   # single panel
+
+    # 03_cortex_classification/montages -- one montage per phenotype;
+    # cortex_montage.montage() looks up the key from the output filename
+    # (its stem), so any montage saved under a new name works without a new
+    # entry here, but the three the pipeline currently writes are named
+    # explicitly so they show up when scanning this dict for what exists.
+    "guv_actin_montage_cortex":        _fig(),
+    "guv_actin_montage_lumenal_only":  _fig(),
+    "guv_actin_montage_undetermined":  _fig(),
+
+    # 07_susceptibility -- bare vs cortex vs lumenal-only at matched dV_m,
+    # from susceptibility.py. Not part of the numbered LAYOUT folders above;
+    # written to its own SUBFOLDER instead (see susceptibility.SUBFOLDER).
+    "size_distribution_ecdf":            _fig(),   # single panel
+    "guv_size_full_population_ecdf":     _fig(),   # single panel
+    "field_response_by_population":      _fig(),   # fixed at 2 panels
+    "field_response_by_population_supplementary_highfield": _fig(),  # 2 panels
+    "field_response_by_session":         _fig(),   # fixed at 2 panels
+    "endpoint_distribution":             _fig(),   # fixed at 2 panels
+    "per_experiment_release":            _fig(),   # single panel
+    "detectability_by_population":       _fig(),   # 2-3 panels
+    "per_experiment_within_field":       _fig(),   # single panel
 }
 
 
@@ -137,34 +182,74 @@ def style_figure(key: str) -> None:
 
     Anything left as None is not touched, so a figure with no overrides keeps
     the sizes its plotting function chose.
+
+    `scale`, where set, is applied per TEXT OBJECT: each axis label, each
+    tick label, each legend entry, each annotation keeps whatever size the
+    plotting code gave it and is multiplied by `scale` individually, rather
+    than every object of one kind being forced to one shared size. A figure
+    that already draws its annotations at three different sizes for a reason
+    keeps that internal proportion after scaling; only the OVERALL size of
+    the text grows or shrinks. An explicit field (axis_label=9, etc.) is an
+    absolute override and takes precedence over scale for that element.
     """
     s = _style(key)
     fig = plt.gcf()
+    scale = s.get("scale")
+
+    def _abs_or_scaled(explicit, current):
+        """Absolute override if given, else current size * scale, else None
+        (leave untouched)."""
+        if explicit is not None:
+            return float(explicit)
+        if scale is not None and current is not None:
+            try:
+                return float(current) * float(scale)
+            except (TypeError, ValueError):
+                return None
+        return None
 
     for ax in fig.get_axes():
-        if s["axis_label"] is not None:
-            ax.xaxis.label.set_size(s["axis_label"])
-            ax.yaxis.label.set_size(s["axis_label"])
+        v = _abs_or_scaled(s["axis_label"], ax.xaxis.label.get_size())
+        if v is not None:
+            ax.xaxis.label.set_size(v)
+        v = _abs_or_scaled(s["axis_label"], ax.yaxis.label.get_size())
+        if v is not None:
+            ax.yaxis.label.set_size(v)
+
         if s["tick_label"] is not None:
             ax.tick_params(axis="both", which="both",
                            labelsize=s["tick_label"])
-        if s["title"] is not None and ax.get_title():
-            ax.title.set_size(s["title"])
-        if s["annotation"] is not None:
-            for txt in ax.texts:
-                txt.set_fontsize(s["annotation"])
+        elif scale is not None:
+            for txt in ax.get_xticklabels() + ax.get_yticklabels():
+                txt.set_fontsize(txt.get_fontsize() * scale)
+
+        if ax.get_title():
+            v = _abs_or_scaled(s["title"], ax.title.get_fontsize())
+            if v is not None:
+                ax.title.set_size(v)
+
+        for txt in ax.texts:
+            v = _abs_or_scaled(s["annotation"], txt.get_fontsize())
+            if v is not None:
+                txt.set_fontsize(v)
+
         leg = ax.get_legend()
         if leg is not None:
-            if s["legend"] is not None:
-                for txt in leg.get_texts():
-                    txt.set_fontsize(s["legend"])
-            if s["legend_title"] is not None and leg.get_title() is not None:
-                leg.get_title().set_fontsize(s["legend_title"])
+            for txt in leg.get_texts():
+                v = _abs_or_scaled(s["legend"], txt.get_fontsize())
+                if v is not None:
+                    txt.set_fontsize(v)
+            if leg.get_title() is not None:
+                v = _abs_or_scaled(s["legend_title"],
+                                   leg.get_title().get_fontsize())
+                if v is not None:
+                    leg.get_title().set_fontsize(v)
 
-    if s["suptitle"] is not None:
-        sup = getattr(fig, "_suptitle", None)
-        if sup is not None:
-            sup.set_size(s["suptitle"])
+    sup = getattr(fig, "_suptitle", None)
+    if sup is not None:
+        v = _abs_or_scaled(s["suptitle"], sup.get_fontsize())
+        if v is not None:
+            sup.set_size(v)
 
 
 RESULTS_SUBFOLDER = "Bulk_Analysis_Results"
@@ -177,6 +262,7 @@ LAYOUT = {
     "cortex_breakdown": "04_cortex_breakdown",
     "kinetics":         "05_kinetics",
     "pooled":           "06_pooled_reference",
+    "representative_traces": "07_representative_traces",
 }
 
 README = """Bulk_Analysis_Results
@@ -205,12 +291,30 @@ excluded_intensity_gainers.csv
                           The visual check on the two histograms.
 
 04_cortex_breakdown/      what happened to the cortex after the pulse: peak
-                          height lost, its full time course, and whether the
-                          loss is directional (poles vs equator). All three
-                          carry the 30 V control as a reference; the
-                          directional one also carries the pre-pulse index,
-                          which is zero by construction and so measures its
-                          own noise floor.
+                          height lost, its time course, the mean radial
+                          profile, and whether the loss is directional (poles
+                          vs equator). All carry the 30 V control as a
+                          reference; the directional one also carries the
+                          pre-pulse index, which is zero by construction and
+                          so measures its own noise floor.
+                          I_peak comes from the radial profiles in
+                          *_actin_evolution.csv, background-subtracted and
+                          divided by each vesicle's own pre-pulse mean. It is
+                          NOT bleach-corrected: the 30 V reference is drawn as
+                          its own curve and nothing is divided by it.
+                          guv_actin_evolution_mean.pdf gates each time bin on
+                          at least half the condition's vesicles still
+                          contributing, so a missing curve means the short
+                          records ran out, not that the cortex stopped
+                          changing. Endpoint values are blank for any vesicle
+                          whose record stops more than one frame short of the
+                          matched endpoint.
+                          guv_cortex_size_dependence.* asks whether larger
+                          vesicles lose more cortex, correlating loss with
+                          radius WITHIN each field and pooling on within-field
+                          ranks. Read it knowing dV_m scales with radius: a
+                          positive result is the dose axis in micrometres, not
+                          a size effect on top of dose.
 
 05_kinetics/              time constants. Last because the records mostly
                           cannot constrain them -- tau_identifiability.pdf
@@ -223,6 +327,18 @@ excluded_intensity_gainers.csv
                           should not appear or vanish with where those
                           thresholds sit, and this is what that is checked
                           against.
+
+07_representative_traces/ one worked example per figure, not a population
+                          summary: a representative flatline / efflux /
+                          gainer SRB trace (guv_representative_intensity_
+                          traces.pdf, restricted to the interpreted field
+                          range), and a representative pre-pulse radial actin
+                          profile per phenotype (guv_representative_radial_
+                          profiles.pdf: cortex, lumenal-only, ambiguous).
+                          "Representative" means closest to that class's own
+                          median (endpoint diff, or cortex_contrast), not the
+                          most dramatic member -- see each function's
+                          docstring for the exact selection rule.
 """
 
 def write_layout_readme(results_dir) -> None:
@@ -256,8 +372,9 @@ INTENSITY_DIFF_THRESHOLD = 0.05
 #
 # Setting this to a number in seconds reads every endpoint at that same
 # elapsed time after the pulse instead, using the last ENDPOINT_N_FRAMES
-# samples at or before it. report_bleach_comparability already prints the
-# instruction to compare at matched elapsed time; this is what carries it out.
+# samples at or before it. cortex_montage.report_bleach_comparability
+# already prints the instruction to compare at matched elapsed time; this
+# is what carries it out.
 #
 # 431.0 is the natural value for this dataset: the shortest full-length
 # record. Experiments that end before the target cannot be read there at all,
@@ -697,6 +814,145 @@ _GAINER_ATTRITION_COLS = [
     "t_endpoint_used", "efflux", "efflux_noise",
     "efflux_threshold", "tau_fit_ok",
 ]
+
+
+def plot_representative_intensity_traces(df_all: pd.DataFrame,
+                                          outputs_root: str,
+                                          output_dir: str):
+  """One representative raw SRB intensity-vs-time trace per endpoint class.
+
+  Must be called on df_all from BEFORE drop_intensity_gainers, since the
+  gainer example is exactly what that function removes -- call this first,
+  in run_intensity(), and reassign df_all to the dropped version only after.
+
+  Restricted to the interpreted field range (<= config.INTERPRETED_MAX_FIELD,
+  i.e. 0.1-1.33 kV/cm / 30-400 V), matching every other main-text figure as
+  of the 2026-08 pipeline update. A vesicle above that range would show a
+  perfectly normal-looking trace; the field written under it would just be
+  session-confounded, which this figure is not the place to explain.
+
+  "Representative" means: within each class (flatline / efflux / gainer),
+  the vesicle whose endpoint diff sits closest to that class's own median
+  diff, among vesicles in the interpreted range. Not the most extreme example
+  and not an arbitrary first row -- the point of a representative trace is
+  that it looks like what the class typically looks like, not like its most
+  dramatic member.
+
+  Re-opens each chosen vesicle's *_normalized_curves.csv directly (the same
+  file aggregate_pipeline_results reads for the endpoint summary, but here
+  the full per-frame trace is kept rather than collapsed to i_pre/i_final).
+  Experiment directories are expected as direct children of outputs_root,
+  matching cortex_montage.collect_evolution_peaks.
+
+  df_all is aggregate_pipeline_results' raw output and does NOT carry
+  field_kV_cm -- that column is only added downstream, by
+  susceptibility.derive_columns() once the table has gone through a
+  round trip to guv_bulk_summary.csv, and this module cannot import
+  susceptibility (susceptibility already imports process, so the reverse
+  would cycle). Derived locally here from the same "voltage" strings with
+  the field_kV_cm() function below, which is the same conversion
+  susceptibility.py's copy performs.
+  """
+  root = Path(outputs_root)
+  sub = df_all[(df_all["size_category"] == "Stagnate")
+              & df_all["intensity_category"].notna()].copy()
+  sub["field_kV_cm"] = sub["voltage"].map(field_kV_cm)
+  max_field = getattr(cfg, "INTERPRETED_MAX_FIELD", None)
+  if max_field is not None:
+    sub = sub[sub["field_kV_cm"] <= max_field]
+  if sub.empty:
+    print("Representative intensity traces skipped: nothing in the "
+          "interpreted range.")
+    return
+
+  # class key -> (selection mask, legend label, colour, line style)
+  classes = {
+      "flatline": (sub["intensity_category"] == "Flatline",
+                   "flatline (within noise)", PALETTE["grey"], "-"),
+      "efflux":   (sub["efflux"] == True,  # noqa: E712 (NaN must compare False)
+                   "efflux (crossed response threshold)",
+                   PALETTE["dark_red"], "-"),
+      "gainer":   (sub["intensity_category"] == "Increase Intensity",
+                   "gainer (excluded from analysis)",
+                   PALETTE["medium_blue"], "--"),
+  }
+
+  chosen = {}
+  for key, (mask, label, colour, ls) in classes.items():
+    cell = sub[mask]
+    if cell.empty:
+      print(f"  Representative traces: no {key} vesicle in the interpreted "
+            "range; that example will be missing from the figure.")
+      continue
+    med = cell["diff"].median()
+    row = cell.loc[(cell["diff"] - med).abs().idxmin()]
+    chosen[key] = (str(row["experiment"]), str(row["guv_id"]), label, colour,
+                   ls)
+
+  if not chosen:
+    print("Representative intensity traces skipped: no class had a "
+          "usable example.")
+    return
+
+  fig, ax = plt.subplots(
+      figsize=fig_size("guv_representative_intensity_traces", 5.6, 5.0))
+  for key, (exp_name, gid, label, colour, ls) in chosen.items():
+    norm_files = list((root / exp_name).glob("**/*_normalized_curves.csv"))
+    if not norm_files:
+      print(f"  {exp_name}: no normalized_curves.csv found; "
+            f"{key} example skipped")
+      continue
+    try:
+      df_norm = pd.read_csv(norm_files[0])
+    except Exception as e:
+      print(f"  could not read {norm_files[0].name}: {e}")
+      continue
+    col = f"GUV_{gid}_I_retained"
+    if "Time (s)" not in df_norm.columns or col not in df_norm.columns:
+      print(f"  {exp_name}: {col} not found; {key} example skipped")
+      continue
+    t = df_norm["Time (s)"].to_numpy(float)
+    y = df_norm[col].to_numpy(float)
+    order = np.argsort(t)
+    t, y = t[order], y[order]
+    ax.plot(t, y, color=colour, lw=2.0, ls=ls, label=label, zorder=3,
+            solid_capstyle="round")
+    ax.plot(t[-1], y[-1], "o", color=colour, ms=5, zorder=4,
+            markeredgecolor="white", markeredgewidth=0.8)
+
+  ax.axvline(0, color=PALETTE["grey"], lw=0.8, ls=":", zorder=1)
+  if ENDPOINT_MATCHED_T_S is not None:
+    ax.axvline(ENDPOINT_MATCHED_T_S, color=PALETTE["grey"], lw=0.8, ls=":",
+               zorder=1)
+    ax.text(ENDPOINT_MATCHED_T_S, 0.02, f"{ENDPOINT_MATCHED_T_S:.0f} s",
+            fontsize=7.5, color=PALETTE["grey"], ha="right", va="bottom",
+            rotation=90, transform=ax.get_xaxis_transform(),
+            bbox=dict(facecolor="white", edgecolor="none", pad=1,
+                      alpha=0.85))
+  ax.axhspan(1.0 - INTENSITY_DIFF_THRESHOLD, 1.0 + INTENSITY_DIFF_THRESHOLD,
+             color=PALETTE["pale_blue"], alpha=0.5, lw=0, zorder=0)
+  # y is NOT forced to 0: I_retained lives in a narrow band around 1.0
+  # (flatline near it, efflux below, a gainer above), and forcing the floor
+  # to 0 would waste most of the plot on empty space no trace ever reaches.
+  # Autoscaled with headroom instead. x is also left alone -- the pre-pulse
+  # baseline sits at negative time by construction (t=0 is the pulse), and
+  # there's no equivalent "natural zero" to anchor it to anyway.
+  ax.margins(y=0.10)
+  ax.set_xlabel("time relative to pulse (s)", fontsize=10)
+  ax.set_ylabel("normalized SRB intensity ($I_{retained}$)", fontsize=10)
+  ax.spines["top"].set_visible(False)
+  ax.spines["right"].set_visible(False)
+  ax.grid(alpha=0.25, linestyle="--", lw=0.6)
+  ax.tick_params(labelsize=8.5)
+  ax.legend(frameon=False, fontsize=8, loc="lower left", handlelength=1.6,
+            handletextpad=0.6, borderaxespad=0.3)
+  style_figure("guv_representative_intensity_traces")
+  fig.tight_layout()
+  out_path = (sub_dir(output_dir, "representative_traces")
+             / "guv_representative_intensity_traces.pdf")
+  fig.savefig(out_path, dpi=300)
+  plt.close(fig)
+  print(f"Saved {out_path}")
 
 
 def drop_intensity_gainers(df: pd.DataFrame, results_dir=None,
@@ -1265,6 +1521,20 @@ def report_onset_fields(df: pd.DataFrame, output_dir: str) -> pd.DataFrame:
     work = df.copy()
     work = work[work["size_category"] != "Rupture/Collapse"]
 
+    # Interpreted field range only, as of the 2026-08 update. work comes from
+    # a LEFT merge onto the full, unrestricted df (see cortex_analysis's
+    # docstring for why: an inner merge would drop every Bare vesicle, which
+    # has no actin trace but does have an area-loss measurement), so it does
+    # NOT inherit the restriction collect_evolution_peaks applies -- area_loss
+    # _frac in particular is computed straight from terminal_norm_radius here
+    # and never passes through that function at all. Filtered explicitly.
+    max_field = getattr(cfg, "INTERPRETED_MAX_FIELD", None)
+    if max_field is not None and "voltage" in work.columns:
+      n_before = len(work)
+      work = work[work["voltage"].map(field_kV_cm) <= max_field]
+      print(f"Onset fields restricted to the interpreted field range "
+            f"(<= {max_field} kV/cm): {len(work)} of {n_before} retained.")
+
     # assign_cortex_group rather than apply_cortex_split: the split itself is
     # wanted, the several paragraphs of counts it prints are not, having
     # already been printed once for the figures that follow.
@@ -1319,7 +1589,6 @@ def report_onset_fields(df: pd.DataFrame, output_dir: str) -> pd.DataFrame:
             ax.axvline(res["v50"], ls="--", lw=1.0, color="0.3")
             ax.axvspan(res["v50_ci_low"], res["v50_ci_high"],
                        color="0.6", alpha=0.15)
-      ax.set_title(pop)
       ax.set_xlabel(FIELD_AXIS_LABEL)
       ax.axhline(0.0, color="0.7", lw=0.8, ls=":")
       ax.legend(frameon=False, loc="upper left")
@@ -1581,16 +1850,11 @@ def plot_drop_by_cortex_status(df: pd.DataFrame, output_dir: str):
     ax.set_xticks(x)
     ax.set_xticklabels(field_labels(voltages), rotation=45, fontsize=9)
     ax.set_xlabel(FIELD_AXIS_LABEL)
-    ax.set_title(POPULATION_LABELS.get(pop, pop))
     ax.grid(axis="y", linestyle="--", alpha=0.4)
     if p_idx == 0:
       ax.set_ylabel(r"$I_{final} - I_{pre}$")
       ax.legend(title="Pre-pulse cortex", fontsize=8, loc="best")
 
-  fig.suptitle(
-      "Dye retention change split by pre-pulse cortex presence"
-      "\n(Stagnate GUVs; bars = median)"
-  )
   style_figure("drop_by_cortex_status")
   plt.tight_layout()
   pdf_path = out_path / "guv_drop_by_cortex_status.pdf"
@@ -1685,7 +1949,6 @@ def plot_tau_by_size_and_voltage(df: pd.DataFrame, output_dir: str):
     ax.set_xticklabels(field_labels(voltages), rotation=45, fontsize=9)
     ax.set_xlabel(FIELD_AXIS_LABEL)
     ax.set_yscale("log")
-    ax.set_title(POPULATION_LABELS.get(pop, pop))
     ax.grid(axis="y", which="both", linestyle="--", alpha=0.4)
     if len(pop_df) == 0:
       ax.text(
@@ -1700,18 +1963,14 @@ def plot_tau_by_size_and_voltage(df: pd.DataFrame, output_dir: str):
       )
     if p_idx == 0:
       ax.set_ylabel(r"$\tau$ (s)")
-      ax.legend(title="Size group", fontsize=8, loc="best")
+      #ax.legend(title="Size group", fontsize=8, loc="best")
 
   gates = []
   if TAU_REQUIRE_RESPONDING:
     gates.append("responding")
   if TAU_REQUIRE_IDENTIFIABLE:
     gates.append(r"$\tau$ identifiable")
-  gate_txt = " + ".join(gates) if gates else "no gating"
-  fig.suptitle(
-      r"Dye efflux time constant $\tau$ vs. voltage, by size group"
-      f"\n(bars = median; {gate_txt})"
-  )
+  #gate_txt = " + ".join(gates) if gates else "no gating"
   style_figure("tau_by_size_voltage")
   plt.tight_layout()
   pdf_path = out_path / "guv_tau_by_size_voltage.pdf"
@@ -1751,96 +2010,30 @@ def apply_cortex_split(df: pd.DataFrame) -> pd.DataFrame:
     out = kept.copy()
   return out
 
-PEAK_N_FRAMES = ENDPOINT_N_FRAMES
 MIN_CONTROL_N = 5
-# How far from the requested matched time a condition's nearest sampled frame
-# may sit before that condition is left blank instead of read. Records here end
-# between about 430 and 436 s, so a matched time of 431 s sits at the edge of
-# coverage and argmin would otherwise silently return whatever frame was
-# closest, however far away.
-MATCHED_T_TOLERANCE_S = 20.0
 CONTROL_VOLTAGE = "30V"
-BLEACH_REFERENCE_PATTERN = rf"-{CONTROL_VOLTAGE}-"
 EXCLUDE_EXPERIMENTS = [r"-0V-", r"260331.*400V"]
 
 def is_excluded_experiment(name: str) -> bool:
   return any(re.search(pat, name) for pat in EXCLUDE_EXPERIMENTS)
 
-APPLY_BLEACH_CORRECTION = True
-
-def report_bleach_comparability(outputs_root: str) -> pd.DataFrame:
-  root = Path(outputs_root)
-  rows = []
-  for exp_dir in sorted(p for p in root.iterdir() if p.is_dir()):
-    if exp_dir.name == RESULTS_SUBFOLDER or is_excluded_experiment(exp_dir.name):
-      continue
-    files = [f for f in exp_dir.glob("**/*_normalized_curves.csv")
-             if RESULTS_SUBFOLDER not in f.parts]
-    if not files:
-      continue
-    try:
-      cur = pd.read_csv(files[0])
-    except Exception:
-      continue
-    tcol = next((c for c in ("Time (s)", "time_s", "t_aligned", "time")
-                 if c in cur.columns), None)
-    if tcol is None or cur.empty:
-      continue
-    t = cur[tcol].dropna().to_numpy(float)
-    if t.size < 2:
-      continue
-    rows.append({
-        "experiment": exp_dir.name,
-        "is_control": bool(re.search(BLEACH_REFERENCE_PATTERN, exp_dir.name)),
-        "n_frames": int(t.size),
-        "record_s": float(t.max() - t.min()),
-        "mean_interval_s": float(np.median(np.diff(t))),
-    })
-  if not rows:
-    print("Bleach comparability skipped: no normalized curves found.")
-    return pd.DataFrame()
-
-  tbl = pd.DataFrame(rows)
-  ctrl = tbl[tbl["is_control"]]
-  if ctrl.empty:
-    print(f"No bleach control matched {BLEACH_REFERENCE_PATTERN!r} "
-          "(check EXCLUDE_EXPERIMENTS). With no no-pulse reference, cortex "
-          "peak loss can only be read against 1.0, and photobleaching cannot "
-          "be separated from breakdown in any decline reported here.")
-    return tbl
-
-  print("\nBleach control acquisition vs the rest:")
-  for _, c in ctrl.iterrows():
-    print(f"  control {c['experiment']}: {c['n_frames']} frames over "
-          f"{c['record_s']:.0f} s (median interval {c['mean_interval_s']:.2f} s)")
-  others = tbl[~tbl["is_control"]]
-  print(f"  others : {others['n_frames'].median():.0f} frames (median) over "
-        f"{others['record_s'].median():.0f} s "
-        f"(median interval {others['mean_interval_s'].median():.2f} s)")
-
-  c = ctrl.iloc[0]
-  rate_ratio = (c["mean_interval_s"]
-                / max(others["mean_interval_s"].median(), 1e-9))
-  covers = c["record_s"] >= others["record_s"].median()
-
-  if abs(rate_ratio - 1.0) > 0.2:
-    print(f"  WARNING: the control was sampled at {rate_ratio:.2f}x the "
-          "interval of a typical experiment, so it accumulated exposure at a "
-          "different rate. Its decay per second is NOT transferable; rescale "
-          "to a per-exposure basis or leave APPLY_BLEACH_CORRECTION off.")
-  else:
-    print("  Sampling interval matches, so decay per second is comparable.")
-    print(f"  Control covers {c['record_s']:.0f} s vs a typical "
-          f"{others['record_s'].median():.0f} s"
-          + (" -- it spans the experiments, which is what is needed."
-             if covers else
-             " -- it is SHORTER than a typical experiment, so the tail of "
-             "each curve has no control to compare against."))
-    print("  Compare conditions at matched elapsed time, not at each record's "
-          "own endpoint.")
-  return tbl
+# -----------------------------------------------------------------------------
+# The radial cortex PEAK stages -- add_cortex_peak_metrics,
+# plot_cortex_peak_breakdown and report_bleach_comparability -- now live in
+# cortex_montage.py, together with the settings only they used (PEAK_N_FRAMES,
+# BLEACH_REFERENCE_PATTERN). They read the radial profiles rather than the
+# exported cortex_peak traces, so load_actin_peak_metrics,
+# collect_cortex_peak_traces and plot_cortex_peak_timecourse are gone
+# entirely.
+#
+# What stayed here is what more than one stage reads: the population filter,
+# the time grid, the control voltage and the classification figures. Moving
+# those as well would have left cortex_montage.py importing half of process.py
+# and process.py importing it back.
+# -----------------------------------------------------------------------------
 
 def _peak_time_grid(t_max: float) -> np.ndarray:
+  """Shared with the pole/equator stage below, so it stays in process.py."""
   return np.unique(np.concatenate([
       np.arange(0.0, 2.01, 0.1),
       np.arange(2.0, 10.01, 0.5),
@@ -1879,220 +2072,6 @@ def cortex_stage_population(df: pd.DataFrame, verbose: bool = True) -> pd.DataFr
             f"{RADIUS_STABLE_TOL:.0%}; {len(keep)} retained.")
   return keep
 
-
-def collect_cortex_peak_traces(df: pd.DataFrame, outputs_root: str):
-  root = Path(outputs_root)
-  keep = cortex_stage_population(df)
-  if keep.empty:
-    return None, None, None
-  wanted = {(r["experiment"], str(r["guv_id"])): r["voltage"]
-            for _, r in keep.iterrows()}
-
-  raw, t_max = [], 0.0
-  for exp_dir in sorted(p for p in root.iterdir() if p.is_dir()):
-    if exp_dir.name == RESULTS_SUBFOLDER or is_excluded_experiment(exp_dir.name):
-      continue
-    files = [f for f in exp_dir.glob("**/*_actin_cortex_traces.csv")
-             if RESULTS_SUBFOLDER not in f.parts]
-    if not files:
-      continue
-    try:
-      tr = pd.read_csv(files[0])
-    except Exception:
-      continue
-    if "time_s" not in tr:
-      continue
-    t = tr["time_s"].to_numpy(float)
-    for col in tr.columns:
-      m = re.match(r"GUV_(.+)_cortex_peak$", col)
-      if not m:
-        continue
-      key = (exp_dir.name, m.group(1))
-      if key not in wanted:
-        continue
-      y = tr[col].to_numpy(float)
-      ok = np.isfinite(t) & np.isfinite(y)
-      if ok.sum() < 4:
-        continue
-      raw.append((wanted[key], t[ok], y[ok]))
-      t_max = max(t_max, float(t[ok].max()))
-
-  if not raw:
-    return None, None, None
-
-  # The grid stops at ENDPOINT_MATCHED_T_S rather than at the longest record.
-  #
-  # Two reasons, and they point the same way. The bleach reference only covers
-  # ~441 s, so past that the divisor is all-NaN and every corrected trace is
-  # blanked -- visible as "All-NaN slice encountered" and, in the figure, as
-  # the long records simply stopping. And a median across voltages taken past
-  # 431 s is computed on whichever sessions happened to record longer, which
-  # is the record-length confound the matched endpoint exists to remove.
-  t_grid_max = t_max if ENDPOINT_MATCHED_T_S is None else min(
-      t_max, float(ENDPOINT_MATCHED_T_S))
-  grid = _peak_time_grid(t_grid_max)
-  by_voltage = {}
-  for volt, t, y in raw:
-    interp = np.interp(grid, t, y)
-    interp[(grid < t.min()) | (grid > t.max())] = np.nan
-    by_voltage.setdefault(volt, []).append(interp)
-  return grid, {v: np.vstack(a) for v, a in by_voltage.items()}, len(raw)
-
-def plot_cortex_peak_timecourse(df: pd.DataFrame, outputs_root: str,
-                                output_dir: str, min_frac: float = 0.5):
-  out_path = sub_dir(output_dir, "cortex_breakdown")
-  out_path.mkdir(parents=True, exist_ok=True)
-
-  grid, by_voltage, n_guv = collect_cortex_peak_traces(df, outputs_root)
-  if grid is None:
-    print("Cortex peak timecourse skipped: no cortex-bearing traces.")
-    return
-
-  voltages = sorted(by_voltage, key=_voltage_key)
-  pulsed = [v for v in voltages if v != CONTROL_VOLTAGE]
-
-  corrected = False
-  if APPLY_BLEACH_CORRECTION and CONTROL_VOLTAGE in by_voltage:
-    ref = np.nanmedian(by_voltage[CONTROL_VOLTAGE], axis=0)
-    with np.errstate(invalid="ignore", divide="ignore"):
-      for volt in pulsed:
-        arr = by_voltage[volt].copy()
-        safe = np.isfinite(ref) & (ref > 0.05)
-        arr[:, safe] = arr[:, safe] / ref[safe]
-        arr[:, ~safe] = np.nan
-        by_voltage[volt] = arr
-    corrected = True
-    print(f"  Bleach correction APPLIED: each curve divided by the "
-          f"{CONTROL_VOLTAGE} reference median.")
-  cmap = mcolors.LinearSegmentedColormap.from_list(
-      "ep_blues", [PALETTE["pale_blue"], PALETTE["medium_blue"],
-                   PALETTE["dark_blue"]])
-  shades = {v: cmap(0.3 + 0.7 * i / max(len(pulsed) - 1, 1))
-            for i, v in enumerate(pulsed)}
-
-  fig, axes = plt.subplots(1, 2, figsize=fig_size("cortex_peak_timecourse", 13, 5.2, 2))
-  rows, curves = [], {}
-
-  for ax, (t_lo, t_hi, title) in zip(
-      axes, [(0.0, 10.0, "Burst window"), (0.0, float(grid.max()),
-                                           "Full record")]):
-    win = (grid >= t_lo) & (grid <= t_hi)
-    for volt in voltages:
-      arr = by_voltage[volt]
-      n_t = np.sum(np.isfinite(arr), axis=0)
-      enough = n_t >= max(2, int(np.ceil(min_frac * arr.shape[0])))
-      sel = win & enough
-      if not sel.any():
-        continue
-      med = np.nanmedian(arr[:, sel], axis=0)
-      q1 = np.nanpercentile(arr[:, sel], 25, axis=0)
-      q3 = np.nanpercentile(arr[:, sel], 75, axis=0)
-      is_ctrl = volt == CONTROL_VOLTAGE
-      colour = PALETTE["dark_red"] if is_ctrl else shades[volt]
-      ax.plot(grid[sel], med, color=colour, lw=2.0 if is_ctrl else 1.5,
-              ls="--" if is_ctrl else "-", zorder=5 if is_ctrl else 3,
-              label=f"{field_label(volt)} kV/cm (n={arr.shape[0]})")
-      ax.fill_between(grid[sel], q1, q3, color=colour, alpha=0.13, lw=0,
-                      zorder=2)
-      if ax is axes[1]:
-        rows.append({"voltage": volt, "n_guv": int(arr.shape[0]),
-                     "t_last_s": float(grid[sel].max()),
-                     "peak_at_t_last": float(med[-1])})
-        curves[volt] = (grid[sel], med)
-
-    ax.axhline(1.0, color=ANNOTATION_TEXT, lw=0.8, ls=":", zorder=1)
-    ax.set_xlabel("time after pulse (s)")
-    ax.set_title(title, fontsize=10)
-    ax.grid(axis="y", linestyle="--", alpha=0.4)
-  axes[0].set_ylabel("cortex peak height  (I$_{peak}$ / I$_{peak,pre}$)")
-  axes[1].legend(frameon=False, fontsize=7, ncol=2, loc="lower left")
-
-  fig.suptitle("Radial cortex peak height over time, cortex-bearing GUVs\n"
-               + (f"(median and IQR; pulsed curves divided by the "
-                  f"{CONTROL_VOLTAGE} bleach reference, which is itself "
-                  "drawn uncorrected)" if corrected else
-                  f"(median and IQR; dashed red = {CONTROL_VOLTAGE} "
-                  "bleach reference, uncorrected)"),
-               fontsize=11)
-  style_figure("cortex_peak_timecourse")
-  fig.tight_layout(rect=(0, 0, 1, 0.93))
-  pdf_path = out_path / ("guv_cortex_peak_timecourse"
-                         + ("_bleach_corrected" if corrected else "")
-                         + ".pdf")
-  fig.savefig(pdf_path, format="pdf", dpi=300)
-  plt.close(fig)
-  print(f"Saved cortex peak timecourse: {pdf_path}  ({n_guv} GUV traces)")
-
-  if rows:
-    tbl = pd.DataFrame(rows).sort_values("voltage", key=lambda c:
-                                         c.map(_voltage_key))
-
-    # Read at the same elapsed time the dye endpoint uses, so the actin and
-    # dye sections of the chapter describe one instant rather than two. This
-    # was 320 s, chosen only because every record reaches it; the cost was that
-    # no sentence could put a cortex number and a release number side by side.
-    t_ref = ENDPOINT_MATCHED_T_S
-    matched, short = [], []
-    for volt, (t, med) in curves.items():
-        i = int(np.argmin(np.abs(t - t_ref)))
-        gap = float(abs(float(t[i]) - t_ref))
-        if gap > MATCHED_T_TOLERANCE_S:
-            short.append((volt, float(t[i]), gap))
-            matched.append({"voltage": volt, "peak_at_matched_t": np.nan})
-        else:
-            matched.append({"voltage": volt, "peak_at_matched_t": float(med[i])})
-    tbl = tbl.merge(pd.DataFrame(matched), on="voltage", how="left")
-    ctrl_row = tbl[tbl["voltage"] == CONTROL_VOLTAGE]
-    n_ctrl = int(ctrl_row["n_guv"].iloc[0]) if not ctrl_row.empty else 0
-    ctrl_at_t = float(ctrl_row["peak_at_matched_t"].iloc[0]) if n_ctrl else np.nan
-
-    if corrected:
-        # Each pulsed curve was already divided by the CONTROL_VOLTAGE median
-        # above, so the level a condition is measured against is 1.0 by
-        # construction. Subtracting the control's own value here as well
-        # removed it twice and put a floor of -(1 - ctrl_at_t) under the
-        # column: a condition behaving exactly like the control came out as
-        # having lost LESS peak than the control, which nothing can do. It is
-        # what produced the flat -0.02 to -0.04 band across 90-360V.
-        tbl["excess_loss_vs_control"] = 1.0 - tbl["peak_at_matched_t"]
-        tbl.loc[tbl["voltage"] == CONTROL_VOLTAGE,
-                "excess_loss_vs_control"] = np.nan
-    elif n_ctrl >= MIN_CONTROL_N:
-        tbl["excess_loss_vs_control"] = ctrl_at_t - tbl["peak_at_matched_t"]
-    elif n_ctrl:
-        print(f"\n  {CONTROL_VOLTAGE} reference has only {n_ctrl} GUV(s) at t = {t_ref:.0f} s "
-              f"(peak = {ctrl_at_t:.3f}); fewer than MIN_CONTROL_N="
-              f"{MIN_CONTROL_N}, so no excess-over-control column is given.")
-        if ctrl_at_t > 1.0:
-            print("  The control also reads ABOVE its own pre-pulse level, "
-                  "which a bleaching baseline cannot do -- it is sampling "
-                  "noise, not a decay curve. Read peak_at_matched_t directly "
-                  "and treat 1.0 as the no-change reference.")
-
-    tbl.to_csv(out_path / "guv_cortex_peak_timecourse_summary.csv", index=False)
-    if t_ref is not None:
-      print(f"\nCortex peak, all conditions read at matched t = {t_ref:.0f} s.")
-      print("peak_at_matched_t < 1 means peak height lost by that time; "
-            "1.0 is no change.")
-      if "excess_loss_vs_control" in tbl:
-        print("excess_loss_vs_control > 0 means more peak lost than the "
-              f"{CONTROL_VOLTAGE} reference at the same elapsed time.")
-      if corrected:
-        print(f"  Curves are already divided by the {CONTROL_VOLTAGE} "
-              "reference, so that level is 1.000 by construction and the "
-              "column is 1 - peak_at_matched_t. The reference row is left "
-              "blank in it: the peak shown against "
-              f"{CONTROL_VOLTAGE} is UNCORRECTED, i.e. the drift that was "
-              "divided out of every other row, and is not on their scale.")
-      if short:
-        print(f"  No sample within {MATCHED_T_TOLERANCE_S:.0f} s of "
-              f"{t_ref:.0f} s, so read as blank rather than from the nearest "
-              "frame:")
-        for volt, t_near, gap in short:
-          print(f"    {volt:>5}  nearest support at {t_near:.0f} s "
-                f"({gap:.0f} s away)")
-    print(tbl.to_string(index=False))
-    print()
 
 # -----------------------------------------------------------------------------
 # --- POLE VS EQUATOR: IS CORTEX BREAKDOWN DIRECTIONAL? ---
@@ -2270,6 +2249,19 @@ def collect_pole_equator_traces(df: pd.DataFrame, outputs_root: str):
   if keep.empty:
     print("Pole/equator pooling skipped: no cortex-bearing stagnate GUVs.")
     return None, None, None
+  # Interpreted field range only, as of the 2026-08 update -- same
+  # restriction and same reasoning as collect_evolution_peaks.
+  max_field = getattr(cfg, "INTERPRETED_MAX_FIELD", None)
+  if max_field is not None:
+    n_before = len(keep)
+    keep = keep[keep["voltage"].map(field_kV_cm) <= max_field]
+    print(f"Pole/equator population restricted to the interpreted field "
+          f"range (<= {max_field} kV/cm): {len(keep)} of {n_before} "
+          "retained.")
+    if keep.empty:
+      print("Pole/equator pooling skipped: nothing left in the "
+            "interpreted range.")
+      return None, None, None
   has_drop = "peak_drop_final" in keep.columns
   wanted = {(r["experiment"], str(r["guv_id"])):
             (r["voltage"],
@@ -2824,7 +2816,7 @@ def plot_pole_equator_pooled(df: pd.DataFrame, outputs_root: str,
                              output_dir: str, min_frac: float = 0.5):
   """Pooled time course, then one per-GUV panel per post-pulse window.
 
-  Left panel mirrors plot_cortex_peak_timecourse (median and IQR per voltage,
+  Left panel mirrors the cortex peak time course (median and IQR per voltage,
   drawn only where at least min_frac of the contributing GUVs are still
   measurable). The window panels mirror plot_cortex_peak_breakdown (per-GUV
   points with median and IQR against the 30 V control band).
@@ -2883,7 +2875,6 @@ def plot_pole_equator_pooled(df: pd.DataFrame, outputs_root: str,
   ax.axvline(0.0, color=ANNOTATION_TEXT, lw=0.8, ls="-", alpha=0.6, zorder=1)
   ax.set_xlabel("time relative to pulse (s)")
   ax.set_ylabel("polarization index  (equator $-$ pole) / (equator $+$ pole)")
-  ax.set_title("Pooled time course (shaded = summary windows)", fontsize=10)
   ax.legend(frameon=False, fontsize=7, ncol=2, loc="lower left")
   ax.grid(axis="y", linestyle="--", alpha=0.4)
 
@@ -2959,210 +2950,17 @@ def plot_pole_equator_pooled(df: pd.DataFrame, outputs_root: str,
     ax.set_xticks(np.arange(len(x_volts)))
     ax.set_xticklabels(field_labels(x_volts), rotation=45)
     ax.set_xlabel(FIELD_AXIS_LABEL)
-    ax.set_title(f"{w_label}: per-GUV mean, {lo:.0f} to {hi:.0f} s",
-                 fontsize=10)
     ax.legend(frameon=False, fontsize=7, loc="upper left")
     ax.grid(axis="y", linestyle="--", alpha=0.4)
 
-  fig.suptitle("Directionality of cortex breakdown: poles vs equator\n"
-               "(> 0 = electrode-facing poles lose more actin; pooled "
-               "because a single vesicle is free to rotate)", fontsize=11)
   style_figure("pole_equator_pooled")
-  fig.tight_layout(rect=(0, 0, 1, 0.90))
+  fig.tight_layout()
   pdf_path = out_path / "guv_pole_equator_pooled.pdf"
   fig.savefig(pdf_path, format="pdf", dpi=300)
   plt.close(fig)
   print(f"\nSaved pole/equator figure: {pdf_path}")
   return tbl
 
-
-# Experiments whose actin trace cannot reach ENDPOINT_MATCHED_T_S. Module
-# level so add_cortex_peak_metrics can report them in one place: dropping a
-# whole experiment's cortex metrics is not something that should happen
-# without a line in the log, and on a 5 s frame grid an experiment can miss
-# the target by less than one frame.
-_ACTIN_SHORT = {}
-
-
-def load_actin_peak_metrics(exp_dir: Path) -> pd.DataFrame:
-  files = [f for f in exp_dir.glob("**/*_actin_cortex_traces.csv")
-           if RESULTS_SUBFOLDER not in f.parts]
-  if not files:
-    return None
-  try:
-    tr = pd.read_csv(files[0])
-  except Exception as e:
-    print(f"Skipping actin traces {files[0]}: {e}")
-    return None
-
-  # Same matched-time rule as the dye endpoint. Without it peak_drop_final is
-  # still read at each record's own end, so the actin and dye halves of the
-  # same figure would be measured on different clocks.
-  t_col = tr["time_s"].to_numpy(float) if "time_s" in tr.columns else None
-  if ENDPOINT_MATCHED_T_S is not None:
-    if t_col is None:
-      print(f"  {exp_dir.name}: actin traces have no time_s column, so no "
-            "matched-time cortex endpoint is possible; skipped.")
-      return None
-    t_max = float(np.nanmax(t_col)) if np.isfinite(np.nanmax(t_col)) else np.nan
-    # Same tolerance as the dye endpoint, and it has to be the same number:
-    # an experiment admitted on the dye side and refused here would put a
-    # matched-time release magnitude and a missing cortex metric on the same
-    # vesicle, which is what the merge in add_cortex_peak_metrics then drops
-    # without saying so.
-    if (not np.isfinite(t_max)
-        or t_max < ENDPOINT_MATCHED_T_S - ENDPOINT_MATCHED_TOLERANCE_S):
-      _ACTIN_SHORT[exp_dir.name] = t_max
-      return None
-
-  rows = []
-  for col in tr.columns:
-    m = re.match(r"GUV_(.+)_cortex_peak$", col)
-    if not m:
-      continue
-    if ENDPOINT_MATCHED_T_S is None:
-      vals = tr[col].dropna()
-    else:
-      keep = pd.DataFrame({"t": t_col, "y": tr[col]}).dropna()
-      vals = keep.loc[keep["t"] <= ENDPOINT_MATCHED_T_S, "y"]
-    if len(vals) < 2 * PEAK_N_FRAMES:
-      continue
-    burst = float(vals.iloc[:PEAK_N_FRAMES].median())
-    final = float(vals.iloc[-PEAK_N_FRAMES:].median())
-    rows.append({
-        "guv_id": m.group(1),
-        "peak_norm_burst": burst,
-        "peak_norm_final": final,
-        "peak_drop_burst": 1.0 - burst,
-        "peak_drop_final": 1.0 - final,
-        "n_post_frames": int(len(vals)),
-    })
-  return pd.DataFrame(rows) if rows else None
-
-def add_cortex_peak_metrics(df: pd.DataFrame, outputs_root: str) -> pd.DataFrame:
-  root = Path(outputs_root)
-  frames = []
-  _ACTIN_SHORT.clear()
-  for exp_dir in sorted(p for p in root.iterdir() if p.is_dir()):
-    if exp_dir.name == RESULTS_SUBFOLDER or is_excluded_experiment(exp_dir.name):
-      continue
-    pk = load_actin_peak_metrics(exp_dir)
-    if pk is None:
-      continue
-    pk["experiment"] = exp_dir.name
-    frames.append(pk)
-  if _ACTIN_SHORT:
-    print(f"\nCortex peak metrics: {len(_ACTIN_SHORT)} experiment(s) have an "
-          f"actin trace ending before ENDPOINT_MATCHED_T_S = "
-          f"{ENDPOINT_MATCHED_T_S} and contribute no cortex metrics at all:")
-    for name, t_max in sorted(_ACTIN_SHORT.items(), key=lambda kv: kv[1]):
-      print(f"    ends {t_max:7.1f} s  {name}")
-    print("  On a 5 s frame grid an experiment can miss the target by less "
-          "than one frame, so check these against the target before reading "
-          "the cortex figures as a complete set.")
-  if not frames:
-    print("No actin traces found; cortex peak metrics skipped.")
-    return df.iloc[0:0]
-
-  pk_all = pd.concat(frames, ignore_index=True)
-  out = df.copy()
-  out["guv_id"] = out["guv_id"].astype(str)
-  pk_all["guv_id"] = pk_all["guv_id"].astype(str)
-  return out.merge(pk_all, on=["experiment", "guv_id"], how="inner")
-
-def plot_cortex_peak_breakdown(df: pd.DataFrame, output_dir: str):
-  out_path = sub_dir(output_dir, "cortex_breakdown")
-  out_path.mkdir(parents=True, exist_ok=True)
-  if df.empty or "peak_drop_final" not in df:
-    print("Cortex peak breakdown skipped: no peak metrics.")
-    return
-
-  sub = cortex_stage_population(df, verbose=False)
-  if sub.empty:
-    print("Cortex peak breakdown skipped: no cortex-bearing stagnate GUVs.")
-    return
-
-  voltages = _voltage_order(sub)
-  ctrl = sub[sub["voltage"] == CONTROL_VOLTAGE]["peak_drop_final"].dropna()
-  voltages = [v for v in voltages if v != CONTROL_VOLTAGE]
-  if not voltages:
-    print("Cortex peak breakdown skipped: only the 30V control is present.")
-    return
-
-  x = np.arange(len(voltages))
-  series = [("peak_drop_burst", "immediately after pulse", PALETTE["light_blue"]),
-            ("peak_drop_final", "end of record", PALETTE["dark_blue"])]
-  offset_w = 0.16
-  rng = np.random.default_rng(0)
-
-  fig, ax = plt.subplots(figsize=fig_size("cortex_peak_breakdown", max(8, 1.1 * len(voltages) + 3), 5.5))
-
-  if len(ctrl) and len(ctrl) < MIN_CONTROL_N:
-    print(f"  NOTE: the {CONTROL_VOLTAGE} band is drawn from {len(ctrl)} GUV(s), below "
-          f"MIN_CONTROL_N={MIN_CONTROL_N}. Treat it as indicative only.")
-  if len(ctrl) >= 2:
-    lo, hi = float(ctrl.quantile(.25)), float(ctrl.quantile(.75))
-    ax.axhspan(lo, hi, color=PALETTE["pale_red"], alpha=0.55, zorder=0)
-    ax.axhline(float(ctrl.median()), color=PALETTE["dark_red"], lw=1.2,
-               ls="--", zorder=1,
-               label=f"{CONTROL_VOLTAGE} bleach reference (n={len(ctrl)})")
-  elif len(ctrl) == 1:
-    ax.axhline(float(ctrl.iloc[0]), color=PALETTE["dark_red"], lw=1.2, ls="--",
-               zorder=1, label=f"{CONTROL_VOLTAGE} bleach reference (n=1)")
-
-  rows = []
-  for s_idx, (col, label, colour) in enumerate(series):
-    offset = (s_idx - (len(series) - 1) / 2) * 2 * offset_w
-    labelled = False
-    for idx, v in enumerate(voltages):
-      cell = sub[sub["voltage"] == v][col].dropna()
-      if cell.empty:
-        continue
-      jitter = rng.uniform(-offset_w * 0.45, offset_w * 0.45, len(cell))
-      ax.scatter(x[idx] + offset + jitter, cell.values, s=14, alpha=0.45,
-                 color=colour, edgecolors="none", zorder=2)
-      med = float(cell.median())
-      q1, q3 = float(cell.quantile(.25)), float(cell.quantile(.75))
-      ax.plot([x[idx] + offset - offset_w * 0.7,
-               x[idx] + offset + offset_w * 0.7], [med, med],
-              color=colour, lw=2.2, zorder=4,
-              label="" if labelled else label)
-      labelled = True
-      ax.plot([x[idx] + offset, x[idx] + offset], [q1, q3],
-              color=colour, lw=1.0, alpha=0.8, zorder=3)
-      rows.append({"voltage": v, "when": label, "n": len(cell),
-                   "median_peak_drop": med, "q1": q1, "q3": q3})
-
-  ax.axhline(0.0, color="black", lw=0.8, ls="--", alpha=0.7)
-  ax.set_xticks(x)
-  ax.set_xticklabels(field_labels(voltages), rotation=45)
-  ax.set_xlabel(FIELD_AXIS_LABEL)
-  ax.set_ylabel("Cortex peak height lost  (1 - I$_{peak}$ / I$_{peak,pre}$)")
-  ax.set_title("Radial cortex peak breakdown, cortex-bearing GUVs\n"
-               f"(median and IQR; band = {CONTROL_VOLTAGE} bleach "
-               "reference, no measurable response)")
-  ax.legend(frameon=False, loc="upper left", fontsize=8)
-  ax.grid(axis="y", linestyle="--", alpha=0.5)
-  style_figure("cortex_peak_breakdown")
-  plt.tight_layout()
-
-  pdf_path = out_path / "guv_cortex_peak_breakdown.pdf"
-  plt.savefig(pdf_path, format="pdf", dpi=300)
-  plt.close(fig)
-  print(f"Saved cortex peak breakdown: {pdf_path}")
-
-  tbl = pd.DataFrame(rows)
-  csv_path = out_path / "guv_cortex_peak_summary.csv"
-  sub.to_csv(out_path / "guv_cortex_peak_per_guv.csv", index=False)
-  tbl.to_csv(csv_path, index=False)
-  print(f"Saved cortex peak summary: {csv_path}")
-  if len(ctrl):
-    print(f"  {CONTROL_VOLTAGE} bleach reference: median peak lost "
-          f"{ctrl.median():.3f} (n={len(ctrl)}). Conditions at or below "
-          "this show no breakdown beyond bleaching.")
-  print("\nCortex peak height lost per condition:")
-  print(tbl.to_string(index=False))
-  print()
 
 def plot_lumen_abs_histogram(df: pd.DataFrame, output_dir: str):
   out_path = sub_dir(output_dir, "cortex_class")
@@ -3180,7 +2978,6 @@ def plot_lumen_abs_histogram(df: pd.DataFrame, output_dir: str):
           edgecolor=PALETTE["white"], linewidth=0.4)
   ax.set_xlabel("pre-pulse lumen above background (camera counts)")
   ax.set_ylabel("GUV count")
-  ax.set_title("Lumenal actin level, BranchedCortex population")
   ax.grid(axis="y", linestyle="--", alpha=0.4)
   style_figure("lumen_abs_histogram")
   plt.tight_layout()
@@ -3224,8 +3021,6 @@ def plot_cortex_contrast_histogram(df: pd.DataFrame, output_dir: str):
 
   ax.set_xlabel(r"pre-pulse cortex contrast  $(I_{peak}-I_{lumen})/(I_{lumen}-I_{bg})$")
   ax.set_ylabel("GUV count")
-  ax.set_title("Cortex contrast, BranchedCortex population\n"
-               f"n={len(vals)} classified, {n_nan} NaN of {n_total}")
   ax.grid(axis="y", linestyle="--", alpha=0.4)
   style_figure("cortex_contrast_histogram")
   plt.tight_layout()
@@ -3310,11 +3105,6 @@ def plot_released_fraction_by_voltage(df: pd.DataFrame, output_dir: str,
   ax.set_xticklabels(field_labels(voltages), rotation=45)
   ax.set_xlabel(FIELD_AXIS_LABEL)
   ax.set_ylabel("Released fraction  (I$_{pre}$ - I$_{final}$)")
-  ax.set_title(
-      f"Dye released per vesicle, by {what}\n"
-      f"(pre-pulse vs final {ENDPOINT_N_FRAMES}-frame average; median and IQR; "
-      "all stagnate GUVs, responding or not)"
-  )
   ax.legend(frameon=False, loc="upper left")
   ax.grid(axis="y", linestyle="--", alpha=0.5)
   style_figure("released_fraction_by_voltage")
@@ -3396,9 +3186,6 @@ def generate_separate_pdf_plots(df: pd.DataFrame, output_dir: str):
 
   ax1.set_xticks(x)
   ax1.set_xticklabels(field_labels(voltages))
-  ax1.set_title(
-      "GUV Size Category Distribution\n(Ba = Bare, Br = Branched)"
-  )
   ax1.set_xlabel(FIELD_AXIS_LABEL)
   ax1.set_ylabel("GUV Count")
   ax1.legend(title="Size Category", bbox_to_anchor=(1.02, 1), loc="upper left")
@@ -3444,10 +3231,6 @@ def generate_separate_pdf_plots(df: pd.DataFrame, output_dir: str):
 
   ax2.set_xticks(x)
   ax2.set_xticklabels(field_labels(voltages))
-  ax2.set_title(
-      "Stagnate GUV Intensity Breakdown\n(Pre-Pulse vs. Final"
-      f" {ENDPOINT_N_FRAMES} Frames)"
-  )
   ax2.set_xlabel(FIELD_AXIS_LABEL)
   ax2.set_ylabel("GUV Count")
   ax2.legend(
@@ -3521,7 +3304,6 @@ def generate_separate_pdf_plots(df: pd.DataFrame, output_dir: str):
     ax3.set_xticks(np.arange(len(voltages)))
     ax3.set_xticklabels(field_labels(voltages), fontsize=9, rotation=45)
     ax3.set_xlabel(FIELD_AXIS_LABEL)
-    ax3.set_title(POPULATION_LABELS.get(pop, pop))
     ax3.set_ylim(bottom=0)
     ax3.grid(axis="y", linestyle="--", alpha=0.5)
     if p_idx == 0:
@@ -3529,11 +3311,6 @@ def generate_separate_pdf_plots(df: pd.DataFrame, output_dir: str):
       if mean_labelled:
         ax3.legend(loc="lower left", fontsize=9)
 
-  fig3.suptitle(
-      "Intensity Drop Trajectories per Field Strength"
-      f"\n(Pre-Pulse → Final {ENDPOINT_N_FRAMES}-Frame Average;"
-      f" shaded band is ±{INTENSITY_DIFF_THRESHOLD:.0%} of baseline)"
-  )
   style_figure("intensity_drop_trajectories")
   plt.tight_layout()
 
@@ -3595,13 +3372,11 @@ def generate_separate_pdf_plots(df: pd.DataFrame, output_dir: str):
       ax_v.set_xticks(np.arange(len(bin_order)))
       ax_v.set_xticklabels(bin_order, fontsize=9)
       ax_v.set_xlabel("Size Group")
-      ax_v.set_title(POPULATION_LABELS.get(pop, pop))
       ax_v.set_ylim(bottom=0, top=1.15)
       ax_v.grid(axis="y", linestyle="--", alpha=0.5)
       if p_idx == 0:
         ax_v.set_ylabel("Normalized Intensity")
 
-    fig_v.suptitle(f"{field_label(v)} kV/cm — Size Group vs. Intensity Drop")
     style_figure("drop_by_size_per_voltage")
     plt.tight_layout()
 
@@ -3622,20 +3397,13 @@ if __name__ == "__main__":
   df_summary.to_csv(results_dir / "guv_bulk_summary.csv", index=False)
   write_layout_readme(results_dir)
   plot_lumen_abs_histogram(df_summary, str(results_dir))
-  df_peak = add_cortex_peak_metrics(df_summary, outputs_root)
-  plot_cortex_peak_breakdown(df_peak, str(results_dir))
-  # Onsets are fitted on df_peak, not df_summary: the cortex-loss curve needs
-  # peak_drop_final, which only exists after the merge above. Bare GUVs carry
-  # no actin columns, so their onset is fitted on area loss alone.
-  report_onset_fields(
-      df_summary.merge(
-          df_peak[["experiment", "guv_id", "peak_drop_final"]],
-          on=["experiment", "guv_id"], how="left")
-      if not df_peak.empty else df_summary,
-      str(results_dir))
-  report_bleach_comparability(outputs_root)
-  plot_cortex_peak_timecourse(df_summary, outputs_root, str(results_dir))
-  plot_pole_equator_pooled(df_summary, outputs_root, str(results_dir))
+  # Cortex peak, bleach reference, onset fields and pole/equator, all of which
+  # need the peak metrics. Imported here rather than at the top of the file
+  # because cortex_montage imports process: at module level that is a cycle,
+  # inside __main__ it is not. run_bulk.py is the supported entry point and
+  # calls the same function.
+  import cortex_montage
+  cortex_montage.cortex_analysis(df_summary, outputs_root, results_dir)
   plot_cortex_contrast_histogram(df_summary, str(results_dir))
   report_cortex_status(df_summary)
 

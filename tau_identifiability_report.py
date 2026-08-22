@@ -18,7 +18,7 @@ RESULTS_SUBFOLDER = 'Bulk_Analysis_Results'
 
 try:
   from process import (EXCLUDE_EXPERIMENTS, is_excluded_experiment,
-                       SIZE_WINDOW_UM)
+                       SIZE_WINDOW_UM, fig_size, style_figure)
 except Exception as _e:
   print(f"WARNING: could not import EXCLUDE_EXPERIMENTS from process.py "
         f"({type(_e).__name__}: {_e}). No experiments will be excluded from "
@@ -28,6 +28,12 @@ except Exception as _e:
 
   def is_excluded_experiment(name: str) -> bool:
     return any(re.search(pat, name) for pat in EXCLUDE_EXPERIMENTS)
+
+  def fig_size(key, default_w, default_h, n_panels=1):
+    return (default_w, default_h)
+
+  def style_figure(key):
+    pass
 
 def _match_analysis_population(out):
   """Keep only rows whose (experiment, guv_id) survives process.analysis_population."""
@@ -237,7 +243,8 @@ def summarise(df: pd.DataFrame) -> None:
 def figure(df: pd.DataFrame, out_path: Path) -> None:
   colours = POPULATION_COLORS
   key = 'cortex_group' if 'cortex_group' in df.columns else 'population'
-  fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4.6))
+  fig, (ax1, ax2) = plt.subplots(
+      1, 2, figsize=fig_size("tau_identifiability", 11, 4.6, 2))
 
   x = df['tau_over_record'].to_numpy(float)
   y = df['tau_se_ratio'].to_numpy(float)
@@ -254,7 +261,6 @@ def figure(df: pd.DataFrame, out_path: Path) -> None:
   ax1.set_yscale('log')
   ax1.set_xlabel(r'$\tau$ / record length')
   ax1.set_ylabel(r'$\tau_{SE}$ / $\tau$')
-  ax1.set_title('Neither constraint is satisfied', fontsize=10)
   ax1.legend(frameon=False, fontsize=8, loc='lower right')
   ax1.text(0.03, 0.95, 'identifiable\nregion', transform=ax1.transAxes,
            fontsize=8, va='top', color=PALETTE['grey'])
@@ -271,9 +277,14 @@ def figure(df: pd.DataFrame, out_path: Path) -> None:
          label=r'3$\sigma$ detection floor')
   ax2.set_xlabel('trace noise (MAD of successive differences)')
   ax2.set_ylabel('observed decline (normalised units)')
-  ax2.set_title('Response magnitude is measurable', fontsize=10)
+  # 1D axes start at 0: both are non-negative magnitudes on a linear scale.
+  # ax1 is deliberately left alone -- it's log-log, and 0 has no position on
+  # a log axis.
+  ax2.set_xlim(left=0)
+  ax2.set_ylim(bottom=0)
   ax2.legend(frameon=False, fontsize=8)
 
+  style_figure("tau_identifiability")
   fig.tight_layout()
   fig.savefig(out_path, bbox_inches='tight')
   fig.savefig(out_path.with_suffix('.png'), dpi=200, bbox_inches='tight')

@@ -83,16 +83,24 @@ MIN_BIN_N = 5              # a bin below this is dropped, not drawn thin
 SUBFOLDER = "07_susceptibility"
 
 # Highest field the dose series can be read across. Fields above this are
-# still measured, plotted and tabulated, but drawn broken and excluded from
-# any statement about how response varies with field, because the sessions
-# supplying them supply nothing else: at the top of the series the field axis
-# and the session axis are the same axis.
+# still measured and tabulated, but never drawn into a main-text dose-response
+# figure: they are session-confounded (see report_session_confound), and as of
+# the 2026-08 pipeline update they are excluded from every main plot outright
+# rather than drawn broken alongside the interpreted range. They still appear,
+# in full, in the dedicated high-field supplementary figures
+# (plot_field_response_supplementary).
 #
-# The value is stated rather than derived so that it is reviewable, but
-# report_session_confound recomputes the cut from the session table on every
-# run and prints a warning if the data no longer agree with it. Set to None to
-# interpret the whole series.
-INTERPRETED_MAX_FIELD = 1.34
+# The value now lives in config.py, since process.py's raw-trace figure needs
+# it too and cannot import this module (susceptibility already imports
+# process). report_session_confound still recomputes the cut from the session
+# table on every run and prints a warning if the data no longer agree with the
+# config value. Set config.INTERPRETED_MAX_FIELD to None to interpret the
+# whole series.
+try:
+  import config as cfg
+  INTERPRETED_MAX_FIELD = cfg.INTERPRETED_MAX_FIELD
+except Exception:
+  INTERPRETED_MAX_FIELD = 1.34
 
 # Keys are the group names process.assign_cortex_group emits; the order
 # here sets plotting and print order everywhere in this module.
@@ -638,7 +646,8 @@ def report_size_distributions(df: pd.DataFrame, out: Path):
                 "cortex with transmembrane potential; check the size window "
                 "below.")
 
-  fig, ax = plt.subplots(figsize=(7.5, 4.8))
+  fig, ax = plt.subplots(
+      figsize=process.fig_size("size_distribution_ecdf", 7.5, 4.8))
   for pop in pops:
     vals = np.sort(sub[sub["population"] == pop]["radius_um"].to_numpy())
     ax.step(vals, np.arange(1, len(vals) + 1) / len(vals), where="post",
@@ -646,11 +655,11 @@ def report_size_distributions(df: pd.DataFrame, out: Path):
             label=f"{POP_LABEL[pop]} (n={len(vals)})")
   ax.set_xlabel("radius (um)")
   ax.set_ylabel("cumulative fraction")
-  ax.set_title("Vesicle size distribution by population\n"
-               "(ECDF; separation here confounds any voltage-matched "
-               "comparison)")
+  ax.set_xlim(left=0)
+  ax.set_ylim(0, 1.02)
   ax.legend(frameon=False)
   ax.grid(alpha=0.35, linestyle="--")
+  process.style_figure("size_distribution_ecdf")
   fig.tight_layout()
   fig.savefig(out / "size_distribution_ecdf.pdf", dpi=300)
   plt.close(fig)
@@ -663,6 +672,33 @@ def _field_cells(df: pd.DataFrame):
   return df[(df["size_category"] == "Stagnate")
             & df["released"].notna()
             & df["field_kV_cm"].notna()]
+
+
+def _field_cells_interpreted(df: pd.DataFrame):
+  """_field_cells, restricted to the interpreted range (<= INTERPRETED_MAX_FIELD).
+
+  This is what every main-text field-strength figure should plot from, as of
+  the 2026-08 update: fields above the cut are excluded outright here, not
+  drawn broken alongside the interpreted range. Use
+  _field_cells_high_field for the complementary, supplementary-only set.
+  """
+  sub = _field_cells(df)
+  if INTERPRETED_MAX_FIELD is None:
+    return sub
+  return sub[sub["field_kV_cm"].map(interpreted)]
+
+
+def _field_cells_high_field(df: pd.DataFrame):
+  """_field_cells, restricted to ABOVE the interpreted range.
+
+  The complement of _field_cells_interpreted. Feeds the supplementary
+  high-field figures only -- never a main-text plot -- and is not read as a
+  dose response for the reasons in report_session_confound.
+  """
+  sub = _field_cells(df)
+  if INTERPRETED_MAX_FIELD is None:
+    return sub.iloc[0:0]
+  return sub[~sub["field_kV_cm"].map(interpreted)]
 
 
 def interpreted(E) -> bool:
@@ -705,15 +741,133 @@ def plot_field_response(df: pd.DataFrame, out: Path):
   threshold; the responding fraction counts how many crossed one. A
   population where a few vesicles empty and the rest do nothing shows a high
   mean and a low fraction, and the two together say which is happening.
+
+  As of the 2026-08 pipeline update, this figure is restricted outright to
+  the interpreted range (<= INTERPRETED_MAX_FIELD, i.e. 0.1-1.33 kV/cm /
+  30-400 V): fields above that are session-confounded (see
+  report_session_confound) and are no longer drawn broken alongside the
+  interpreted range. They are drawn in full in their own figure by
+  plot_field_response_supplementary. field_response_summary.csv still
+  tabulates every field, interpreted or not, with an "interpreted" column, so
+  nothing measured is silently dropped -- only kept off the main plot.
   """
-  stag = _field_cells(df)
+  stag_all = _field_cells(df)
+  stag = _field_cells_interpreted(df)
   if stag.empty:
-    print("Field response skipped: no stagnate GUVs with a release value.")
+    print("Field response skipped: no stagnate GUVs with a release value "
+          "in the interpreted range.")
     return
   pops = [p for p in POP_LABEL if p in set(stag["population"])]
   rng = np.random.default_rng(0)
 
-  fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12.5, 5.0))
+  fig, (ax1, ax2) = plt.subplots(
+      1, 2, figsize=process.fig_size("field_response_by_population",
+                                     12.5, 5.0, 2))
+  rows, thin = [], []
+  for pop in pops:
+    # Rows (and therefore the CSV) still cover every field for this
+    # population, interpreted or not; only what gets plotted is restricted.
+    p_df_all = stag_all[stag_all["population"] == pop]
+    p_df = stag[stag["population"] == pop]
+    c = _colour(pop)
+    xs, mean_r, lo_r, hi_r, frac, f_lo, f_hi = [], [], [], [], [], [], []
+    for E, cell in p_df_all.groupby("field_kV_cm"):
+      v = cell["released"].dropna().to_numpy(float)
+      if len(v) < MIN_N_PER_FIELD:
+        thin.append((POP_LABEL[pop], E, len(v)))
+        continue
+      boot = np.mean(v[rng.integers(0, len(v), (4000, len(v)))], axis=1)
+      resp = cell["efflux"].dropna().astype(bool)
+      k, n = int(resp.sum()), int(len(resp))
+      wl, wh = wilson(k, n) if n else (np.nan, np.nan)
+      rows.append({"population": POP_LABEL[pop], "field_kV_cm": E,
+                   "n": len(v), "median_released": float(np.median(v)),
+                   "mean_released": float(v.mean()),
+                   "mean_ci_lo": float(np.percentile(boot, 2.5)),
+                   "mean_ci_hi": float(np.percentile(boot, 97.5)),
+                   "n_with_call": n, "n_efflux": k,
+                   "frac_efflux": (k / n if n else np.nan),
+                   "frac_ci_lo": wl, "frac_ci_hi": wh,
+                   "interpreted": interpreted(E),
+                   "sessions": ",".join(sorted(cell["session"].dropna()
+                                               .unique()))})
+      if not interpreted(E):
+        continue
+      xs.append(E)
+      mean_r.append(v.mean())
+      lo_r.append(np.percentile(boot, 2.5))
+      hi_r.append(np.percentile(boot, 97.5))
+      frac.append(k / n if n else np.nan)
+      f_lo.append(wl)
+      f_hi.append(wh)
+    ax1.scatter(p_df["field_kV_cm"], p_df["released"], s=8, alpha=0.22,
+                color=c, edgecolors="none")
+    xs = np.asarray(xs, float)
+    if xs.size:
+      for ax, mid, lo_v, hi_v, alpha in (
+          (ax1, mean_r, lo_r, hi_r, 0.15), (ax2, frac, f_lo, f_hi, 0.18)):
+        y = np.asarray(mid)
+        lo_a, hi_a = np.asarray(lo_v), np.asarray(hi_v)
+        ax.plot(xs, y, "o-", color=c, lw=2, ms=5, mfc=c,
+                label=POP_LABEL[pop])
+        ax.fill_between(xs, lo_a, hi_a, color=c, alpha=alpha, lw=0)
+
+  # 1D axes start at 0: the release fraction and the responding fraction are
+  # both non-negative quantities by construction, so the axis floor should
+  # say so rather than implying values below zero are possible. If a
+  # bootstrap CI band is ever clipped visibly at the floor, that is real
+  # information (the estimate's lower bound crosses zero), not a plotting
+  # artefact -- leave it clipped rather than padding below 0 to show it.
+  ax1.set_ylim(bottom=0)
+  ax1.set_ylabel("released fraction of lumenal signal")
+  ax2.set_ylabel("fraction with efflux")
+  ax2.set_ylim(0, 1.02)
+  for ax in (ax1, ax2):
+    ax.set_xlim(left=0)
+    ax.set_xlabel("field strength (kV/cm)")
+    ax.legend(frameon=False, fontsize=9)
+    ax.grid(alpha=0.35, linestyle="--")
+  process.style_figure("field_response_by_population")
+  fig.tight_layout()
+  fig.savefig(out / "field_response_by_population.pdf", dpi=300)
+  plt.close(fig)
+
+  if rows:
+    tbl = pd.DataFrame(rows).sort_values(["population", "field_kV_cm"])
+    tbl.to_csv(out / "field_response_summary.csv", index=False)
+    print("\nResponse against applied field strength (no size correction; "
+          "every field, interpreted or not -- see the 'interpreted' "
+          "column):")
+    print(tbl.to_string(index=False, float_format=lambda x: f"{x:.4f}"))
+  if thin:
+    print(f"\n  {len(thin)} population-field cell(s) below "
+          f"{MIN_N_PER_FIELD} vesicles and omitted:")
+    for lab, E, n in sorted(thin, key=lambda t: (t[0], t[1])):
+      print(f"    {lab:<24} {E:.2f} kV/cm  n={n}")
+
+
+def plot_field_response_supplementary(df: pd.DataFrame, out: Path):
+  """Same two panels as plot_field_response, for fields ABOVE the interpreted
+  range only.
+
+  Not a dose-response figure: see report_session_confound for why the fields
+  drawn here cannot be separated from the sessions that supplied them. Exists
+  so the higher-field vesicles remain visible somewhere -- a silent gap at
+  the top of the series invites the reader to assume the missing conditions
+  were unfavourable, and here they were measured, just not interpretable as
+  part of the dose series.
+  """
+  stag = _field_cells_high_field(df)
+  if stag.empty:
+    print("High-field supplementary figure skipped: no vesicles above "
+          f"{INTERPRETED_MAX_FIELD} kV/cm.")
+    return
+  pops = [p for p in POP_LABEL if p in set(stag["population"])]
+  rng = np.random.default_rng(0)
+
+  fig, (ax1, ax2) = plt.subplots(
+      1, 2, figsize=process.fig_size(
+          "field_response_by_population_supplementary_highfield", 12.5, 5.0, 2))
   rows, thin = [], []
   for pop in pops:
     p_df = stag[stag["population"] == pop]
@@ -738,75 +892,57 @@ def plot_field_response(df: pd.DataFrame, out: Path):
       rows.append({"population": POP_LABEL[pop], "field_kV_cm": E,
                    "n": len(v), "median_released": float(np.median(v)),
                    "mean_released": float(v.mean()),
-                   "mean_ci_lo": float(np.percentile(boot, 2.5)),
-                   "mean_ci_hi": float(np.percentile(boot, 97.5)),
                    "n_with_call": n, "n_efflux": k,
                    "frac_efflux": (k / n if n else np.nan),
-                   "frac_ci_lo": wl, "frac_ci_hi": wh,
-                   "interpreted": interpreted(E),
                    "sessions": ",".join(sorted(cell["session"].dropna()
                                                .unique()))})
     ax1.scatter(p_df["field_kV_cm"], p_df["released"], s=8, alpha=0.22,
                 color=c, edgecolors="none")
-    # Drawn as two segments rather than one line. Joining a point that is
-    # read as a dose response to one that is not asserts a trend across the
-    # break, which is the reading the break exists to prevent.
     xs = np.asarray(xs, float)
-    for keep, style in ((np.array([interpreted(E) for E in xs], bool),
-                         dict(ls="-", mfc=c, label=POP_LABEL[pop])),
-                        (np.array([not interpreted(E) for E in xs], bool),
-                         dict(ls="--", mfc="white", label=None))):
-      if not keep.any():
-        continue
-      x_k = xs[keep]
+    if xs.size:
+      order = np.argsort(xs)
+      xs_o = xs[order]
       for ax, mid, lo_v, hi_v, alpha in (
           (ax1, mean_r, lo_r, hi_r, 0.15), (ax2, frac, f_lo, f_hi, 0.18)):
-        y = np.asarray(mid)[keep]
-        lo_a, hi_a = np.asarray(lo_v)[keep], np.asarray(hi_v)[keep]
-        ax.plot(x_k, y, "o", ls=style["ls"], color=c, lw=2, ms=5,
-                mfc=style["mfc"], label=style["label"])
-        if style["ls"] == "-":
-          ax.fill_between(x_k, lo_a, hi_a, color=c, alpha=alpha, lw=0)
-        else:
-          # Bars, not a band. A filled interval reads as a curve with a
-          # width, and these conditions are not a curve -- they are separate
-          # estimates that happen to sit next to each other.
-          ax.errorbar(x_k, y, yerr=[np.clip(y - lo_a, 0, None),
-                                    np.clip(hi_a - y, 0, None)],
-                      fmt="none", ecolor=c, elinewidth=0.9, capsize=2,
-                      alpha=0.8)
+        y = np.asarray(mid)[order]
+        lo_a, hi_a = np.asarray(lo_v)[order], np.asarray(hi_v)[order]
+        # Open markers, no connecting dose-response line: these fields are
+        # each their own isolated condition (one session apiece), not a
+        # series, so the same drawing choice as the old broken-line segment
+        # is kept here without needing the interpreted/uninterpreted split.
+        ax.plot(xs_o, y, "o", ls="none", color=c, mfc="white", mec=c,
+                ms=6, mew=1.5, label=POP_LABEL[pop])
+        ax.errorbar(xs_o, y, yerr=[np.clip(y - lo_a, 0, None),
+                                   np.clip(hi_a - y, 0, None)],
+                    fmt="none", ecolor=c, elinewidth=0.9, capsize=2,
+                    alpha=0.8)
 
-  ax1.axhline(0, color=PALETTE["grey"], lw=0.8, ls="--")
+  ax1.set_ylim(bottom=0)
   ax1.set_ylabel("released fraction of lumenal signal")
-  ax1.set_title("Release magnitude (mean, bootstrap 95% CI)", fontsize=10)
   ax2.set_ylabel("fraction with efflux")
-  ax2.set_ylim(-0.02, 1.02)
-  ax2.set_title("Responding fraction (Wilson 95% CI)", fontsize=10)
-  all_fields = sorted(stag["field_kV_cm"].dropna().unique())
+  ax2.set_ylim(0, 1.02)
   for ax in (ax1, ax2):
+    ax.set_xlim(left=0)
     ax.set_xlabel("field strength (kV/cm)")
     ax.legend(frameon=False, fontsize=9)
     ax.grid(alpha=0.35, linestyle="--")
-    _mark_uninterpreted(ax, all_fields)
-  cut = ("" if INTERPRETED_MAX_FIELD is None else
-         f"; open markers above {INTERPRETED_MAX_FIELD} kV/cm are one session")
-  fig.suptitle("Vesicle groups at matched radius and matched field\n"
-               f"(stagnate GUVs; fields with < {MIN_N_PER_FIELD} vesicles "
-               f"omitted{cut})", fontsize=11)
-  fig.tight_layout(rect=(0, 0, 1, 0.91))
-  fig.savefig(out / "field_response_by_population.pdf", dpi=300)
+  ax1.annotate("supplementary: fields above the interpreted range,\n"
+               "each one session only -- not a dose response",
+               xy=(0.02, 0.96), xycoords="axes fraction", ha="left",
+               va="top", fontsize=8, color=PALETTE["grey"])
+  process.style_figure("field_response_by_population_supplementary_highfield")
+  fig.tight_layout()
+  fig.savefig(out / "field_response_by_population_supplementary_highfield.pdf",
+              dpi=300)
   plt.close(fig)
 
   if rows:
     tbl = pd.DataFrame(rows).sort_values(["population", "field_kV_cm"])
-    tbl.to_csv(out / "field_response_summary.csv", index=False)
-    print("\nResponse against applied field strength (no size correction):")
+    tbl.to_csv(out / "field_response_summary_supplementary_highfield.csv",
+              index=False)
+    print("\nHigh-field supplementary response (session-confounded, not a "
+          "dose response):")
     print(tbl.to_string(index=False, float_format=lambda x: f"{x:.4f}"))
-  if thin:
-    print(f"\n  {len(thin)} population-field cell(s) below "
-          f"{MIN_N_PER_FIELD} vesicles and omitted:")
-    for lab, E, n in sorted(thin, key=lambda t: (t[0], t[1])):
-      print(f"    {lab:<24} {E:.2f} kV/cm  n={n}")
 
 
 # --- 3b. is the field axis also the session axis? ----------------------------
@@ -915,8 +1051,9 @@ def report_session_confound(df: pd.DataFrame, out: Path):
   pops = [p for p in POP_LABEL if p in set(sub["population"])]
   sessions = sorted(sub["session"].dropna().unique())
   marks = ["o", "s", "^", "D", "v", "P"]
-  fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11.5, 4.4),
-                                 gridspec_kw={"width_ratios": [1.6, 1]})
+  fig, (ax1, ax2) = plt.subplots(
+      1, 2, figsize=process.fig_size("field_response_by_session", 11.5, 4.4, 2),
+      gridspec_kw={"width_ratios": [1.6, 1]})
   for pop in pops:
     for j, s in enumerate(sessions):
       cell = sub[(sub["population"] == pop) & (sub["session"] == s)]
@@ -932,7 +1069,6 @@ def report_session_confound(df: pd.DataFrame, out: Path):
   ax1.set_xlabel("field strength (kV/cm)")
   ax1.set_ylabel("fraction with efflux")
   ax1.set_ylim(-0.05, 1.05)
-  ax1.set_title("Response against field, split by session", fontsize=10)
   handles = ([plt.Line2D([], [], marker=marks[j % len(marks)], ls="",
                          mfc="none", mec=PALETTE["grey"],
                          color=PALETTE["grey"], ms=5, label=s)
@@ -950,7 +1086,7 @@ def report_session_confound(df: pd.DataFrame, out: Path):
   ax2.set_xticks(range(len(rate)))
   ax2.set_xticklabels(rate.index, rotation=45, ha="right", fontsize=8)
   ax2.set_ylabel("fraction with efflux")
-  ax2.set_title("Response per session, pooled", fontsize=10)
+  process.style_figure("field_response_by_session")
   fig.tight_layout()
   fig.savefig(out / "field_response_by_session.pdf", dpi=300)
   plt.close(fig)
@@ -1008,14 +1144,21 @@ def plot_endpoint_distribution(df: pd.DataFrame, out: Path):
   dominate the eye. That reads as two groups whether or not there are two.
   A count axis settles it.
   """
-  sub = _field_cells(df)
+  # Restricted to the interpreted range, as of the 2026-08 update: this is a
+  # main-text figure and should agree with plot_field_response about which
+  # vesicles are shown, not pool in the session-confounded high-field block
+  # unmarked. The right-hand panel already filtered on cls["interpreted"];
+  # this brings the left-hand histogram into line with it.
+  sub = _field_cells_interpreted(df)
   if sub.empty:
-    print("Endpoint distribution skipped: nothing to plot.")
+    print("Endpoint distribution skipped: nothing to plot in the "
+          "interpreted range.")
     return
   cls = endpoint_classes(df)
   pops = [p for p in POP_LABEL if p in set(sub["population"])]
 
-  fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11.0, 4.2),
+  fig, (ax1, ax2) = plt.subplots(
+      1, 2, figsize=process.fig_size("endpoint_distribution", 11.0, 4.2, 2),
                                  gridspec_kw={"width_ratios": [1.15, 1]})
   # Full range, not a percentile: clipping the axis at the 99th percentile
   # would fold the largest releases into the last bin, and those are the
@@ -1037,9 +1180,9 @@ def plot_endpoint_distribution(df: pd.DataFrame, out: Path):
   # linear axis hides the tail entirely, but a plain log axis cannot show the
   # empty bins between the two.
   ax1.set_yscale("symlog", linthresh=10)
+  ax1.set_ylim(bottom=0)
   ax1.set_xlabel("released fraction at the matched endpoint")
   ax1.set_ylabel("vesicles")
-  ax1.set_title("Endpoint change, all fields", fontsize=10)
   ax1.legend(frameon=False, fontsize=8, loc="upper right")
 
   # Counts are annotated only for the two populations the section compares.
@@ -1062,10 +1205,12 @@ def plot_endpoint_distribution(df: pd.DataFrame, out: Path):
                    textcoords="offset points", xytext=(0, dy), ha="center",
                    fontsize=6.5, color=_colour(pop))
   ax2.set_xlabel("field strength (kV/cm)")
+  ax2.set_xlim(left=0)
   ax2.set_ylabel(f"vesicles ending within {INTACT_BAND:.0%} (%)")
-  ax2.set_title("Intact fraction, interpreted range", fontsize=10)
+  ax2.set_ylim(0, 105)
   ax2.legend(frameon=False, fontsize=8, loc="lower left")
 
+  process.style_figure("endpoint_distribution")
   fig.tight_layout()
   fig.savefig(out / "endpoint_distribution.pdf", dpi=300)
   plt.close(fig)
@@ -1164,150 +1309,6 @@ def report_uninterpreted_block(df: pd.DataFrame, out: Path):
       out / "uninterpreted_block_checks.csv", index=False)
 
 
-# --- LaTeX tables ------------------------------------------------------------
-
-def _tex_escape(s) -> str:
-  return str(s).replace("_", r"\_").replace("%", r"\%")
-
-
-def write_latex_tables(df: pd.DataFrame, out: Path, noise: pd.DataFrame = None):
-  """Emit the results tables as \\input-able .tex, from the same frame.
-
-  Every number here is also in a CSV beside it. The point of the .tex is that
-  the thesis never contains a figure retyped by hand from a console.
-  """
-  if not WRITE_LATEX_TABLES:
-    return
-  tex = out / LATEX_SUBFOLDER
-  tex.mkdir(parents=True, exist_ok=True)
-  sub = _field_cells(df)
-  cls = endpoint_classes(df)
-  pops = [p for p in POP_LABEL if p in set(sub["population"])]
-  written = []
-
-  # --- responding vesicles at each field -----------------------------------
-  lines = [r"% generated by susceptibility.write_latex_tables -- do not edit",
-           r"\begin{table}[tb]", r"  \centering",
-           r"  \caption[Responding vesicles at each applied field]"
-           r"{\textbf{Responding vesicles at each applied field.} Responding "
-           r"vesicles over vesicles scored, with the percentage and its "
-           r"Wilson \SI{95}{\percent} interval. The session column is what "
-           r"shows whether the dose axis is also a date axis.}",
-           r"  \label{tab: CH2 - Field response}", r"  \small",
-           r"  \begin{tabular}{l"
-           + " r@{\\hspace{5pt}}l" * len(pops) + r" l}",
-           r"    \toprule",
-           r"    \multicolumn{1}{c}{$E$} & "
-           + " & ".join(f"\\multicolumn{{2}}{{c}}{{\\textit{{{POP_LABEL[p]}}}}}"
-                        for p in pops)
-           + r" & \multicolumn{1}{c}{Session} \\",
-           r"    \multicolumn{1}{c}{(\si{\kilo\volt\per\centi\meter})} & "
-           + " & ".join([r"$k/n$ & \% (CI)"] * len(pops)) + r" & \\",
-           r"    \midrule"]
-  for E in sorted(sub["field_kV_cm"].unique()):
-    cells, sess = [], set()
-    for pop in pops:
-      c = sub[(sub["population"] == pop) & (sub["field_kV_cm"] == E)]
-      if c.empty:
-        cells += ["--", ""]
-        continue
-      k, n = int(c["efflux"].sum()), len(c)
-      lo, hi = wilson(k, n)
-      cells += [f"{k}/{n}", f"{100 * k / n:.1f} ({100 * lo:.0f}--{100 * hi:.0f})"]
-      sess.update(c["session"].dropna().astype(str))
-    lines.append(f"    {E:.2f} & " + " & ".join(cells) + " & "
-                 + ", ".join(sorted(sess)) + r" \\")
-    if INTERPRETED_MAX_FIELD is not None and interpreted(E) and not any(
-        interpreted(x) for x in sub["field_kV_cm"].unique() if x > E):
-      lines.append(r"    \midrule")
-  lines += [r"    \bottomrule", r"  \end{tabular}", r"\end{table}"]
-  (tex / "tab_field_response.tex").write_text("\n".join(lines) + "\n")
-  written.append("tab_field_response.tex")
-
-  # --- endpoint classification ---------------------------------------------
-  lines = [r"% generated by susceptibility.write_latex_tables -- do not edit",
-           r"\begin{table}[tb]", r"  \centering",
-           r"  \caption[Endpoint classification at each applied field]"
-           r"{\textbf{Endpoint classification at each applied field.} "
-           r"Vesicles scored ($n$), those ending within "
-           rf"\SI{{{100 * INTACT_BAND:.0f}}}{{\percent}} of their pre-pulse "
-           r"intensity, those losing more, those gaining more, and those "
-           r"meeting the response criterion, which additionally requires the "
-           r"fall to exceed three times the vesicle's own frame-to-frame "
-           r"noise. The two are separate measurements of the same trace.}",
-           r"  \label{tab: CH2 - Endpoint classes}", r"  \small",
-           r"  \begin{tabular}{l r r r r r}", r"    \toprule",
-           r"    $E$ (\si{\kilo\volt\per\centi\meter}) & $n$ & Within band"
-           r" & Lost & Gained & Responding \\"]
-  for pop in pops:
-    m = cls[(cls["population"] == pop) & cls["interpreted"]]
-    if m.empty:
-      continue
-    lines.append(r"    \midrule")
-    lines.append(f"    \\multicolumn{{6}}{{l}}{{\\textit{{{POP_LABEL[pop]}}}}} \\\\")
-    for _, r in m.iterrows():
-      lines.append(f"    \\quad {r['field_kV_cm']:.2f} & {int(r['n'])} & "
-                   f"{int(r['n_intact'])} & {int(r['n_lost'])} & "
-                   f"{int(r['n_gained'])} & {int(r['n_efflux'])} \\\\")
-    lines.append(f"    \\quad all & {int(m['n'].sum())} & "
-                 f"{int(m['n_intact'].sum())} & {int(m['n_lost'].sum())} & "
-                 f"{int(m['n_gained'].sum())} & "
-                 f"{int(m['n_efflux'].sum())} \\\\")
-  lines += [r"    \bottomrule", r"  \end{tabular}", r"\end{table}"]
-  (tex / "tab_endpoint_classes.tex").write_text("\n".join(lines) + "\n")
-  written.append("tab_endpoint_classes.tex")
-
-  # --- the responders themselves -------------------------------------------
-  r_df = sub[sub["efflux"] == True].copy()
-  if not r_df.empty:
-    r_df = r_df.sort_values(["population", "field_kV_cm", "released"],
-                            ascending=[True, True, False])
-    # Was counted from response_class in ("GRADUAL", "DELAYED"). That column
-    # is gone; the same thing is read straight off the fit instead, and more
-    # directly: a vesicle whose tau the record did not constrain was still
-    # losing dye when the record ended.
-    n_cens = int((~r_df.get("tau_identifiable",
-                            pd.Series(False, index=r_df.index))
-                  .fillna(False).astype(bool)).sum())
-    caption = (
-        r"\caption[Responding vesicles]{\textbf{The "
-        rf"${len(r_df)}$ responding vesicles." + "}"
-        r" Released fraction is the fall from the pre-pulse baseline to the "
-        r"matched endpoint, and a vesicle counts as releasing when that fall "
-        r"exceeds the larger of \SI{5}{\percent} and three times its own "
-        rf"frame-to-frame noise. ${n_cens}$ of ${len(r_df)}$ were still "
-        r"losing dye when the record ended, so their $\tau$ is an "
-        r"extrapolation rather than a measurement. $\tau/T$ is the fitted "
-        r"time constant over the record duration; $^{\dagger}$ marks the "
-        r"vesicles meeting the identifiability criteria." + "}")
-    lines = [r"% generated by susceptibility.write_latex_tables -- do not edit",
-             r"\begin{table}[tb]", r"  \centering", "  " + caption,
-             r"  \label{tab: CH2 - Responders}", r"  \small",
-             r"  \begin{tabular}{l S[table-format=1.2] S[table-format=2.1] "
-             r"S[table-format=2.2] l}", r"    \toprule",
-             r"    Population & {$E$ (\si{\kilo\volt\per\centi\meter})}"
-             r" & {Released (\%)} & {$\tau/T$} & Session \\",
-             r"    \midrule"]
-    prev = None
-    for _, r in r_df.iterrows():
-      if prev is not None and r["population"] != prev:
-        lines.append(r"    \addlinespace")
-      prev = r["population"]
-      tor = r.get("tau_over_record", np.nan)
-      lines.append(
-          f"    \\textit{{{POP_LABEL[r['population']]}}} & "
-          f"{r['field_kV_cm']:.2f} & {100 * r['released']:.1f} & "
-          f"{tor:.2f}" + ("$^{\\dagger}$" if r.get("tau_identifiable") else "")
-          + f" & {r.get('session', '')} \\\\")
-    lines += [r"    \bottomrule", r"  \end{tabular}", r"\end{table}"]
-    (tex / "tab_responders.tex").write_text("\n".join(lines) + "\n")
-    written.append("tab_responders.tex")
-
-  print(f"\nWrote {len(written)} LaTeX table(s) to {tex}:")
-  for w in written:
-    print(f"    {w}")
-
-
 def plot_experiment_level(df: pd.DataFrame, out: Path):
   """One point per EXPERIMENT, not per GUV.
 
@@ -1315,9 +1316,12 @@ def plot_experiment_level(df: pd.DataFrame, out: Path):
   overstates n by an order of magnitude. Whatever survives here is what the
   design actually supports.
   """
-  stag = df[(df["size_category"] == "Stagnate") & df["released"].notna()]
+  # Restricted to the interpreted range, as of the 2026-08 update, matching
+  # every other main-text field-strength figure.
+  stag = _field_cells_interpreted(df)
   if stag.empty:
-    print("Experiment-level plot skipped: no stagnate GUVs.")
+    print("Experiment-level plot skipped: no stagnate GUVs in the "
+          "interpreted range.")
     return
 
   per_exp = (stag.groupby(["population", "voltage", "voltage_V", "experiment"])
@@ -1334,7 +1338,8 @@ def plot_experiment_level(df: pd.DataFrame, out: Path):
   pops = [p for p in POP_LABEL if p in set(per_exp["population"])]
   rng = np.random.default_rng(0)
 
-  fig, ax = plt.subplots(figsize=(max(8, 1.0 * len(volts) + 3), 5.0))
+  fig, ax = plt.subplots(figsize=process.fig_size(
+      "per_experiment_release", max(8, 1.0 * len(volts) + 3), 5.0))
   for k, pop in enumerate(pops):
     p_df = per_exp[per_exp["population"] == pop]
     off = (k - (len(pops) - 1) / 2) * 0.3
@@ -1344,6 +1349,7 @@ def plot_experiment_level(df: pd.DataFrame, out: Path):
                edgecolors="white", linewidth=0.6, zorder=3,
                label=f"{POP_LABEL[pop]} ({len(p_df)} experiments)")
   ax.axhline(0, color=PALETTE["grey"], lw=0.8, ls="--")
+  ax.set_ylim(bottom=0)
   ax.set_xticks(range(len(volts)))
   # Field strength, matching every other axis in the chapter. The grouping
   # stays on voltage_V because the conversion is one constant and the
@@ -1352,10 +1358,9 @@ def plot_experiment_level(df: pd.DataFrame, out: Path):
                      rotation=45)
   ax.set_xlabel("Field strength (kV/cm)")
   ax.set_ylabel("experiment median released fraction")
-  ax.set_title("One point per experiment, not per vesicle\n"
-               "(the unit of replication the design supports)")
   ax.legend(frameon=False, fontsize=9)
   ax.grid(axis="y", alpha=0.35, linestyle="--")
+  process.style_figure("per_experiment_release")
   fig.tight_layout()
   fig.savefig(out / "per_experiment_release.pdf", dpi=300)
   plt.close(fig)
@@ -1441,6 +1446,19 @@ def check_detectability(df: pd.DataFrame, outputs_root, out: Path):
       qc, on=["experiment", "guv_id"], how="inner")
   if merged.empty:
     print("Detectability check skipped: no GUVs matched between tables.")
+    return
+  # Restricted to the interpreted range, as of the 2026-08 update: this
+  # check exists to rule out a confound in the SAME comparison the
+  # field-response figures make, so it has to describe the same population,
+  # not a wider one that includes the session-confounded high-field block.
+  n_all_field = len(merged)
+  merged = merged[merged["field_kV_cm"].map(interpreted)]
+  if n_all_field != len(merged):
+    print(f"  Detectability restricted to the interpreted field range: "
+          f"{n_all_field - len(merged)} of {n_all_field} dropped.")
+  if merged.empty:
+    print("Detectability check skipped: nothing left in the interpreted "
+          "range.")
     return
 
   # Stagnate only, matching every other response figure in this module.
@@ -1540,8 +1558,9 @@ def check_detectability(df: pd.DataFrame, outputs_root, out: Path):
             "against the observed effect, so the difference is CONSERVATIVE, "
             "not explained away.")
 
-  fig, axes = plt.subplots(1, len(cols) + 1,
-                           figsize=(4.8 * (len(cols) + 1), 4.6))
+  n_panels = len(cols) + 1
+  fig, axes = plt.subplots(1, n_panels, figsize=process.fig_size(
+      "detectability_by_population", 4.8 * n_panels, 4.6, n_panels))
   axes = np.atleast_1d(axes)
   for ax, col in zip(axes, cols):
     for pop in pops:
@@ -1551,7 +1570,8 @@ def check_detectability(df: pd.DataFrame, outputs_root, out: Path):
                 color=_colour(pop), lw=2, label=POP_LABEL[pop])
     ax.set_xlabel(col)
     ax.set_ylabel("cumulative fraction")
-    ax.set_title(col, fontsize=10)
+    ax.set_xlim(left=0)
+    ax.set_ylim(0, 1.02)
     ax.grid(alpha=0.35, linestyle="--")
     ax.legend(frameon=False, fontsize=8)
 
@@ -1567,14 +1587,13 @@ def check_detectability(df: pd.DataFrame, outputs_root, out: Path):
     ax.plot(xs, 3 * xs, ls="--", lw=1.0, color=PALETTE["dark_red"],
             label="3 sigma floor")
     ax.set_xlim(0, lim)
+    ax.set_ylim(bottom=0)
     ax.set_xlabel("response_noise")
     ax.set_ylabel("response_drop")
-    ax.set_title("Signal against its own noise floor", fontsize=10)
     ax.legend(frameon=False, fontsize=8)
     ax.grid(alpha=0.35, linestyle="--")
-  fig.suptitle("Detectability: can every group be scored equally well?",
-               fontsize=11)
-  fig.tight_layout(rect=(0, 0, 1, 0.92))
+  process.style_figure("detectability_by_population")
+  fig.tight_layout()
   fig.savefig(out / "detectability_by_population.pdf", dpi=300)
   plt.close(fig)
 
@@ -1587,9 +1606,12 @@ def check_per_experiment_within_fields(df: pd.DataFrame, out: Path):
   carried by one chamber is a statement about that chamber. This is the
   check that the difference is not.
   """
-  sub = _field_cells(df)
+  # Restricted to the interpreted range, as of the 2026-08 update, matching
+  # every other main-text field-strength figure.
+  sub = _field_cells_interpreted(df)
   if sub.empty:
-    print("Per-experiment field check skipped: nothing to compare.")
+    print("Per-experiment field check skipped: nothing to compare in the "
+          "interpreted range.")
     return
   per = (sub.groupby(["field_kV_cm", "population", "experiment"])
          .agg(n_guv=("efflux", "count"),
@@ -1628,7 +1650,8 @@ def check_per_experiment_within_fields(df: pd.DataFrame, out: Path):
             "experiments with any responder)")
       print(f"      {fr}")
 
-  fig, ax = plt.subplots(figsize=(9.5, 5))
+  fig, ax = plt.subplots(
+      figsize=process.fig_size("per_experiment_within_field", 9.5, 5))
   rng = np.random.default_rng(0)
   fields = sorted(per["field_kV_cm"].unique())
   xpos = {E: i for i, E in enumerate(fields)}
@@ -1642,21 +1665,13 @@ def check_per_experiment_within_fields(df: pd.DataFrame, out: Path):
                linewidth=0.6,
                label=f"{POP_LABEL[pop]} (1 point = 1 experiment)")
   ax.set_xticks(range(len(fields)))
-  # Asterisked fields are outside the interpreted range. The x axis here is
-  # categorical, so the shaded band used on the dose figures has nothing to
-  # sit on; the mark is the same statement in the space available.
-  ax.set_xticklabels([f"{E:.2f}" + ("" if interpreted(E) else "*")
-                      for E in fields], fontsize=8)
+  ax.set_xticklabels([f"{E:.2f}" for E in fields], fontsize=8)
   ax.set_xlabel("field strength (kV/cm)")
   ax.set_ylabel("fraction with efflux")
-  ax.set_ylim(-0.05, 1.05)
-  star = ("" if all(interpreted(E) for E in fields) else
-          "\n* one session only; not read as a dose response")
-  ax.set_title("Responding fraction per experiment, at each field\n"
-               "(marker size = GUVs contributed; <3 GUVs per field dropped)"
-               + star)
+  ax.set_ylim(0, 1.05)
   ax.legend(frameon=False, fontsize=9)
   ax.grid(axis="y", alpha=0.35, linestyle="--")
+  process.style_figure("per_experiment_within_field")
   fig.tight_layout()
   fig.savefig(out / "per_experiment_within_field.pdf", dpi=300)
   plt.close(fig)
@@ -1826,6 +1841,94 @@ def _report_matched_cell(a: pd.DataFrame, b: pd.DataFrame, label: str):
           f"median {np.median(per):.2f}")
 
 
+def report_size_distributions_unrestricted(results_dir: Path, out: Path):
+  """ECDF of pre-pulse radius for the full tracked population, before
+  SIZE_WINDOW_UM is applied.
+
+  report_size_distributions, above, cannot answer this on its own: by the
+  time load_summary() hands it a df, process.analysis_population() has
+  already restricted to SIZE_WINDOW_UM. guv_bulk_summary.csv is not the fix
+  either -- it is not guaranteed to be the pre-restriction population, and
+  reading it directly is what the previous version of this function did
+  wrong. ALL_RADII_CSV (guv_bulk_all_radii.csv) is what run_bulk.py writes
+  specifically for this comparison, before the size window; it is the same
+  file report_radius_sensitivity reads, so this function reads it the same
+  way rather than opening a second path to the same population.
+
+  Sees the comparison Chapter 2 Results Sec 2 opens with -- Bare vs the full
+  protein-loaded population, before any phenotype split. Compares on the raw
+  "population" label (Bare / BranchedCortex) precisely so that
+  process.EXCLUDE_GROUPS is NOT applied here: those ~126 ambiguous/
+  unclassified vesicles are still part of "protein-loaded" for this
+  comparison, matching the 497 Bare / 513 protein-loaded counts Results Sec 1
+  reports. Check the printed n against those two numbers when this runs --
+  they should match exactly, modulo any vesicles with a missing radius_um.
+  """
+  path = Path(results_dir) / ALL_RADII_CSV
+  if not path.exists():
+    print(f"  Skipped: {path} not found. run_bulk.py writes it beside "
+          "guv_bulk_summary.csv; re-run the intensity stage to produce it.")
+    return
+  df = pd.read_csv(path)
+  df = df[df["radius_um"].notna()]
+  if df.empty:
+    print("Unrestricted size comparison skipped: no radius_um values.")
+    return
+
+  # Bare vs every protein-loaded vesicle, on the RAW population label
+  # ("Bare" / "BranchedCortex"), before process.apply_cortex_split. This is
+  # deliberately NOT the split table: apply_cortex_split drops
+  # process.EXCLUDE_GROUPS (the ambiguous/unclassified ~126 vesicles) before
+  # anything downstream sees it, which is correct for a cortex-vs-lumenal
+  # comparison but wrong here. Results Sec 2 reports the 6.58 vs ~4.4 um
+  # split for the FULL protein-loaded population, all phenotypes and
+  # unclassified vesicles pooled (497 Bare / 513 protein-loaded, matching
+  # Results Sec 1's tracked counts) -- calling apply_cortex_split first
+  # silently shrank the Branched group to 387 and shifted its median, which
+  # is why this figure could not be reproduced from the split table.
+
+  bare = df[df["population"] == "Bare"]["radius_um"]
+  branched = df[df["population"] != "Bare"]["radius_um"]
+  print("\nUnrestricted radius comparison (before SIZE_WINDOW_UM):")
+  print(f"  Bare:     n={len(bare)}  median={bare.median():.2f} um")
+  print(f"  Branched: n={len(branched)}  median={branched.median():.2f} um")
+  if len(bare) < 3 or len(branched) < 3:
+    print("  Too few vesicles in one group for a comparison.")
+    return
+
+  try:
+    from scipy.stats import mannwhitneyu
+    p = float(mannwhitneyu(bare, branched, alternative="two-sided").pvalue)
+    print(f"  Mann-Whitney U, p = {p:.3g}")
+  except Exception:
+    print("  scipy unavailable; p-value not computed.")
+
+  fig, ax = plt.subplots(
+      figsize=process.fig_size("guv_size_full_population_ecdf", 7.5, 4.8))
+  for label, vals, color in (
+      ("Bare", bare, PALETTE["grey"]),
+      ("Branched (all phenotypes)", branched, PALETTE["dark_blue"])):
+    v = np.sort(vals.to_numpy())
+    ax.step(v, np.arange(1, len(v) + 1) / len(v), where="post",
+            color=color, lw=2, label=f"{label} (n={len(v)})")
+  window = process.SIZE_WINDOW_UM if process is not None else None
+  if window is not None:
+    lo, hi = window
+    ax.axvspan(lo, hi, color=PALETTE["grey"], alpha=0.12,
+               label=f"SIZE_WINDOW_UM ({lo:.1f}-{hi:.1f} um)")
+  ax.set_xlabel("radius (um)")
+  ax.set_ylabel("cumulative fraction")
+  ax.set_xlim(left=0)
+  ax.set_ylim(0, 1.02)
+  ax.legend(frameon=False)
+  ax.grid(alpha=0.35, linestyle="--")
+  process.style_figure("guv_size_full_population_ecdf")
+  fig.tight_layout()
+  fig.savefig(out / "guv_size_full_population_ecdf.pdf", dpi=300)
+  plt.close(fig)
+  print(f"Saved {out / 'guv_size_full_population_ecdf.pdf'}")
+
+
 def main(results_dir=None, root=None):
   base = Path(results_dir) if results_dir else outputs_root() / RESULTS_SUBFOLDER
   out = base / SUBFOLDER
@@ -1835,6 +1938,9 @@ def main(results_dir=None, root=None):
 
   df = load_summary(base, attrition_dir=out)
   print(f"Loaded {len(df)} GUV rows from {base / 'guv_bulk_summary.csv'}")
+  # Must run on the population BEFORE the restriction load_summary() just
+  # applied, so it re-reads guv_bulk_summary.csv itself rather than reusing df.
+  report_size_distributions_unrestricted(base, out)
   report_size_distributions(df, out)
   # Runs before the dose figures so that a disagreement between
   # INTERPRETED_MAX_FIELD and the session table is printed above them rather
@@ -1842,6 +1948,7 @@ def main(results_dir=None, root=None):
   report_session_confound(df, out)
   report_uninterpreted_block(df, out)
   plot_field_response(df, out)
+  plot_field_response_supplementary(df, out)
   plot_endpoint_distribution(df, out)
   check_per_experiment_within_fields(df, out)
   check_detectability(df, tree, out)
@@ -1849,7 +1956,6 @@ def main(results_dir=None, root=None):
   report_section3(df, out)
   report_radius_sensitivity(base, out)
   plot_experiment_level(df, out)
-  write_latex_tables(df, out)
   print(f"\nSaved susceptibility figures to {out}")
   return df
 
