@@ -774,7 +774,13 @@ def _runs(mask: np.ndarray):
   return list(zip(idx[0::2], idx[1::2]))
 
 
-def plot_field_response(df: pd.DataFrame, out: Path):
+def plot_field_response(
+    df: pd.DataFrame, 
+    out: Path,
+    font_size: int = 15,
+    tick_size: int = 15,
+    legend_size: int = 15
+):
   """Release magnitude and responding fraction against applied field.
 
   One point per field per population, not per bin. The eleven amplitudes are
@@ -853,16 +859,31 @@ def plot_field_response(df: pd.DataFrame, out: Path):
       frac.append(k / n if n else np.nan)
       f_lo.append(lo_f)
       f_hi.append(hi_f)
-    ax1.scatter(p_df["field_kV_cm"], p_df["released"], s=8, alpha=0.22,
-                color=c, edgecolors="none")
+      
+    # Plot larger, darker points on ax1, with a bit of x-jitter
+    valid_rel = p_df.dropna(subset=["released"])
+    if not valid_rel.empty:
+      x_jit1 = rng.uniform(-0.015, 0.015, len(valid_rel))
+      ax1.scatter(valid_rel["field_kV_cm"] + x_jit1, valid_rel["released"], 
+                  s=35, alpha=0.6, color=c, edgecolors="none")
+
+    # Add raw points to ax2 with matching style and xy-jitter for 0/1 separation
+    valid_eff = p_df.dropna(subset=["efflux"])
+    if not valid_eff.empty:
+      x_jit2 = rng.uniform(-0.015, 0.015, len(valid_eff))
+      y_jit2 = rng.uniform(-0.02, 0.02, len(valid_eff))
+      ax2.scatter(valid_eff["field_kV_cm"] + x_jit2, valid_eff["efflux"].astype(float) + y_jit2, 
+                  s=35, alpha=0.6, color=c, edgecolors="none")
+
     xs = np.asarray(xs, float)
     if xs.size:
       for ax, mid, lo_v, hi_v, alpha in (
           (ax1, mean_r, lo_r, hi_r, 0.15), (ax2, frac, f_lo, f_hi, 0.18)):
         y = np.asarray(mid)
         lo_a, hi_a = np.asarray(lo_v), np.asarray(hi_v)
+        # zorder=5 elevates the summary lines above the new larger scatter dots
         ax.plot(xs, y, "o-", color=c, lw=2, ms=5, mfc=c,
-                label=POP_LABEL[pop])
+                label=POP_LABEL[pop], zorder=5)
         # NaN-safe: points below MIN_CLUSTERS_FOR_CI chambers have no
         # interval, and fill_between would otherwise raise or silently drop
         # the whole band at the first NaN. Drawn per contiguous run of
@@ -872,7 +893,7 @@ def plot_field_response(df: pd.DataFrame, out: Path):
         ok = np.isfinite(lo_a) & np.isfinite(hi_a)
         for start, stop in _runs(ok):
           ax.fill_between(xs[start:stop], lo_a[start:stop], hi_a[start:stop],
-                          color=c, alpha=alpha, lw=0)
+                          color=c, alpha=alpha, lw=0, zorder=1)
 
   # 1D axes start at 0: the release fraction and the responding fraction are
   # both non-negative quantities by construction, so the axis floor should
@@ -881,17 +902,25 @@ def plot_field_response(df: pd.DataFrame, out: Path):
   # information (the estimate's lower bound crosses zero), not a plotting
   # artefact -- leave it clipped rather than padding below 0 to show it.
   ax1.set_ylim(bottom=0)
-  ax1.set_ylabel("released fraction of lumenal signal")
-  ax2.set_ylabel("fraction with efflux")
-  ax2.set_ylim(0, 1.02)
+  ax1.set_ylabel("released fraction of lumenal signal", fontsize=font_size)
+  ax2.set_ylabel("fraction with efflux", fontsize=font_size)
+  # Expanded the limit slightly so jittered points near 0 and 1 don't get clipped
+  ax2.set_ylim(-0.05, 1.05) 
   for ax in (ax1, ax2):
     ax.set_xlim(left=0)
-    ax.set_xlabel("field strength (kV/cm)")
-    ax.legend(frameon=False, fontsize=9)
+    ax.set_xlabel("field strength (kV/cm)", fontsize=font_size)
+    ax.tick_params(axis="both", labelsize=tick_size)
     ax.grid(alpha=0.35, linestyle="--")
-  process.style_figure("field_response_by_population")
+    
+  # Extract handles and labels once from the first axis to create a single legend below
+  handles, labels = ax1.get_legend_handles_labels()
+  fig.legend(handles, labels, loc="lower center", bbox_to_anchor=(0.5, 0.0), 
+             ncol=len(labels), frameon=False, fontsize=legend_size)
+
   fig.tight_layout()
-  fig.savefig(out / "field_response_by_population.pdf", dpi=300)
+  # Adjust bottom margin to make space for the unified legend
+  fig.subplots_adjust(bottom=0.2)
+  fig.savefig(out / "field_response_by_population.pdf", dpi=300, bbox_inches="tight")
   plt.close(fig)
 
   if rows:
