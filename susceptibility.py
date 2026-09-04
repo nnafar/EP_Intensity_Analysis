@@ -775,7 +775,7 @@ def _runs(mask: np.ndarray):
 
 
 def plot_field_response(
-    df: pd.DataFrame, 
+    df: pd.DataFrame,
     out: Path,
     font_size: int = 15,
     tick_size: int = 15,
@@ -884,27 +884,14 @@ def plot_field_response(
         # zorder=5 elevates the summary lines above the new larger scatter dots
         ax.plot(xs, y, "o-", color=c, lw=2, ms=5, mfc=c,
                 label=POP_LABEL[pop], zorder=5)
-        # NaN-safe: points below MIN_CLUSTERS_FOR_CI chambers have no
-        # interval, and fill_between would otherwise raise or silently drop
-        # the whole band at the first NaN. Drawn per contiguous run of
-        # resolvable points instead, so a gap in the middle of the series
-        # (e.g. one thin field) leaves a real gap rather than a false bridge
-        # or an empty plot.
         ok = np.isfinite(lo_a) & np.isfinite(hi_a)
         for start, stop in _runs(ok):
           ax.fill_between(xs[start:stop], lo_a[start:stop], hi_a[start:stop],
                           color=c, alpha=alpha, lw=0, zorder=1)
 
-  # 1D axes start at 0: the release fraction and the responding fraction are
-  # both non-negative quantities by construction, so the axis floor should
-  # say so rather than implying values below zero are possible. If a
-  # bootstrap CI band is ever clipped visibly at the floor, that is real
-  # information (the estimate's lower bound crosses zero), not a plotting
-  # artefact -- leave it clipped rather than padding below 0 to show it.
   ax1.set_ylim(bottom=0)
   ax1.set_ylabel("released fraction of lumenal signal", fontsize=font_size)
   ax2.set_ylabel("fraction with efflux", fontsize=font_size)
-  # Expanded the limit slightly so jittered points near 0 and 1 don't get clipped
   ax2.set_ylim(-0.05, 1.05) 
   for ax in (ax1, ax2):
     ax.set_xlim(left=0)
@@ -914,13 +901,13 @@ def plot_field_response(
     
   # Extract handles and labels once from the first axis to create a single legend below
   handles, labels = ax1.get_legend_handles_labels()
-  fig.legend(handles, labels, loc="lower center", bbox_to_anchor=(0.5, 0.0), 
+  fig.legend(handles, labels, loc="lower center", bbox_to_anchor=(0.5, 0.02), 
              ncol=len(labels), frameon=False, fontsize=legend_size)
 
   fig.tight_layout()
   # Adjust bottom margin to make space for the unified legend
-  fig.subplots_adjust(bottom=0.2)
-  fig.savefig(out / "field_response_by_population.pdf", dpi=300, bbox_inches="tight")
+  fig.subplots_adjust(bottom=0.25)
+  fig.savefig(out / "field_response_by_population.pdf", dpi=300)
   plt.close(fig)
 
   if rows:

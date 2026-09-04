@@ -876,9 +876,18 @@ def plot_representative_radial_profiles(df_all: pd.DataFrame, outputs_root,
   plt.close(fig)
   print(f"Saved {out_path}")
 
-
-def plot_mean_actin_evolution(traces, profiles, grid_x, edges, output_dir,
-                              min_frac: float = EVOLUTION_MIN_FRAC):
+def plot_mean_actin_evolution(
+    traces, 
+    profiles, 
+    grid_x, 
+    edges, 
+    output_dir,
+    min_frac: float = EVOLUTION_MIN_FRAC,
+    font_size: int = 15,
+    tick_size: int = 15,
+    annot_size: int = 15,
+    legend_size: int = 15
+):
   """Mean radial profile evolution, one panel per field strength.
 
   The pooled version of the per-experiment *_actin_evolution.png panels: every
@@ -902,9 +911,7 @@ def plot_mean_actin_evolution(traces, profiles, grid_x, edges, output_dir,
   n_by_volt = pd.Series([tr["voltage"] for tr in traces]).value_counts()
   n_cols = min(3, len(voltages))
   n_rows = int(np.ceil(len(voltages) / n_cols))
-  # Constrained layout rather than tight_layout: the colorbar takes its space
-  # from the axes, and tight_layout would then push the suptitle down onto the
-  # panel titles.
+  
   fig, axes = plt.subplots(n_rows, n_cols, squeeze=False, sharex=True,
                            sharey=True, layout="constrained",
                            figsize=fig_size("actin_evolution_mean",
@@ -922,6 +929,7 @@ def plot_mean_actin_evolution(traces, profiles, grid_x, edges, output_dir,
 
   for ax in axes.ravel():
     ax.set_visible(False)
+    
   dropped = []
   for k, volt in enumerate(voltages):
     ax = axes[k // n_cols][k % n_cols]
@@ -937,35 +945,58 @@ def plot_mean_actin_evolution(traces, profiles, grid_x, edges, output_dir,
       s, n = acc[0], acc[1]
       mean = np.where(n > 0, s / np.maximum(n, 1), np.nan)
       ax.plot(grid_x, mean, color=greys(norm(t_mid[b])), lw=1.1)
+      
     pre = profiles.get((volt, -1))
     if pre is not None:
       s, n = pre[0], pre[1]
       mean_pre = np.where(n > 0, s / np.maximum(n, 1), np.nan)
       ax.plot(grid_x, mean_pre, color=PALETTE["dark_red"], lw=1.6, ls="--",
               zorder=6, label="pre-pulse")
+              
     ax.axvline(1.0, color=ANNOTATION_TEXT, lw=0.8, ls=":", zorder=1)
-    # Per-panel identifier drawn as an annotation, not an axes title: with
-    # one panel per field strength, each still needs to say which field it
-    # is, but that is not a plot title.
-    ax.text(0.5, 1.0, f"{field_label(volt)} kV/cm "
+    # Moved the text inside the plot to the bottom left corner
+    ax.text(0.05, 0.05, f"{field_label(volt)} kV/cm "
             f"(n={int(n_by_volt.get(volt, 0))})", transform=ax.transAxes,
-            ha="center", va="bottom", fontsize=10)
+            ha="left", va="bottom", fontsize=annot_size)
     ax.grid(alpha=0.2)
-    if k % n_cols == 0:
-      ax.set_ylabel("actin intensity / pre-pulse peak")
+    ax.tick_params(axis="both", labelsize=tick_size)
+    
     if k // n_cols == n_rows - 1:
-      ax.set_xlabel("radius / vesicle radius")
-  axes[0][0].legend(frameon=False, fontsize=8, loc="upper left")
+      ax.set_xlabel("radius / vesicle radius", fontsize=font_size)
+      
+  axes[0][0].legend(frameon=False, fontsize=legend_size, loc="upper left")
+  
+  # Set a single, global y-axis label for the entire figure
+  fig.supylabel("actin intensity / pre-pulse peak", fontsize=font_size)
 
   sm = plt.cm.ScalarMappable(norm=norm, cmap=greys)
-  cbar = fig.colorbar(sm, ax=axes.ravel().tolist(), fraction=0.025, pad=0.02)
-  cbar.set_label("time after pulse (s)")
+  
+  n_filled = len(voltages)
+  empty_axes = axes.ravel()[n_filled:]
+  
+  if len(empty_axes) > 0:
+    gs = empty_axes[0].get_subplotspec().get_gridspec()
+    for ax in empty_axes:
+      ax.remove()
+    row = n_filled // n_cols
+    col = n_filled % n_cols
+    
+    anchor_ax = fig.add_subplot(gs[row, col:])
+    anchor_ax.axis("off")
+    
+    cax = anchor_ax.inset_axes([0.05, 0.4, 0.9, 0.15])
+    cbar = fig.colorbar(sm, cax=cax, orientation="horizontal")
+  else:
+    cbar = fig.colorbar(sm, ax=axes.ravel().tolist(), orientation="horizontal", fraction=0.05, pad=0.05)
 
-  style_figure("actin_evolution_mean")
+  cbar.set_label("time after pulse (s)", fontsize=font_size)
+  cbar.ax.tick_params(labelsize=tick_size)
+
   pdf_path = out_path / "guv_actin_evolution_mean.pdf"
   fig.savefig(pdf_path, format="pdf", dpi=300)
   plt.close(fig)
   print(f"Saved mean actin evolution: {pdf_path}")
+  
   if dropped:
     print(f"  Time bins blanked for coverage below {min_frac:.0%} of the "
           "condition's vesicles:")
@@ -988,7 +1019,6 @@ def plot_mean_actin_evolution(traces, profiles, grid_x, edges, output_dir,
         "n_guv": len(acc[2])}))
   pd.concat(prof_rows, ignore_index=True).to_csv(
       out_path / "guv_actin_evolution_mean_profiles.csv", index=False)
-
 
 def plot_evolution_peak_timecourse(traces, per_guv, output_dir,
                                    min_frac: float = EVOLUTION_MIN_FRAC):
