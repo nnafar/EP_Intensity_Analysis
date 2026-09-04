@@ -68,6 +68,12 @@ from palette import (
 #                    combined with a targeted override (e.g. scale=1.2 with
 #                    legend=6 pinned) when one element needs to buck the
 #                    trend.
+#   marker_scale     multiplies the marker size of every plotted line, so
+#                    individual traces and summary markers grow together and
+#                    keep their relative sizes. Does not touch the figure
+#                    size, only what is drawn inside it.
+#   line_scale       same, for line width. Grid lines, spines and shaded
+#                    bands are left alone, so only the data gets heavier.
 #
 # Example -- a single-column figure for the thesis:
 #
@@ -80,13 +86,19 @@ from palette import (
 #
 #   "lumen_abs_histogram": dict(scale=1.3),
 #
+# Example -- same figure at the same size, but text and data both heavier
+# so it survives being shrunk onto a thesis page:
+#
+#   "lumen_abs_histogram": dict(scale=1.7, marker_scale=1.6, line_scale=1.6),
+#
 # The keys below are named after the PDF each one controls. Panel counts
 # scale with the number of populations present unless noted.
 # -----------------------------------------------------------------------------
 
 _FIG_FIELDS = ("width", "width_per_panel", "height", "axis_label",
                "tick_label", "legend", "legend_title", "title",
-               "suptitle", "annotation", "scale")
+               "suptitle", "annotation", "scale",
+               "marker_scale", "line_scale")
 
 
 def _fig(**kwargs):
@@ -101,7 +113,9 @@ def _fig(**kwargs):
 FIGURE_STYLE = {
     # 01_dye_release
     "released_fraction_by_voltage":  _fig(),   # single panel
-    "intensity_drop_trajectories":   _fig(),   # one panel per population
+    "intensity_drop_trajectories":   _fig(       # one panel per population
+        scale=1.7, marker_scale=1.6, line_scale=1.6,
+        axis_label=24, tick_label=20, annotation=12),
     "stagnate_intensity_counts":     _fig(),   # single panel
     "drop_by_size_per_voltage":      _fig(),   # one panel per population
     # 02_size_and_fate
@@ -122,7 +136,9 @@ FIGURE_STYLE = {
     "tau_identifiability":           _fig(),   # fixed at 2 panels
 
     # 06_representative_traces (new as of the 2026-08 update)
-    "guv_representative_intensity_traces": _fig(),   # single panel
+    "guv_representative_intensity_traces": _fig(     # single panel
+    axis_label=24, tick_label=11, legend=18, annotation=18, 
+        marker_scale=1.8, line_scale=1.4),
     "guv_representative_radial_profiles":  _fig(),   # single panel
 
     # 03_cortex_classification/montages -- one montage per phenotype;
@@ -181,7 +197,10 @@ def style_figure(key: str) -> None:
     and overriding them in one place keeps the knob in one place too.
 
     Anything left as None is not touched, so a figure with no overrides keeps
-    the sizes its plotting function chose.
+    the sizes its plotting function chose. The same is true of `marker_scale`
+    and `line_scale`, which multiply what the plotting code drew rather than
+    forcing one shared weight, and which change nothing about the figure's
+    own dimensions.
 
     `scale`, where set, is applied per TEXT OBJECT: each axis label, each
     tick label, each legend entry, each annotation keeps whatever size the
@@ -233,7 +252,26 @@ def style_figure(key: str) -> None:
             if v is not None:
                 txt.set_fontsize(v)
 
+        # Marker and line weight. Applied per artist and multiplicatively so
+        # a panel that deliberately draws its individual traces lighter than
+        # its summary line keeps that contrast. Legend handles are separate
+        # artists copied at legend creation, so they are scaled alongside or
+        # the key stops matching the plot. Grid lines and spines are not in
+        # ax.lines and shaded bands are Polygons, so both are left alone.
         leg = ax.get_legend()
+        handles = list(getattr(leg, "legend_handles", None)
+                       or getattr(leg, "legendHandles", [])) if leg else []
+        for ln in list(ax.lines) + [h for h in handles
+                                    if hasattr(h, "get_markersize")]:
+            if (s["marker_scale"] is not None
+                    and ln.get_marker() not in (None, "", "None")):
+                m = float(s["marker_scale"])
+                ln.set_markersize(ln.get_markersize() * m)
+                ln.set_markeredgewidth(ln.get_markeredgewidth() * m)
+            if (s["line_scale"] is not None
+                    and ln.get_linestyle() not in (None, "", "None")):
+                ln.set_linewidth(ln.get_linewidth() * float(s["line_scale"]))
+
         if leg is not None:
             for txt in leg.get_texts():
                 v = _abs_or_scaled(s["legend"], txt.get_fontsize())
@@ -938,8 +976,8 @@ def plot_representative_intensity_traces(df_all: pd.DataFrame,
   # baseline sits at negative time by construction (t=0 is the pulse), and
   # there's no equivalent "natural zero" to anchor it to anyway.
   ax.margins(y=0.10)
-  ax.set_xlabel("time relative to pulse (s)", fontsize=10)
-  ax.set_ylabel("normalized SRB intensity ($I_{retained}$)", fontsize=10)
+  ax.set_xlabel("Time relative to pulse (s)", fontsize=10)
+  ax.set_ylabel("Normalized SRB intensity ($I_{retained}$)", fontsize=10)
   ax.spines["top"].set_visible(False)
   ax.spines["right"].set_visible(False)
   ax.grid(alpha=0.25, linestyle="--", lw=0.6)
@@ -3124,9 +3162,21 @@ def plot_released_fraction_by_voltage(df: pd.DataFrame, output_dir: str,
     print(tbl.to_string(index=False))
     print()
 
-def generate_separate_pdf_plots(df: pd.DataFrame, output_dir: str):
+def generate_separate_pdf_plots(
+    df: pd.DataFrame, 
+    output_dir: str,
+    font_size: int   = 25,
+    tick_size: int   = 25,
+    annot_size: int  = 25,
+    legend_size: int = 25
+):
   if df.empty:
     print("No valid GUV records found. Please check output directory path.")
+    return
+
+  df = df[df["voltage"].apply(field_kV_cm) <= 1.34].copy()
+  if df.empty:
+    print("No valid GUV records remain after filtering for field strength <= 1.34 kV/cm.")
     return
 
   report_endpoint_times(df)
@@ -3137,12 +3187,16 @@ def generate_separate_pdf_plots(df: pd.DataFrame, output_dir: str):
 
   size_categories = ["Grow", "Stagnate", "Reduce", "Rupture/Collapse"]
   size_colors = {c: SIZE_CATEGORY_COLORS[c] for c in size_categories}
-  # Two, not three. Gainers are gone from the frame by the time it gets here
-  # (drop_intensity_gainers, at aggregation), so these two classes are
-  # exhaustive and the bars sum to the condition's n -- which is the same n
-  # Section 3 reports. The excluded vesicles are listed in
-  # GAINER_ATTRITION_CSV rather than drawn as a third bar.
   intensity_categories = ["Lose Intensity", "Flatline"]
+  
+  # Map internal population names to requested subplot titles
+  title_map = {
+      "Bare": "Bare",
+      "Empty": "Bare",
+      "Branched, cortex": "Branched Cortex",
+      "BranchedCortex": "Branched Cortex",
+      "Branched, lumenal only": "Lumenal"
+  }
 
   fig1, ax1 = plt.subplots(figsize=fig_size("size_category_distribution", max(8, 1.1 * len(voltages) + 3), 5.5))
   x = np.arange(len(voltages))
@@ -3179,18 +3233,18 @@ def generate_separate_pdf_plots(df: pd.DataFrame, output_dir: str):
             "Ba" if pop in ("Empty", "Bare") else "Br",
             ha="center",
             va="bottom",
-            fontsize=7,
+            fontsize=annot_size,
             color=POPULATION_COLORS.get(pop, ANNOTATION_TEXT),
             fontweight="bold",
         )
 
   ax1.set_xticks(x)
-  ax1.set_xticklabels(field_labels(voltages))
-  ax1.set_xlabel(FIELD_AXIS_LABEL)
-  ax1.set_ylabel("GUV Count")
-  ax1.legend(title="Size Category", bbox_to_anchor=(1.02, 1), loc="upper left")
+  ax1.set_xticklabels(field_labels(voltages), fontsize=tick_size)
+  ax1.set_xlabel(FIELD_AXIS_LABEL, fontsize=font_size)
+  ax1.set_ylabel("GUV Count", fontsize=font_size)
+  ax1.tick_params(axis="y", labelsize=tick_size)
+  ax1.legend(title="Size Category", bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=legend_size, title_fontsize=font_size)
   ax1.grid(axis="y", linestyle="--", alpha=0.5)
-  style_figure("size_category_distribution")
   plt.tight_layout()
 
   pdf_path1 = sub_dir(output_dir, "fate") / "guv_size_category_distribution.pdf"
@@ -3230,14 +3284,15 @@ def generate_separate_pdf_plots(df: pd.DataFrame, output_dir: str):
       s_idx += 1
 
   ax2.set_xticks(x)
-  ax2.set_xticklabels(field_labels(voltages))
-  ax2.set_xlabel(FIELD_AXIS_LABEL)
-  ax2.set_ylabel("GUV Count")
+  ax2.set_xticklabels(field_labels(voltages), fontsize=tick_size)
+  ax2.set_xlabel(FIELD_AXIS_LABEL, fontsize=font_size)
+  ax2.set_ylabel("GUV Count", fontsize=font_size)
+  ax2.tick_params(axis="y", labelsize=tick_size)
   ax2.legend(
-      title="Population / Behaviour", bbox_to_anchor=(1.02, 1), loc="upper left"
+      title="Population / Behaviour", bbox_to_anchor=(1.02, 1), loc="upper left",
+      fontsize=legend_size, title_fontsize=font_size
   )
   ax2.grid(axis="y", linestyle="--", alpha=0.5)
-  style_figure("stagnate_intensity_counts")
   plt.tight_layout()
 
   pdf_path2 = sub_dir(output_dir, "dye") / "guv_stagnate_intensity_counts.pdf"
@@ -3254,6 +3309,9 @@ def generate_separate_pdf_plots(df: pd.DataFrame, output_dir: str):
     ax3 = axes3[0][p_idx]
     pop_df = df_stagnate[df_stagnate["population"] == pop]
     mean_labelled = False
+    
+    plot_title = title_map.get(pop, pop.title())
+    ax3.set_title(plot_title, fontsize=font_size)
 
     for idx, v in enumerate(voltages):
       sub = pop_df[pop_df["voltage"] == v]
@@ -3266,9 +3324,10 @@ def generate_separate_pdf_plots(df: pd.DataFrame, output_dir: str):
               [x_pre, x_post],
               [r["i_pre"], r["i_final"]],
               "-o",
-              color=INDIVIDUAL_TRACE,
+              color=PALETTE["grey"],
               alpha=0.35,
-              ms=4,
+              lw=1.5,
+              ms=10,
           )
 
       if not sub.empty:
@@ -3278,40 +3337,27 @@ def generate_separate_pdf_plots(df: pd.DataFrame, output_dir: str):
             "-s",
             color=SUMMARY_LINE,
             lw=1.8,
-            ms=5,
+            ms=12,
             alpha=0.85,
             zorder=5,
             label="Mean Drop" if not mean_labelled else "",
         )
         mean_labelled = True
-        ax3.text(
-            idx,
-            0.02,
-            f"n={len(sub)}",
-            ha="center",
-            va="bottom",
-            fontsize=7,
-            color=ANNOTATION_TEXT,
-        )
 
-    # The band the figure is read against. Every statement made from this
-    # panel is about how many vesicles ended inside or outside
-    # INTENSITY_DIFF_THRESHOLD of their baseline, and without the band drawn
-    # the reader has to take that boundary on trust and place it by eye.
     ax3.axhspan(1 - INTENSITY_DIFF_THRESHOLD, 1 + INTENSITY_DIFF_THRESHOLD,
                 color=PALETTE["pale_blue"], alpha=0.5, lw=0, zorder=0)
 
     ax3.set_xticks(np.arange(len(voltages)))
-    ax3.set_xticklabels(field_labels(voltages), fontsize=9, rotation=45)
-    ax3.set_xlabel(FIELD_AXIS_LABEL)
+    ax3.set_xticklabels(field_labels(voltages), fontsize=tick_size, rotation=45)
+    ax3.set_xlabel(FIELD_AXIS_LABEL, fontsize=font_size)
     ax3.set_ylim(bottom=0)
+    ax3.tick_params(axis="y", labelsize=tick_size)
     ax3.grid(axis="y", linestyle="--", alpha=0.5)
     if p_idx == 0:
-      ax3.set_ylabel("Normalized Intensity")
+      ax3.set_ylabel("Normalized Intensity", fontsize=font_size)
       if mean_labelled:
-        ax3.legend(loc="lower left", fontsize=9)
+        ax3.legend(loc="lower left", bbox_to_anchor=(0.0, 0.06), fontsize=legend_size)
 
-  style_figure("intensity_drop_trajectories")
   plt.tight_layout()
 
   pdf_path3 = sub_dir(output_dir, "dye") / "guv_intensity_drop_trajectories.pdf"
@@ -3332,6 +3378,9 @@ def generate_separate_pdf_plots(df: pd.DataFrame, output_dir: str):
       sub = df_binned[
           (df_binned["voltage"] == v) & (df_binned["population"] == pop)
       ]
+      
+      plot_title = title_map.get(pop, pop.title())
+      ax_v.set_title(plot_title, fontsize=font_size)
 
       for b_idx, b_label in enumerate(bin_order):
         bin_sub = sub[sub["radius_bin"] == b_label]
@@ -3345,7 +3394,7 @@ def generate_separate_pdf_plots(df: pd.DataFrame, output_dir: str):
               "-o",
               color=INDIVIDUAL_TRACE,
               alpha=0.4,
-              ms=4,
+              ms=10,
           )
 
         if not bin_sub.empty:
@@ -3355,29 +3404,20 @@ def generate_separate_pdf_plots(df: pd.DataFrame, output_dir: str):
               "-s",
               color=SUMMARY_LINE,
               lw=1.8,
-              ms=5,
+              ms=12,
               alpha=0.85,
               zorder=5,
           )
-          ax_v.text(
-              b_idx,
-              0.02,
-              f"n={len(bin_sub)}",
-              ha="center",
-              va="bottom",
-              fontsize=7,
-              color=ANNOTATION_TEXT,
-          )
 
       ax_v.set_xticks(np.arange(len(bin_order)))
-      ax_v.set_xticklabels(bin_order, fontsize=9)
-      ax_v.set_xlabel("Size Group")
+      ax_v.set_xticklabels(bin_order, fontsize=tick_size)
+      ax_v.set_xlabel("Size Group", fontsize=font_size)
       ax_v.set_ylim(bottom=0, top=1.15)
+      ax_v.tick_params(axis="y", labelsize=tick_size)
       ax_v.grid(axis="y", linestyle="--", alpha=0.5)
       if p_idx == 0:
-        ax_v.set_ylabel("Normalized Intensity")
+        ax_v.set_ylabel("Normalized Intensity", fontsize=font_size)
 
-    style_figure("drop_by_size_per_voltage")
     plt.tight_layout()
 
     pdf_v_path = (sub_dir(output_dir, "dye_by_voltage")

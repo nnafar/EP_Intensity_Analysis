@@ -46,6 +46,7 @@ RUN_TAU       = True    # tau identifiability diagnostic
 RUN_MONTAGE   = True    # actin montages; needs the raw ND2s, slowest stage
 RUN_SUSCEPT   = True    # size-matched Bare vs Branched comparison
 
+
 # Only the montage needs this: the tree holding the .nd2 files.
 MONTAGE_DATA_ROOT = r"D:\Data\EP"
 

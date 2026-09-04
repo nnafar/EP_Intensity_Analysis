@@ -248,6 +248,39 @@ def cluster_diff(a: pd.DataFrame, b: pd.DataFrame, col: str = "efflux",
   return obs, float(lo), float(hi)
 
 
+def clustered_field_ci(cell: pd.DataFrame, col: str, n_boot: int = 4000,
+                       seed: int = 0):
+  """Percentile CI for the mean of `col`, resampling whole chambers.
+
+  Same logic as cluster_diff, applied to one population-field cell instead
+  of a two-group difference: vesicles from the same chamber share a
+  preparation, a field and a day, so the unit of replication is the
+  experiment, not the vesicle. Used for both panels of plot_field_response
+  -- `col="released"` for the mean-release CI, `col="efflux"` for the
+  responding-fraction CI -- so that neither panel quietly reverts to a
+  vesicle-level interval while the other stays chamber-clustered.
+
+  Returns (mean, lo, hi, n_chambers). Below MIN_CLUSTERS_FOR_CI chambers,
+  lo/hi are NaN rather than an interval built from resampling one or two
+  chambers over and over, matching the gate cluster_diff already applies.
+  """
+  chambers = [g[col].dropna().to_numpy(float)
+              for _, g in cell.groupby("experiment")]
+  chambers = [g for g in chambers if len(g)]
+  n_chambers = len(chambers)
+  pooled = cell[col].dropna().to_numpy(float)
+  mean = float(pooled.mean()) if len(pooled) else np.nan
+  if n_chambers < MIN_CLUSTERS_FOR_CI:
+    return mean, np.nan, np.nan, n_chambers
+  rng = np.random.default_rng(seed)
+  draws = np.empty(n_boot)
+  for i in range(n_boot):
+    picks = rng.integers(0, n_chambers, n_chambers)
+    draws[i] = np.concatenate([chambers[j] for j in picks]).mean()
+  lo, hi = np.percentile(draws, [2.5, 97.5])
+  return mean, float(lo), float(hi), n_chambers
+
+
 # --- Section 3: flatline vs efflux -------------------------------------------
 
 def split_field(d: pd.DataFrame) -> float:
@@ -729,6 +762,18 @@ def _mark_uninterpreted(ax, fields):
               color=PALETTE["grey"], zorder=1)
 
 
+def _runs(mask: np.ndarray):
+  """Start/stop index pairs of each contiguous True run in a boolean array.
+
+  Used to draw a filled CI band only across points that actually have one,
+  leaving a real gap at points without a chamber-clustered interval instead
+  of bridging over them or dropping the band for the whole series.
+  """
+  idx = np.flatnonzero(np.diff(np.concatenate(([0], mask.astype(int),
+                                              [0]))))
+  return list(zip(idx[0::2], idx[1::2]))
+
+
 def plot_field_response(df: pd.DataFrame, out: Path):
   """Release magnitude and responding fraction against applied field.
 
@@ -776,18 +821,26 @@ def plot_field_response(df: pd.DataFrame, out: Path):
       if len(v) < MIN_N_PER_FIELD:
         thin.append((POP_LABEL[pop], E, len(v)))
         continue
-      boot = np.mean(v[rng.integers(0, len(v), (4000, len(v)))], axis=1)
+      # Chamber-clustered, not vesicle-level: matches the Methods text
+      # ("all confidence intervals in this chapter resample whole
+      # chambers"), which previously described cluster_diff's behaviour but
+      # not this figure's. A cell with fewer than MIN_CLUSTERS_FOR_CI
+      # chambers gets its point plotted from every pooled vesicle but no
+      # interval -- see n_chambers in the CSV rather than a falsely narrow
+      # band built from resampling one or two chambers repeatedly.
+      mean_v, lo_v, hi_v, n_ch = clustered_field_ci(cell, "released")
       resp = cell["efflux"].dropna().astype(bool)
       k, n = int(resp.sum()), int(len(resp))
-      wl, wh = wilson(k, n) if n else (np.nan, np.nan)
+      cell_num = cell.assign(efflux=cell["efflux"].astype(float))
+      mean_f, lo_f, hi_f, n_ch_f = clustered_field_ci(cell_num, "efflux")
       rows.append({"population": POP_LABEL[pop], "field_kV_cm": E,
-                   "n": len(v), "median_released": float(np.median(v)),
+                   "n": len(v), "n_chambers": n_ch,
+                   "median_released": float(np.median(v)),
                    "mean_released": float(v.mean()),
-                   "mean_ci_lo": float(np.percentile(boot, 2.5)),
-                   "mean_ci_hi": float(np.percentile(boot, 97.5)),
+                   "mean_ci_lo": lo_v, "mean_ci_hi": hi_v,
                    "n_with_call": n, "n_efflux": k,
                    "frac_efflux": (k / n if n else np.nan),
-                   "frac_ci_lo": wl, "frac_ci_hi": wh,
+                   "frac_ci_lo": lo_f, "frac_ci_hi": hi_f,
                    "interpreted": interpreted(E),
                    "sessions": ",".join(sorted(cell["session"].dropna()
                                                .unique()))})
@@ -795,11 +848,11 @@ def plot_field_response(df: pd.DataFrame, out: Path):
         continue
       xs.append(E)
       mean_r.append(v.mean())
-      lo_r.append(np.percentile(boot, 2.5))
-      hi_r.append(np.percentile(boot, 97.5))
+      lo_r.append(lo_v)
+      hi_r.append(hi_v)
       frac.append(k / n if n else np.nan)
-      f_lo.append(wl)
-      f_hi.append(wh)
+      f_lo.append(lo_f)
+      f_hi.append(hi_f)
     ax1.scatter(p_df["field_kV_cm"], p_df["released"], s=8, alpha=0.22,
                 color=c, edgecolors="none")
     xs = np.asarray(xs, float)
@@ -810,7 +863,16 @@ def plot_field_response(df: pd.DataFrame, out: Path):
         lo_a, hi_a = np.asarray(lo_v), np.asarray(hi_v)
         ax.plot(xs, y, "o-", color=c, lw=2, ms=5, mfc=c,
                 label=POP_LABEL[pop])
-        ax.fill_between(xs, lo_a, hi_a, color=c, alpha=alpha, lw=0)
+        # NaN-safe: points below MIN_CLUSTERS_FOR_CI chambers have no
+        # interval, and fill_between would otherwise raise or silently drop
+        # the whole band at the first NaN. Drawn per contiguous run of
+        # resolvable points instead, so a gap in the middle of the series
+        # (e.g. one thin field) leaves a real gap rather than a false bridge
+        # or an empty plot.
+        ok = np.isfinite(lo_a) & np.isfinite(hi_a)
+        for start, stop in _runs(ok):
+          ax.fill_between(xs[start:stop], lo_a[start:stop], hi_a[start:stop],
+                          color=c, alpha=alpha, lw=0)
 
   # 1D axes start at 0: the release fraction and the responding fraction are
   # both non-negative quantities by construction, so the axis floor should
